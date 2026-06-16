@@ -29,12 +29,13 @@ DIRS = ["bin", "sbin", "etc", "proc", "sys", "dev", "run", "mnt",
         f"lib/modules/{KVER}/extra", "lib/firmware/rtl_nic", "lib/firmware/i915"]
 
 # Firmware a embarquer (motifs glob sous /lib/firmware) :
-#   rtl_nic  -> NIC Realtek r8169
+#   rtl_nic  -> NIC Realtek r8169 (couvre RTL8168 1G ET RTL8125 2.5G)
 #   i915/tgl_* -> GuC + HuC (Rocket Lake reutilise Tiger Lake) -- xe les lit dans i915/
 #   i915/rkl_* -> DMC (power management display, specifique Rocket Lake)
 # On copie tous les suffixes de version pour ne dependre d'aucun nom precis.
 FW_GLOBS = os.environ.get("FW_GLOBS",
                           "/lib/firmware/rtl_nic/rtl8168*:"
+                          "/lib/firmware/rtl_nic/rtl8125*:"   # RTL8125B 2.5GbE
                           "/lib/firmware/i915/tgl_*:"
                           "/lib/firmware/i915/rkl_*").split(":")
 

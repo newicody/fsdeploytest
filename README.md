@@ -238,7 +238,10 @@ CONFIG_RD_ZSTD=y                         # décompression de l'initramfs .zst
 CONFIG_ZLIB_INFLATE=y, CONFIG_ZLIB_DEFLATE=y
 CONFIG_CRYPTO=y, CONFIG_CRYPTO_DEFLATE=y
 CONFIG_CRYPTO_SHA256=y, CONFIG_CRYPTO_SHA512=y
+CONFIG_CRC32=y, CONFIG_CRC32C=y          # checksums ZFS (crc32c) -- en dur
+CONFIG_CRYPTO_CRC32C_INTEL=y             # crc32c accéléré SSE4.2 (gratuit, i5)
 CONFIG_CRYPTO_AES=y, CONFIG_CRYPTO_GCM=y  # si pools chiffrés ; sans risque sinon
+CONFIG_CRYPTO_AES_NI_INTEL=y             # AES-NI : seulement si datasets chiffrés
 # Firmware (rtl_nic + i915 GuC/HuC/DMC) embarqué dans l'initramfs par
 # build_initramfs.py -> CONFIG_EXTRA_FIRMWARE inutile (l'initramfs est
 # décompressé AVANT les initcalls des drivers =y, donc /lib/firmware est là).
@@ -435,10 +438,19 @@ Une ligne, sans script dédié — vérifie que les options critiques sont bien
 posées dans le `.config` qui va servir au build :
 
 ```sh
-grep -E 'CONFIG_(DRM_XE|DRM_I915|R8169|REALTEK_PHY|IP_PNP|SQUASHFS|SQUASHFS_XATTR|OVERLAY_FS|BLK_DEV_LOOP|EFI_STUB|BINFMT_SCRIPT|RD_ZSTD)=' /usr/src/linux/.config
-# ZFS/SPL doivent etre EN MODULE, jamais =y (licence CDDL) :
-grep -E 'CONFIG_(ZFS|SPL)=' /usr/src/linux/.config   # attendu : =m
+grep -E 'CONFIG_(DRM_XE|DRM_I915|R8169|REALTEK_PHY|IP_PNP|SQUASHFS|SQUASHFS_XATTR|OVERLAY_FS|BLK_DEV_LOOP|EFI_STUB|BINFMT_SCRIPT|RD_ZSTD|DRM_FBDEV_EMULATION)=' /usr/src/linux/.config
+# Dependances NOYAU de ZFS : DOIVENT etre =y (sinon zfs.ko ne charge pas) :
+grep -E 'CONFIG_(ZLIB_INFLATE|ZLIB_DEFLATE|CRYPTO|CRYPTO_DEFLATE|CRYPTO_SHA256|CRC32C)=' /usr/src/linux/.config
 ```
+
+> ZFS lui-meme n'est PAS dans le `.config` : c'est un module **hors-arbre**
+> (`sys-fs/zfs-kmod`), il n'a aucun symbole `CONFIG_ZFS`. Ne cherche pas
+> `CONFIG_ZFS`/`CONFIG_SPL` (toujours vide, normal). Verifie sa presence par :
+> ```sh
+> modinfo -k $(uname -r) -n zfs    # doit renvoyer un chemin vers zfs.ko
+> modinfo -k $(uname -r) -F depends zfs   # liste des modules a charger avant
+> ls /lib/modules/$(uname -r)/extra/      # zfs.ko, spl.ko (+ famille)
+> ```
 Toute ligne absente = option non posée (souvent `# CONFIG_X is not set`).
 Pour un noyau **déjà booté** (si `CONFIG_IKCONFIG_PROC=y`), remplace le chemin
 par `/proc/config.gz` et préfixe par `zcat`.

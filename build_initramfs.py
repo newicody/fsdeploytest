@@ -286,6 +286,33 @@ def main():
         pack(stage, OUT)
         size = subprocess.run(["du", "-h", OUT], capture_output=True, text=True).stdout.split()[0]
         msg(f"OK -> {OUT}  ({size})")
+
+        # verification POST-BUILD du contenu (sans booter) + checksum
+        try:
+            import initramfs_verify as iv
+            crit_missing = False
+            msg("verification du contenu de l'initramfs genere :")
+            for lvl, line in iv.verify_contents(OUT):
+                flag = "  !!" if (lvl == "crit" and "MANQUANT" in line) else "    "
+                print(f"{flag} [{lvl}] {line}", flush=True)
+                if lvl == "crit" and "MANQUANT" in line:
+                    crit_missing = True
+            sha = iv.image_sha256(OUT)
+            msg(f"SHA-256 image : {sha}")
+            if crit_missing:
+                msg("ATTENTION: des fichiers CRITIQUES manquent -> NE PAS booter "
+                    "cette image (corrige le build).")
+            # enregistrer le checksum dans le registre (controle d'integrite)
+            try:
+                import kernel_registry
+                kernel_registry.KernelRegistry().log_event(
+                    "compile", KVER,
+                    f"initramfs build sha256={sha[:16]} bootable="
+                    f"{not crit_missing}")
+            except Exception:
+                pass
+        except Exception as e:
+            msg(f"verification post-build non effectuee ({e}) -- non bloquant")
     finally:
         shutil.rmtree(stage, ignore_errors=True)
 

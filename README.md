@@ -275,9 +275,14 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 │                         #   overlay squashfs → réseau → stream → switch_root
 ├── build_initramfs.py    # construit initramfs-<ver>.zst : CPython + busybox +
 │                         #   zpool/zfs/mount.zfs/ip + famille zfs.ko + firmware
+├── initramfs_verify.py   # verifie le contenu d'un initramfs (sans booter) +
+│                         #   checksums SHA-256 + manifeste d'integrite
 ├── session_launch.py     # post-switch_root (PID 1 du rootfs) : seatd + cage +
 │                         #   bascule du stream fbdev → capture wayland
 ├── efi_install.py        # install EFI initiale (un seul noyau, manuel)
+├── first_boot.py         # orchestrateur first-boot (chroot) : verifie infra +
+│                         #   compile + initramfs + EFI + rapport + autorisation git
+├── infra.conf            # declaration de l'infrastructure VOULUE (a editer)
 │
 │  ── AUTO-UPDATE DU NOYAU (espace utilisateur) ───────────────────────
 ├── kernel_diagnose.py    # étape 0 : diagnostic de cohérence au démarrage
@@ -384,6 +389,8 @@ emerge -av sci-ml/ollama
 # numpy : requis par rag.py (recherche vectorielle). Repli pur-Python existe
 # mais numpy est fortement recommande (perf).
 emerge -av dev-python/numpy
+# configobj : requis par first_boot.py (lecture de infra.conf)
+emerge -av dev-python/configobj
 ```
 
 > `python3` (et donc `ctypes`) est déjà fourni par `dev-lang/python` sur Gentoo —
@@ -648,7 +655,31 @@ sudo env FFMPEG_STATIC=/usr/local/bin/ffmpeg-static \
 > même device en continu. Après `switch_root`, `session_launch.py` tue ce
 > ffmpeg (handoff `/etc/initramfs-stream.pid`) et bascule sur la capture wayland.
 
-## 9. Install EFI (initiale)
+### Vérifier l'initramfs (sans booter) + checksums
+
+`build_initramfs.py` vérifie **automatiquement** le contenu de l'image générée
+(post-build) : présence de `/init`, `zfs.ko`, `zfs_load_order`, `zpool`/`zfs`/
+`mount.zfs`, `python3` (critiques), et `ip`/`ffmpeg`/firmware (warnings). Il
+calcule le **SHA-256** de l'image et le journalise dans le registre. Si un
+fichier critique manque, il l'affiche clairement (ne pas booter cette image).
+
+Le même contrôle est réutilisable à la demande via `initramfs_verify.py` :
+```sh
+python3 initramfs_verify.py initramfs-<ver>.zst              # verdict bootable
+python3 initramfs_verify.py initramfs-<ver>.zst --list       # contenu
+python3 initramfs_verify.py initramfs-<ver>.zst --sums       # SHA-256 par fichier
+python3 initramfs_verify.py initramfs-<ver>.zst --manifest m.json  # manifeste d'integrite
+```
+Le module parse le cpio (newc) en pur Python (zstd/gzip/xz/lz4 décompressés via
+l'outil système), sans rien extraire sur disque. Le **manifeste** (sha image +
+sha par fichier) permet un contrôle d'intégrité avant un boot ou après copie.
+
+> **L'ini n'est PAS dans l'initramfs.** `infra.conf` (configobj) est lu par
+> `first_boot.py` côté chroot/rootfs ; `init.py` (PID 1) reste autonome et
+> minimal, sans dépendance ini. De même, le first-boot ne tourne pas *dans*
+> l'initramfs (environnements opposés : minimal vs toolchain complète) ; le code
+> partagé l'est côté rootfs (rapports, registre, stream), pas via l'initramfs.
+
 
 ```sh
 # ajuster DISK/PART/KERNEL_SRC via l'environnement si besoin
@@ -756,6 +787,61 @@ zfs create -o compression=zstd -o atime=off -o xattr=sa -o acltype=posixacl \
 - `kernel_watch.py` : `--src`, `--endpoint`, `--model`
 
 ---
+
+## Premier boot orchestré (`first_boot.py`)
+
+Lancé **depuis le chroot** (avant le premier vrai boot), il fait tout d'un coup,
+**sans inférence** (le modèle n'est pas actif en chroot — c'est volontaire) :
+
+```sh
+# dans le chroot, avec configobj installe
+python3 first_boot.py --config /chemin/vers/.config --infra infra.conf
+#   --dry-run        : verifie l'infra et s'arrete (pas de build)
+#   --repo owner/nom : pousse le rapport sur le board git (sinon confirmation locale)
+#   --no-inference   : force l'inference OFF (deja le cas en chroot)
+```
+
+Étapes : (1) lit `infra.conf` et **vérifie la conformité** réel vs déclaré →
+empreinte ; un écart **critique** (pool/dataset/ESP/firmware-NIC manquant)
+**stoppe** (exit 2), un écart **mineur** (propriété ZFS divergente, dataset
+annexe) est un **warning** et on continue. (2) compile + `zfs-kmod` + garde-fou +
+`modules.sfs` + initramfs + EFI + registre (délégué à `kernel_build.py`, pas de
+réécriture). (3) rapport consolidé dans `boot_pool/manager/first-boot-report.txt`.
+(4) demande l'**autorisation** (board git si `--repo`, sinon locale) avant de
+finaliser.
+
+### `infra.conf` — déclarer son infrastructure
+
+L'empreinte n'est pas devinée : elle est **déclarée**. Tu décris dans `infra.conf`
+ce que la machine doit avoir (pools + redondance, datasets + propriétés, ESP,
+firmware), avec `critical = true|false` par section/clé. Un autre utilisateur
+n'a qu'à éditer ce fichier pour son matériel. Extrait :
+
+```ini
+[pools]
+critical = true
+    [[fast_pool]]
+    type = stripe
+    redundancy = 0
+[datasets]
+    [[fast_pool/rootfs]]
+    critical = true
+    xattr = sa
+    acltype = posixacl
+[firmware]
+    [[required]]
+    critical = true
+    patterns = rtl_nic/rtl8125b-1.fw, rtl_nic/rtl8125b-2.fw
+[inference]
+enabled = false      # force false en chroot ; true en systeme boote
+```
+
+> **Pas d'inférence en chroot, pas de kexec.** L'inférence est gérée par un flag
+> (`enabled`/`--enable-inference`), désactivée tant qu'on est en chroot. Le
+> changement de noyau se fait par **reboot + BootNext** (filet d'essai unique),
+> pas par kexec — démonter ZFS/overlay/stream depuis le système qui tourne
+> dessus serait trop risqué. Le stream **vidéo** démarre au vrai boot (`init.py`,
+> qui a `/dev/fb0`) ; en chroot, le suivi se fait via le fichier rapport.
 
 ## Boucle d'auto-update du noyau
 

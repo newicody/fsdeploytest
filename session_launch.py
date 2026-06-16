@@ -95,6 +95,35 @@ def which(name):
     return None
 
 
+def degraded_repair():
+    """Mode degrade : affiche le rapport et ouvre un shell de reparation au
+    lieu de la session normale. Le stream initramfs n'est PAS arrete -> le
+    rapport reste visible a distance (YouTube). Ne revient jamais (exec shell)."""
+    report = "/etc/degraded-report"
+    banner = "\n" + "#" * 64 + "\n# SYSTEME EN MODE DEGRADE / REPARATION\n" + \
+             "#" * 64 + "\n"
+    try:
+        with open(report) as f:
+            banner += f.read()
+    except OSError:
+        banner += "(rapport /etc/degraded-report introuvable)\n"
+    banner += ("\nSession normale NON demarree. Shell de reparation.\n"
+               "Outils : zpool status -v | zfs list | dmesg | "
+               "efibootmgr -v\n" + "#" * 64 + "\n")
+    # afficher sur toutes les consoles + kmsg (donc visible dans le stream fbdev)
+    for dev in ("/dev/console", "/dev/tty0", "/dev/kmsg"):
+        try:
+            with open(dev, "w") as d:
+                d.write(banner)
+        except OSError:
+            pass
+    print(banner, flush=True)
+    # un shell interactif sur la console ; on garde le stream fbdev tel quel
+    os.environ.setdefault("PS1", "(reparation) # ")
+    sh = which("bash") or which("sh") or "/bin/sh"
+    os.execv(sh, [sh])
+
+
 def main():
     os.environ.setdefault("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
     for src, tgt, fs in (("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs"),
@@ -103,6 +132,11 @@ def main():
     os.makedirs("/dev/pts", exist_ok=True)
     subprocess.run(["mount", "-t", "devpts", "devpts", "/dev/pts"],
                    stderr=subprocess.DEVNULL)
+
+    # MODE DEGRADE : rapport + shell de reparation, pas de session normale
+    if os.path.exists("/etc/rescue-mode"):
+        log("mode degrade detecte -> reparation (session normale annulee)")
+        degraded_repair()                  # ne revient pas
 
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     os.chmod(RUNTIME_DIR, 0o700)

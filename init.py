@@ -35,6 +35,14 @@ RESCUE_POOL    = "boot_pool"
 RESCUE_SFS_DS  = f"{RESCUE_POOL}/images"
 RESCUE_ROOTFS  = "rootfs.sfs"
 
+# --- couches persistantes (datasets fast_pool montes au boot) ----------------
+# upper de l'overlay racine + montages directs. En mode SECOURS (fast_pool
+# absent), aucun n'est disponible -> on retombe sur un upper tmpfs volatile.
+UPPER_DS   = f"{POOL}/rootfs"     # upper de l'overlay racine (systeme mutable)
+VAR_DS     = f"{POOL}/var"        # monte sur NEWROOT/var
+LOG_DS     = f"{POOL}/log"        # monte sur NEWROOT/var/log (replique vers data_pool)
+USRSRC_DS  = f"{POOL}/usr-src"    # monte sur NEWROOT/usr/src (sources noyau, build)
+
 IP_ADDR  = "192.168.1.10/24"   # redondant si ip= passe par la cmdline noyau
 GATEWAY  = "192.168.1.1"
 DNS      = "8.8.8.8"
@@ -322,6 +330,25 @@ def start_boot_stream(key):
     return proc
 
 
+def ds_exists(dataset):
+    """Le dataset ZFS existe-t-il ? (distingue 'absent' de 'corrompu')."""
+    rc, _ = capture(["zfs", "list", "-H", "-o", "name", dataset])
+    return rc == 0
+
+
+def writable_test(path):
+    """Verifie qu'on peut reellement ecrire sous path (detecte un FS monte
+    mais corrompu/lecture seule). Retourne True si OK."""
+    probe = os.path.join(path, ".init_write_probe")
+    try:
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -398,12 +425,38 @@ def main():
     log(f"source rootfs : {sfs_ds}/{rootfs_name}"
         + ("  [SECOURS]" if rescue else ""))
 
-    # --- 4. overlay : lower=rootfs.sfs (ro, loop) + upper=tmpfs -------------
-    # En secours comme en normal, l'upper est un tmpfs NEUF (en secours,
-    # l'ancien upper de fast_pool est perdu ; on n'essaie pas de le simuler).
+    # --- 4. overlay racine : lower=rootfs.sfs (ro) + upper -----------------
+    # Normal : upper = dataset persistant fast_pool/rootfs (systeme mutable).
+    # CORRUPTION (UPPER_DS existe mais montage/ecriture impossible) : on NE
+    # monte PAS le dataset corrompu -> bascule DEGRADE LECTURE SEULE (upper
+    # tmpfs jetable : systeme utilisable, rien ecrit sur le dataset corrompu),
+    # rapport + temoin. Absent (1er boot) -> tmpfs simple. Secours -> tmpfs.
+    degraded_reasons = []
     for d in ("/mnt/lower", "/mnt/ovl", NEWROOT):
         os.makedirs(d, exist_ok=True)
-    mount("tmpfs", "/mnt/ovl", "tmpfs")
+    use_persistent_upper = False
+    if rescue:
+        degraded_reasons.append("fast_pool absent (disque ?) : rootfs depuis boot_pool")
+    elif ds_exists(UPPER_DS):
+        if run(["mount.zfs", UPPER_DS, "/mnt/ovl"]) != 0:
+            degraded_reasons.append(
+                f"{UPPER_DS} existe mais NE SE MONTE PAS (corruption ?) "
+                f"-> non monte, upper volatile")
+        elif not writable_test("/mnt/ovl"):
+            run(["umount", "/mnt/ovl"])
+            degraded_reasons.append(
+                f"{UPPER_DS} monte mais NON INSCRIPTIBLE (corruption/RO ?) "
+                f"-> demonte, upper volatile")
+        else:
+            use_persistent_upper = True
+            log(f"upper persistant : {UPPER_DS} (sain, inscriptible)")
+    else:
+        degraded_reasons.append(
+            f"{UPPER_DS} absent (1er boot ? cree-le : zfs create {UPPER_DS})")
+
+    if not use_persistent_upper:
+        mount("tmpfs", "/mnt/ovl", "tmpfs")        # upper jetable
+        log("upper volatile : tmpfs (rien ne sera ecrit sur un dataset corrompu)")
     os.makedirs("/mnt/ovl/upper", exist_ok=True)
     os.makedirs("/mnt/ovl/work", exist_ok=True)
     try:
@@ -413,18 +466,52 @@ def main():
               "lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work")
     except OSError as e:
         die(f"overlay echoue: {e}")
-    log(f"overlay rootfs assemble sur {NEWROOT}"
-        + ("  [SECOURS]" if rescue else ""))
+    log(f"overlay rootfs assemble sur {NEWROOT}")
 
-    # marqueur secours -> NEWROOT/etc (session_launch / outils post-boot le lisent)
-    if rescue:
+    # --- 4bis. couches persistantes (normal + upper persistant sain) -------
+    # var, log, usr-src : datasets ZFS directs. Corruption d'un dataset EXISTANT
+    # = on ne le monte pas + degrade (pas de die). Absent = non bloquant.
+    if use_persistent_upper:
+        for ds, sub, critical in ((VAR_DS, "var", True),
+                                  (LOG_DS, "var/log", False),
+                                  (USRSRC_DS, "usr/src", False)):
+            tgt = f"{NEWROOT}/{sub}"
+            os.makedirs(tgt, exist_ok=True)
+            if ds_exists(ds):
+                if run(["mount.zfs", ds, tgt]) != 0:
+                    degraded_reasons.append(
+                        f"{ds} existe mais ne se monte pas (corruption ?)")
+                elif critical and not writable_test(tgt):
+                    run(["umount", tgt])
+                    degraded_reasons.append(
+                        f"{ds} non inscriptible (corruption ?) -> demonte")
+                else:
+                    log(f"persistant : {ds} -> /{sub}")
+            else:
+                log(f"{ds} absent (cree-le : zfs create {ds})")
+    elif not rescue:
+        degraded_reasons.append("couches var/log/usr-src non montees (upper degrade)")
+
+    # --- 4ter. mode degrade : rapport + temoin (session de reparation) ------
+    degraded = rescue or bool(degraded_reasons)
+    if degraded:
         try:
             os.makedirs(f"{NEWROOT}/etc", exist_ok=True)
             with open(f"{NEWROOT}/etc/rescue-mode", "w") as f:
-                f.write("fast_pool indisponible ; rootfs depuis "
-                        f"{RESCUE_SFS_DS} ; overlays perdus\n")
-        except OSError:
-            pass
+                f.write("degrade\n")
+            with open(f"{NEWROOT}/etc/degraded-report", "w") as f:
+                f.write("=== SYSTEME EN MODE DEGRADE (LECTURE SEULE) ===\n\n")
+                f.write("Aucune donnee persistante n'est ecrite (upper volatile).\n")
+                f.write("La session normale est REMPLACEE par un shell de "
+                        "reparation.\n\nCauses detectees :\n")
+                for r in degraded_reasons:
+                    f.write(f"  - {r}\n")
+                f.write("\nActions : zpool status -v ; zfs list ; "
+                        "verifier/remplacer le disque ; restaurer depuis "
+                        "boot_pool/data_pool.\n")
+        except OSError as e:
+            log(f"rapport degrade non ecrit ({e})")
+        log("!! MODE DEGRADE : " + " | ".join(degraded_reasons))
 
     # report sante -> NEWROOT/etc (survit au switch_root ; /run sera masque)
     try:

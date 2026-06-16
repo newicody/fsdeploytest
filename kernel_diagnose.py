@@ -158,6 +158,46 @@ def check_runtime(cfg, mods, dmesg):
 
 
 # --------------------------------------------------------------------------- #
+# attributs ZFS attendus (diff proprietes reelles vs reference)
+# --------------------------------------------------------------------------- #
+# Par dataset : proprietes attendues. None = dataset optionnel (pas d'alerte
+# s'il n'existe pas). La table reflete la procedure de creation du README.
+ZFS_EXPECTED = {
+    "fast_pool/sfs":     {"compression": "off",  "atime": "off"},
+    "fast_pool/rootfs":  {"xattr": "sa", "acltype": "posixacl", "atime": "off"},
+    "fast_pool/var":     {"xattr": "sa", "acltype": "posixacl", "atime": "off"},
+    "fast_pool/log":     {"compression": "zstd", "atime": "off"},
+    "fast_pool/usr-src": {"atime": "off"},
+    "boot_pool/images":  {"compression": "off"},
+    "boot_pool/manager": {"atime": "off"},
+    "data_pool/log":     {"compression": "zstd"},
+}
+
+
+def check_zfs_attrs(expected=None):
+    """Lit les proprietes ZFS reelles et diff contre la reference. Signale les
+    ecarts (ATTENTION) et les datasets attendus mais absents (INFO). Non
+    bloquant ; si la commande zfs est absente (hors cible), ne fait rien."""
+    expected = expected or ZFS_EXPECTED
+    issues = []
+    for ds, props in expected.items():
+        # existence
+        r = subprocess.run(["zfs", "list", "-H", "-o", "name", ds],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            issues.append((INFO, f"zfs:{ds}", "dataset attendu absent"))
+            continue
+        for prop, want in props.items():
+            g = subprocess.run(["zfs", "get", "-H", "-o", "value", prop, ds],
+                               capture_output=True, text=True)
+            got = g.stdout.strip()
+            if g.returncode == 0 and got and got != want:
+                issues.append((WARN, f"zfs:{ds}",
+                               f"{prop}={got}, attendu {want}"))
+    return issues
+
+
+# --------------------------------------------------------------------------- #
 # health.json (init.py)
 # --------------------------------------------------------------------------- #
 def check_health(path):
@@ -259,6 +299,7 @@ def main():
     mods = loaded_modules()
     dmesg = dmesg_text()
     issues += check_runtime(cfg, mods, dmesg)
+    issues += check_zfs_attrs()
     issues += check_health(a.health)
 
     issues.sort(key=lambda it: SEV_ORDER.get(it[0], 9))

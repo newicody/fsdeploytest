@@ -98,7 +98,7 @@ structurant pour la sécurité des données :
 
 | Pool | Type | Survit à | Rôle |
 |---|---|---|---|
-| `boot_pool` | mirror SATA | 1 disque | master rootfs/init + `boot_pool/manager` (index) + déploiement |
+| `boot_pool` | mirror SATA (5 disques) | 4 disques | master rootfs/init + `boot_pool/manager` (index) + déploiement |
 | `data_pool` | raidz2 SATA | 2 disques | `home`, modèles, `archives` (snapshots), `log` (réplication) |
 | `fast_pool` | **stripe** 2×NVMe | **0 disque** | rootfs de travail, overlays, sfs, logs (rapide, **fragile**) |
 
@@ -124,19 +124,30 @@ Le firmware UEFI ne lit pas ZFS : noyau et initramfs sont **stagés sur l'ESP
 FAT32**. Les **deux ESP** (`nvme0n1p1`, `nvme1n1p1`, tenues en phase par rsync)
 permettent de booter sur l'autre disque depuis le BIOS si l'un meurt.
 
-### Mode dégradé (niveau 1) — perte de `fast_pool`
+### Mode dégradé (lecture seule + réparation)
 
-Si `nvme` lâche, l'ESP de l'autre disque reste bootable, **mais `fast_pool`
-(stripe) est mort**. `init.py` le détecte (import `fast_pool` échoué) et
-**bascule en secours sur `boot_pool/images/rootfs.sfs`** avec un overlay tmpfs
-neuf, en affichant clairement : rootfs de base seulement, **overlays perdus**,
-système destiné à diagnostiquer/restaurer (pas une continuité). Un marqueur
-`/etc/rescue-mode` est posé dans le rootfs de secours.
+Deux situations déclenchent le mode dégradé, **sans jamais écrire sur un dataset
+suspect** (upper = tmpfs jetable) :
 
-> La survie des overlays (`var`/`rootfs`) n'est PAS automatique : elle suppose
-> une réplication `zfs send` régulière vers `data_pool/archives`, et une
-> remontée **manuelle** d'un snapshot répliqué. Sans cette réplication, l'upper
-> est définitivement perdu à la panne NVMe.
+- **`fast_pool` absent** (NVMe en panne — stripe perdu) : `init.py` bascule sur
+  `boot_pool/images/rootfs.sfs`.
+- **`fast_pool` importé mais un overlay corrompu** (`fast_pool/rootfs` ou `var`
+  existe mais ne se monte pas / non inscriptible) : le dataset suspect **n'est
+  pas monté**, on garde le rootfs.sfs en lower + un upper tmpfs.
+
+Dans les deux cas : système **utilisable mais volatile** (rien de persistant
+écrit), un rapport est posé dans `/etc/degraded-report`, et `session_launch.py`
+détecte `/etc/rescue-mode` → **affiche le rapport** (console + stream YouTube) et
+ouvre un **shell de réparation** au lieu de la session normale. Le stream de
+l'initramfs n'est pas coupé : le rapport reste visible à distance.
+
+Distinction importante : un dataset **absent** (1er boot, pas encore créé) n'est
+PAS une corruption → simple tmpfs, pas de bascule réparation. Seul un dataset
+**existant mais inutilisable** déclenche le dégradé.
+
+> La survie des overlays suppose une réplication `zfs send` vers
+> `data_pool/archives` + une remontée **manuelle**. Sans réplication, l'upper
+> est perdu à la panne NVMe (mais le système reboote en dégradé, réparable).
 
 ---
 
@@ -175,26 +186,40 @@ zfs create -o compression=off -o recordsize=1M \
 #   recordsize=1M : gros fichiers .sfs lus sequentiellement ; compression=off
 #   car squashfs est deja en zstd.
 
-# --- 2. Overlays (upper de overlayfs) : ACL/xattr OBLIGATOIRES ----------------
+# --- 2. Overlays PERSISTANTS (montes par init.py au boot) --------------------
+# upper de l'overlay racine -> systeme mutable et persistant entre les boots.
 zfs create -o compression=zstd -o xattr=sa -o acltype=posixacl \
            -o mountpoint=/fast_pool/rootfs           fast_pool/rootfs
 zfs create -o compression=zstd -o xattr=sa -o acltype=posixacl \
            -o mountpoint=/fast_pool/var              fast_pool/var
-zfs create -o compression=zstd -o sync=disabled \
-           -o mountpoint=/fast_pool/tmp              fast_pool/tmp
-#   tmp : sync=disabled (ephemere, perf) ; pas besoin d'ACL.
-
-# --- 3. Logs : compression forte, recordsize moyen ---------------------------
 zfs create -o compression=zstd -o recordsize=128K \
            -o mountpoint=/fast_pool/log              fast_pool/log
+#   rootfs = upper de l'overlay ; var monte sur /var ; log sur /var/log.
+#   init.py les monte automatiquement (sautes en mode secours -> tmpfs).
+#   /tmp reste un tmpfs volatile : PAS de dataset (ephemere par nature).
+
+# --- 2bis. Sources du noyau (build) : dataset dedie, monte sur /usr/src ------
+zfs create -o compression=zstd -o atime=off \
+           -o mountpoint=/fast_pool/usr-src          fast_pool/usr-src
+#   init.py le monte sur NEWROOT/usr/src : les sources + l'arbre de build
+#   PERSISTENT entre les boots (pas de recompilation complete a chaque fois).
+#   emerge installe les sources la ; kernel_build.py compile la.
+
+# --- 3. Logs : replica durable -----------------------------------------------
 zfs create -o compression=zstd -o recordsize=128K \
            -o mountpoint=/data_pool/log              data_pool/log   # replica durable
 
-# --- 4. Master de deploiement + index gestionnaire (boot_pool, durable) ------
+# --- 4. boot_pool (mirror SATA, durable) : masters + restauration ------------
 zfs create -o compression=off \
            -o mountpoint=/boot_pool/images           boot_pool/images   # rootfs.sfs master
 zfs create -o compression=zstd \
            -o mountpoint=/boot_pool/manager          boot_pool/manager  # index (git-friendly)
+zfs create -o compression=zstd \
+           -o mountpoint=/boot_pool/efi-backup        boot_pool/efi-backup
+#   efi-backup : copie des DEUX ESP (vmlinuz, initramfs, entrees) pour
+#   restaurer une partition FAT corrompue ou re-deployer un NVMe remplace.
+#   boot_pool contient aussi une copie kernel+initrd de secours (source du
+#   mode degrade via boot_pool/images).
 
 # --- 5. Donnees & archives (data_pool, raidz2) -------------------------------
 zfs create -o compression=zstd -o recordsize=1M \
@@ -213,8 +238,13 @@ zfs create -o refreservation=200G -o mountpoint=none fast_pool/reserve
 | Dataset | Monté par | Type |
 |---|---|---|
 | `fast_pool/sfs`, `boot_pool/images` | `init.py` (initramfs) | `mount.zfs` explicite, **pas** d'auto-mount |
-| overlays `fast_pool/{rootfs,var,tmp}` | overlayfs au boot (upper) | montés *dans* l'overlay, pas directement |
+| `fast_pool/rootfs` (upper) | `init.py` | upper de l'overlay racine (persistant) |
+| `fast_pool/var`, `fast_pool/log`, `fast_pool/usr-src` | `init.py` | `mount.zfs` sur `NEWROOT/{var,var/log,usr/src}` |
 | `boot_pool/manager`, `data_pool/*` | système booté (OpenRC) | auto-mount ZFS standard (mountpoint) |
+
+> En **mode secours** (fast_pool absent), `init.py` saute tous les datasets
+> `fast_pool/*` : upper = tmpfs volatile, pas de var/log/usr-src persistants.
+> Le système de secours est minimal et éphémère, par conception.
 
 > `init.py` importe les pools avec `zpool import -N` (**`-N` = ne monte aucun
 > dataset automatiquement**) puis fait des `mount.zfs` explicites : le boot
@@ -673,8 +703,9 @@ seule ensuite → impossible de relabel après coup) :
 
 ```sh
 emerge -av sys-apps/policycoreutils    # fournit setfiles/semanage
-setfiles -r <racine_gentoo> \
-  /etc/selinux/<SELINUXTYPE>/contexts/files/file_contexts <racine_gentoo>
+# applique les contextes du fichier file_contexts a l'arbre du futur rootfs :
+setfiles /etc/selinux/targeted/contexts/files/file_contexts <racine_gentoo>
+#   (remplace 'targeted' par 'strict'/'mcs' selon /etc/selinux/config)
 ```
 `<SELINUXTYPE>` = `targeted`/`strict`/`mcs` selon `/etc/selinux/config`. Sans
 SELinux, ignore cette étape.
@@ -742,11 +773,36 @@ sudo /usr/bin/python3 kernel_build.py
 #      panic    -> power-cycle : BootNext consommé -> noyau précédent
 ```
 
-### Garde-fou `BootNext`
+### Cycle de recompilation : zfs.ko et sources
 
-Consommé après **un seul** boot : un noyau qui plante n'est jamais promu, et le
-power-cycle suivant repart sur `BootOrder[0]` = dernier noyau bon. Aucun code de
-revert. Les anciens noyaux/initramfs restent sur l'ESP (élaguer à la main).
+Recompiler un noyau `<v2>` implique de **reconstruire zfs-kmod contre `<v2>`**
+(les `.ko` sont liés à une version de noyau et ne sont pas portables). C'est
+géré automatiquement par `kernel_build.py` :
+1. `make` + `modules_install` (dans `/usr/src/linux`, sur `fast_pool/usr-src`,
+   **persistant** → pas de recompilation complète à chaque fois) ;
+2. `emerge -1 sys-fs/zfs-kmod` → recompile `zfs.ko`/`spl.ko` contre `<v2>`,
+   **depuis le rootfs booté** ;
+3. garde-fou : vérifie que `zfs.ko` existe pour `<v2>` (sinon stop, pas de
+   BootNext) ;
+4. `mksquashfs modules-<v2>.sfs` (les modules in-tree) sur `fast_pool/sfs` ;
+5. `build_initramfs.py` réembarque les `zfs.ko`/`spl.ko` **frais** dans le
+   nouvel initramfs (ils ne sont PAS dans le `.sfs` — œuf-et-poule : il faut
+   ZFS pour lire `fast_pool/sfs`).
+
+Les sources noyau vivent sur `fast_pool/usr-src` (monté sur `/usr/src` par
+`init.py`), donc l'arbre de build persiste — `emerge sys-kernel/gentoo-sources`
+les installe là, et les compilations successives réutilisent l'arbre.
+
+### Sauvegarde de boot_pool vers data_pool
+
+`boot_pool` (mirror) protège du crash disque ; un snapshot répliqué vers
+`data_pool` (raidz2) protège en plus de la corruption logique / suppression :
+```sh
+zfs snapshot -r boot_pool@$(date +%F)
+zfs send -R boot_pool@$(date +%F) | zfs recv -F data_pool/archives/boot_pool
+```
+(à déclencher depuis le board / un timer ; voir réplication des logs idem
+`fast_pool/log` → `data_pool/log`.)
 
 ---
 

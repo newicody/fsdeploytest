@@ -335,7 +335,11 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 │                         #   + back-ends interchangeables (OpenVINO prod / Stub test)
 ├── rag.py                # RAG multi-domaines : chunking, index, recherche+rerank
 ├── brainstorm.py         # fiche idée (3 couches : candidats/acté/état) + moteur
-└── github_board.py       # pont board GitHub ↔ idées + watcher de confirmation prod
+├── github_board.py       # pont board GitHub ↔ idées (Issues, REST) + watcher prod
+├── github_project.py     # pont GitHub Projects v2 (GraphQL) : items = idées,
+│                         #   statut = colonne ; déclencheur colonne OU label
+├── test_github.py        # valide le pont Issues REST en réel (avant tout le reste)
+└── test_project.py       # valide le pont Projects v2 GraphQL en réel
 ```
 
 Fichiers déployés **dans le rootfs Gentoo** (cf. §5) :
@@ -819,6 +823,46 @@ zfs create -o compression=zstd -o atime=off -o xattr=sa -o acltype=posixacl \
 - `kernel_watch.py` : `--src`, `--endpoint`, `--model`
 
 ---
+
+## Board GitHub : mode Projet (Projects v2)
+
+Les idées sont des **items d'un Project v2** (`github_project.py`, API GraphQL).
+Le statut est la **colonne** (champ single-select `Status` : Idea/WIP/Dev/Prod/
+Drop). Double déclencheur de l'action (compilation...) :
+- la **colonne** `Prod` déclenche **toujours** (mode projet) ;
+- le **label** `state:prod` déclenche **en plus**, mais seulement si l'item est
+  adossé à une **Issue** (les draft items n'ont pas de labels → colonne seule).
+
+Prérequis côté GitHub : le Project doit avoir un champ single-select **`Status`**
+avec exactement les options `Idea, WIP, Dev, Prod, Drop` (sinon ajuster
+`STATUS_OPTION` dans `github_project.py`). Token : scope `project`.
+
+> L'API Projects v2 est en **GraphQL** (≠ REST des Issues). Les requêtes sont
+> écrites au plus près du schéma mais **doivent être validées en réel**
+> (`test_project.py`) ; un nom de champ peut demander un ajustement au 1er essai.
+
+### Procédure de test progressive (par couches)
+
+À valider **dans cet ordre**, chaque couche avant la suivante :
+
+```sh
+export GITHUB_TOKEN=...
+# 1. pont Issues (REST) — le plus simple, sans Project
+python3 test_github.py --repo owner/nom
+# 2. pont Projects v2 (GraphQL) — résout l'ID, lit Status, crée/déplace un item
+python3 test_project.py --owner owner --number <N>
+#    --no-create pour ne tester que la lecture
+# 3. cinématique complète : push idée -> colonne Prod -> watch_once -> action
+#    (à scripter une fois 1+2 verts)
+# 4. first_boot.py --dry-run puis réel (cf. section dédiée)
+```
+
+> **Sans Copilot ni inférence locale pour l'instant.** Copilot (marquage amont)
+> est un *rôle déclaré* dans `infra.conf` mais **non branché** : aucun code
+> n'appelle Copilot aujourd'hui (il faudrait une GitHub Action ou l'API Copilot).
+> L'inférence locale est codée mais désactivée (`enabled = false`, forcée off en
+> chroot). La cinématique board → action fonctionne **sans** ces couches ; on les
+> ajoutera une fois la base validée en réel.
 
 ## Premier boot orchestré (`first_boot.py`)
 

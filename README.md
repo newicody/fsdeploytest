@@ -149,6 +149,38 @@ PAS une corruption → simple tmpfs, pas de bascule réparation. Seul un dataset
 > `data_pool/archives` + une remontée **manuelle**. Sans réplication, l'upper
 > est perdu à la panne NVMe (mais le système reboote en dégradé, réparable).
 
+### Changement de rootfs.sfs sous un upper persistant
+
+Piège réel avec un upper **persistant** (système mutable) : l'upper ne contient
+que les **diffs** par rapport au `rootfs.sfs` (lower) qui l'a engendré. Si on
+repackage un nouveau `rootfs.sfs` en gardant l'ancien upper, des fichiers
+obsolètes de l'upper **masquent silencieusement** les nouveaux du sfs (et les
+whiteouts périmés cachent des fichiers réintroduits) → système incohérent.
+
+`init.py` gère ça automatiquement via le **CRC32** (zlib, streaming) du
+`rootfs.sfs`, comparé au marqueur `.sfs-crc` stocké dans l'upper :
+- marqueur absent (1er boot) → on le pose, upper neuf ;
+- CRC identique → upper réutilisé tel quel ;
+- **CRC différent (sfs changé)** → upper périmé : `init.py` **snapshote** l'ancien
+  upper (`fast_pool/rootfs@presfs-<crc>-<ts>`), l'**envoie vers
+  `data_pool/archives`** (durable), puis **vide le contenu** de l'upper (pas le
+  dataset → xattr/acl conservés) et repose le marqueur. Les modifs repartent
+  proprement du nouveau sfs.
+
+CRC32 (et non SHA-256) : on détecte un *changement*, pas une attaque ; c'est
+rapide (accéléré SSE4.2 sur le i5) et suffisant. Récupérer un ancien upper
+snapshoté est **manuel** (dans `data_pool/archives/rootfs-presfs-<crc>`).
+
+> **En pratique, `rootfs.sfs` change rarement.** Les mises à jour courantes
+> portent sur le **noyau et les modules** (`/usr/src` → nouveau
+> `modules-<ver>.sfs`), suivies par le registre + l'historique de config
+> incrémentale — *pas* par l'overlay. `modules-<ver>.sfs` est monté en lecture
+> seule par version (jamais d'upper), donc aucun risque de péremption pour lui.
+> Le `rootfs.sfs` n'est repackagé que lors d'un `emerge world` délibéré ; le
+> garde-fou CRC32 ne se déclenche que ce jour-là. L'upper persistant
+> `fast_pool/rootfs` sert surtout à conserver les ajustements *runtime* entre
+> deux boots, pas à appliquer les mises à jour.
+
 ---
 
 ## Création des datasets (par type)

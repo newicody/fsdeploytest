@@ -14,8 +14,10 @@ import ctypes
 import ctypes.util
 import fcntl
 import os
+import shutil
 import subprocess
 import sys
+import time
 
 # --- parametres --------------------------------------------------------------
 KVER        = os.uname().release
@@ -349,6 +351,82 @@ def writable_test(path):
         return False
 
 
+def sfs_crc32(path):
+    """CRC32 (zlib, standard 'crc32-b') du rootfs.sfs, en streaming par blocs
+    (pas de chargement complet). Sert a detecter un CHANGEMENT de sfs sous un
+    upper persistant. Rapide ; pas crypto, juste de l'identite. Retourne une
+    chaine hex, ou '' si illisible."""
+    import zlib
+    crc = 0
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                crc = zlib.crc32(chunk, crc)
+        return f"{crc & 0xffffffff:08x}"
+    except OSError:
+        return ""
+
+
+def upper_stale(upper_mnt, sfs_crc):
+    """L'upper persistant a-t-il ete engendre par un AUTRE sfs ? Compare le
+    marqueur .sfs-crc (ecrit dans l'upper) au CRC du sfs courant.
+    Retourne (stale, ancien_crc). stale=False si marqueur absent (1er boot)."""
+    marker = os.path.join(upper_mnt, "upper", ".sfs-crc")
+    try:
+        with open(marker) as f:
+            old = f.read().strip()
+    except OSError:
+        return (False, "")               # pas de marqueur -> 1er usage, pas perime
+    return (old != sfs_crc, old)
+
+
+def write_sfs_marker(upper_mnt, sfs_crc):
+    try:
+        with open(os.path.join(upper_mnt, "upper", ".sfs-crc"), "w") as f:
+            f.write(sfs_crc + "\n")
+    except OSError as e:
+        log(f"marqueur .sfs-crc non ecrit ({e})")
+
+
+def snapshot_and_reset_upper(old_crc, sfs_crc):
+    """Le sfs a change : on SNAPSHOTE l'ancien upper (coherent), on l'ENVOIE
+    vers data_pool/archives (durable), puis on VIDE le contenu de l'upper (PAS
+    le dataset -> on garde ses proprietes xattr/acl). Retourne un message de
+    bilan (non bloquant : un echec de snapshot ne doit pas empecher de booter,
+    mais on le signale fort)."""
+    snap = f"{UPPER_DS}@presfs-{old_crc or 'unknown'}-{int(time.time())}"
+    notes = []
+    if run(["zfs", "snapshot", snap]) == 0:
+        notes.append(f"snapshot {snap}")
+        dest = f"data_pool/archives/rootfs-presfs-{old_crc or 'unknown'}"
+        # send|recv vers data_pool (durable) ; best-effort
+        rc = os.system(f"zfs send {snap} | zfs recv -F {dest} "
+                       f">/dev/null 2>&1")
+        notes.append(f"send -> {dest} ({'ok' if rc == 0 else 'ECHEC'})")
+    else:
+        notes.append(f"snapshot {snap} ECHEC (ancien upper NON sauvegarde)")
+    # vider le contenu de l'upper (upperdir + workdir), garder le dataset
+    for sub in ("upper", "work"):
+        d = f"/mnt/ovl/{sub}"
+        try:
+            if os.path.isdir(d):
+                for name in os.listdir(d):
+                    p = os.path.join(d, name)
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        try:
+                            os.unlink(p)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    os.makedirs("/mnt/ovl/upper", exist_ok=True)
+    os.makedirs("/mnt/ovl/work", exist_ok=True)
+    write_sfs_marker("/mnt/ovl", sfs_crc)
+    return " | ".join(notes)
+
+
 def main():
     os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
 
@@ -450,6 +528,23 @@ def main():
         else:
             use_persistent_upper = True
             log(f"upper persistant : {UPPER_DS} (sain, inscriptible)")
+            os.makedirs("/mnt/ovl/upper", exist_ok=True)   # avant le check marqueur
+            os.makedirs("/mnt/ovl/work", exist_ok=True)
+            # changement de sfs ? CRC du sfs courant vs marqueur dans l'upper
+            crc = sfs_crc32(f"/mnt/sfs/{rootfs_name}")
+            stale, old = upper_stale("/mnt/ovl", crc)
+            if stale:
+                log(f"!! rootfs.sfs A CHANGE (crc {old} -> {crc}) : "
+                    f"l'upper persistant est PERIME pour ce sfs.")
+                log("   -> snapshot de l'ancien upper + upper NEUF "
+                    "(les modifs repartent du nouveau sfs)")
+                bilan = snapshot_and_reset_upper(old, crc)
+                log(f"   {bilan}")
+            elif not old:
+                write_sfs_marker("/mnt/ovl", crc)   # 1er boot : poser le marqueur
+                log(f"upper neuf, marqueur sfs pose (crc {crc})")
+            else:
+                log(f"sfs inchange (crc {crc}) : upper persistant reutilise")
     else:
         degraded_reasons.append(
             f"{UPPER_DS} absent (1er boot ? cree-le : zfs create {UPPER_DS})")

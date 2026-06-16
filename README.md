@@ -919,6 +919,25 @@ enabled = false      # force false en chroot ; true en systeme boote
 > dessus serait trop risqué. Le stream **vidéo** démarre au vrai boot (`init.py`,
 > qui a `/dev/fb0`) ; en chroot, le suivi se fait via le fichier rapport.
 
+### Prérequis chroot (vérifiés par `preflight`)
+
+`first_boot.py` lance un **preflight** qui détecte les prérequis hors `infra.conf`
+et **propose les commandes** (sans les exécuter) :
+
+- **efivarfs non monté** → `efibootmgr` échoue (`exit 2`, « EFI variables not
+  supported »). Monte-le : `mount -t efivarfs efivarfs /sys/firmware/efi/efivars`.
+  (`kernel_build.py` tente aussi de le monter automatiquement.)
+- **`/usr/src/linux` cassé** (boucle de symlink → « too many levels of symbolic
+  links ») : `rm /usr/src/linux ; ln -s /usr/src/linux-<version> /usr/src/linux`.
+- **2e ESP non montée** (rsync impossible) : `mount /dev/nvme1n1p1 /mnt/esp2`.
+
+> Les binaires `zpool`/`zfs`/`mount.zfs` **doivent** être trouvables (`sys-fs/zfs`
+> installé, `/sbin` accessible). `build_initramfs.py` les cherche d'abord dans
+> `/sbin` (robuste en chroot où le PATH est incomplet) et **arrête le build**
+> s'ils manquent (image non-bootable sinon). Vérifie : `which zpool zfs mount.zfs`.
+
+
+
 ## Boucle d'auto-update du noyau
 
 ```sh

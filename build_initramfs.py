@@ -50,14 +50,14 @@ def need_root():
 
 
 def which(name):
-    p = shutil.which(name)
-    if p:
-        return p
-    for d in ("/sbin", "/usr/sbin", "/usr/bin", "/bin"):
+    # en chroot le PATH peut etre incomplet : on cherche d'abord dans les
+    # dossiers systeme standards, puis on retombe sur shutil.which.
+    for d in ("/sbin", "/usr/sbin", "/usr/bin", "/bin", "/usr/local/sbin",
+              "/usr/local/bin"):
         c = os.path.join(d, name)
         if os.path.exists(c):
             return c
-    return None
+    return shutil.which(name)
 
 
 def copy(src, stage):
@@ -241,8 +241,24 @@ def main():
 
         bundle_python(stage)
         bundle_busybox(stage)
+        # binaires CRITIQUES : leur absence rend l'initramfs non-bootable.
+        # On ARRETE le build plutot que de produire une image cassee.
+        manquants = []
         for b in ("zpool", "zfs", "mount.zfs", "ip"):
-            copy_with_deps(b, stage)
+            if not copy_with_deps(b, stage):
+                manquants.append(b)
+        critiques = [b for b in manquants if b != "ip"]   # ip = degradable
+        if critiques:
+            raise SystemExit(
+                "ECHEC build initramfs : binaires introuvables sur le systeme "
+                f": {', '.join(critiques)}.\n"
+                "  Verifie : which zpool zfs mount.zfs ; ls -la /sbin/zpool "
+                "/sbin/zfs /sbin/mount.zfs\n"
+                "  En chroot : sys-fs/zfs doit etre installe (emerge sys-fs/zfs) "
+                "et /sbin dans le PATH.")
+        if "ip" in manquants:
+            msg("ATTENTION: 'ip' absent -> reseau initramfs indisponible "
+                "(non bloquant pour le boot local)")
         bundle_modules(stage)
         bundle_firmware(stage)
 

@@ -40,9 +40,37 @@ def out(cmd):
 
 
 def efi_entry(label):
-    m = re.findall(rf"^Boot([0-9A-Fa-f]{{4}})\*?\s+{re.escape(label)}$",
+    # NB: efibootmgr affiche 'Boot0002* Gentoo-x.y\tHD(...)/File(...)' : le label
+    # est suivi du chemin du loader. On NE doit donc PAS ancrer sur $ (sinon
+    # l'entree existe mais n'est pas retrouvee). On matche le label en debut de
+    # champ, suivi d'un separateur (tab/espaces/fin).
+    m = re.findall(rf"^Boot([0-9A-Fa-f]{{4}})\*?\s+{re.escape(label)}(?:\s|$)",
                    out(["efibootmgr"]), re.M)
     return m[0] if m else None
+
+
+def ensure_efivarfs():
+    """efibootmgr a besoin de /sys/firmware/efi/efivars monte (sinon exit 2
+    'EFI variables are not supported'). On le monte si besoin (en chroot il ne
+    l'est pas). Retourne True si disponible."""
+    p = "/sys/firmware/efi/efivars"
+    if os.path.ismount(p):
+        return True
+    try:
+        if os.listdir(p):                # non vide -> deja accessible
+            return True
+    except OSError:
+        pass
+    subprocess.run(["mount", "-t", "efivarfs", "efivarfs", p],
+                   stderr=subprocess.DEVNULL)
+    return os.path.ismount(p) or bool(_safe_listdir(p))
+
+
+def _safe_listdir(p):
+    try:
+        return os.listdir(p)
+    except OSError:
+        return []
 
 
 def main():
@@ -114,6 +142,10 @@ def main():
     msg(f"stage ESP : vmlinuz-{kver}.efi + initramfs-{kver}.zst")
 
     # 6. entree EFI versionnee + BootNext
+    if not ensure_efivarfs():
+        sys.exit("efivarfs indisponible : impossible d'ecrire les variables EFI.\n"
+                 "  En chroot, monte-le avant : "
+                 "mount -t efivarfs efivarfs /sys/firmware/efi/efivars")
     efi_dir = DEST_DIR.replace("/", "\\")
     label = f"Gentoo-{kver}"
     old = efi_entry(label)
@@ -125,7 +157,9 @@ def main():
          "--unicode", f"initrd=\\{efi_dir}\\initramfs-{kver}.zst {CMDLINE}"])
     new = efi_entry(label)
     if not new:
-        sys.exit("entree EFI introuvable apres creation")
+        # diagnostic : montrer ce que efibootmgr voit reellement
+        sys.exit("entree EFI introuvable apres creation. Sortie efibootmgr :\n"
+                 + out(["efibootmgr"]))
     run(["efibootmgr", "--bootnext", new])
     msg(f"entree {label} = Boot{new} — BootNext arme (essai unique)")
 

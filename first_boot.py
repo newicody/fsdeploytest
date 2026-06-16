@@ -359,6 +359,58 @@ def verify_infra(cfg, rep):
 # --------------------------------------------------------------------------- #
 # build (reutilise les modules existants par import)
 # --------------------------------------------------------------------------- #
+def preflight(cfg, src, rep):
+    """Verifie les prerequis de build qui ne sont PAS dans infra.conf mais
+    bloquent en chroot : efivarfs monte, ESP montees, /usr/src/linux sain.
+    PROPOSE les commandes de correction sans les executer (choix : non
+    intrusif). Retourne la liste des commandes a lancer (vide si tout est bon)."""
+    todo = []
+
+    # 1. efivarfs (sinon efibootmgr -> exit 2 'EFI variables not supported')
+    if not os.path.ismount("/sys/firmware/efi/efivars") and \
+       not os.path.exists("/sys/firmware/efi/efivars/dummy"):
+        # heuristique : repertoire vide ou absent => pas monte
+        try:
+            empty = not os.listdir("/sys/firmware/efi/efivars")
+        except OSError:
+            empty = True
+        if empty:
+            rep.warn("efivarfs non monte -> efibootmgr echouera")
+            todo.append("mount -t efivarfs efivarfs /sys/firmware/efi/efivars")
+
+    # 2. /usr/src/linux : boucle de symlink / cible cassee
+    link = src
+    try:
+        real = os.path.realpath(link)
+        if not os.path.isdir(real):
+            rep.crit(f"{link} -> {real} : cible invalide (symlink casse ?)")
+            todo.append(f"# corrige le lien : rm {link} ; "
+                        f"ln -s /usr/src/linux-<version> {link}")
+        elif not os.path.exists(os.path.join(real, "Makefile")):
+            rep.warn(f"{link} ne contient pas de Makefile noyau")
+    except OSError as e:
+        rep.crit(f"{link} illisible ({e}) -- boucle de symlink ?")
+        todo.append(f"# corrige le lien : rm {link} ; "
+                    f"ln -s /usr/src/linux-<version> {link}")
+
+    # 3. ESP du second disque (declarees mais non montees en chroot)
+    efi = cfg.get("efi", {}) if hasattr(cfg, "get") else {}
+    parts = efi.get("partitions", []) if efi else []
+    if isinstance(parts, str):
+        parts = [parts]
+    # quelles ESP sont effectivement montees ?
+    try:
+        mounts = open("/proc/mounts").read()
+    except OSError:
+        mounts = ""
+    for p in parts:
+        if os.path.exists(p) and p not in mounts:
+            rep.warn(f"ESP {p} presente mais NON montee (rsync 2e ESP impossible)")
+            todo.append(f"mkdir -p /mnt/esp2 ; mount {p} /mnt/esp2  "
+                        f"# pour synchroniser la 2e ESP")
+    return todo
+
+
 def run_build(config_path, rep, src="/usr/src/linux"):
     """Stage le .config fourni puis delegue a kernel_build.py (compile,
     zfs-kmod, sfs, initramfs, EFI, registre). Pas de reecriture : on appelle
@@ -417,6 +469,22 @@ def _local_confirm():
     return ans.strip().lower() in ("y", "o", "yes", "oui")
 
 
+def _push_failure(rep, repo, resume):
+    """Remonte un ECHEC sur le board git (pas seulement le rapport final).
+    Best-effort : si le board n'est pas configure, on consigne localement."""
+    if not repo or not os.environ.get("GITHUB_TOKEN"):
+        return                              # pas de board -> deja dans le rapport local
+    try:
+        import brainstorm
+        import github_board as gb
+        idea = brainstorm.from_note(f"ECHEC first-boot : {resume}", rep.text())
+        idea.set_status(brainstorm.S_DROP)   # echec -> colonne/label drop
+        gb.Board(gb.GitHubTransport(repo)).push(idea)
+        print(f"   (echec remonte sur le board : {repo})", flush=True)
+    except Exception as e:
+        print(f"   (remontee board impossible : {e})", flush=True)
+
+
 # --------------------------------------------------------------------------- #
 def main():
     ap = argparse.ArgumentParser(
@@ -471,11 +539,30 @@ def main():
     if not coherent:
         print("!! ECART(S) CRITIQUE(S) -> first-boot STOPPE. "
               "Corrige l'infra (cf. rapport) puis relance.", flush=True)
+        _push_failure(rep, a.repo, "infra non conforme")
         stop_stream(stream)
         sys.exit(2)
 
+    # preflight : prerequis de build hors infra.conf (efivarfs, ESP, /usr/src)
+    print(">> preflight (efivarfs, ESP, /usr/src/linux)...", flush=True)
+    todo = preflight(cfg, a.src, rep)
+    print(rep.text(), flush=True)
+    if todo:
+        print("!! prerequis manquants. Commandes a lancer AVANT de relancer "
+              "first_boot :", flush=True)
+        for cmd in todo:
+            print(f"    {cmd}", flush=True)
+        # un prerequis critique (rep.criticals nouveau) stoppe ; sinon on
+        # laisse l'utilisateur decider (warnings) mais on s'arrete par securite
+        # car efibootmgr/rsync echoueraient.
+        print("\n   Lance ces commandes puis relance first_boot.py.", flush=True)
+        _push_failure(rep, a.repo, "prerequis preflight manquants")
+        stop_stream(stream)
+        sys.exit(4)
+
     if a.dry_run:
-        print(">> dry-run : infra conforme, arret avant build.", flush=True)
+        print(">> dry-run : infra conforme + preflight OK, arret avant build.",
+              flush=True)
         stop_stream(stream)
         return
 
@@ -484,6 +571,7 @@ def main():
     write_report(rep)
     if not built:
         print("!! build echoue (cf. sortie kernel_build). Rien arme.", flush=True)
+        _push_failure(rep, a.repo, "build echoue")
         stop_stream(stream)
         sys.exit(3)
 

@@ -70,6 +70,18 @@ def main():
     run(["emerge", "--quiet-build=y", "-1", "sys-fs/zfs-kmod"])
     run(["depmod", kver])
 
+    # garde-fou : zfs.ko DOIT exister pour CE noyau, sinon l'initramfs partirait
+    # sans ZFS et init.py mourrait a l'etape 2 (pas de boot). On verifie avant
+    # de construire l'initramfs ET avant d'armer BootNext.
+    zko = subprocess.run(["modinfo", "-k", kver, "-n", "zfs"],
+                         capture_output=True, text=True).stdout.strip()
+    if not zko or not os.path.exists(zko):
+        sys.exit(f"ECHEC: zfs.ko absent pour {kver} apres emerge zfs-kmod.\n"
+                 f"  -> zfs-kmod ne supporte peut-etre pas encore ce noyau.\n"
+                 f"  -> reste sur le noyau actuel, ou essaie ~arch zfs-kmod.\n"
+                 f"  (rien n'a ete stage sur l'ESP, BootNext non arme.)")
+    msg(f"zfs.ko present : {zko}")
+
     # 3. modules-<ver>.sfs sur fast_pool/sfs
     subprocess.run(["zfs", "mount", "fast_pool/sfs"], stderr=subprocess.DEVNULL)
     sfs_mnt = out(["zfs", "get", "-H", "-o", "value", "mountpoint",

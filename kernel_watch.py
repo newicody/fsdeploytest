@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse, json, os, re, subprocess, sys, urllib.error, urllib.request
 from pathlib import Path
 
+import config_delta
+
 DEF_SRC      = "/usr/src/linux"
 DEF_ENDPOINT = "http://127.0.0.1:11434/v1"    # Ollama (API OpenAI-compatible)
 DEF_MODEL    = "qwen3:30b"                     # tag Ollama (verifier `ollama list`)
@@ -106,28 +108,58 @@ def approve(props):
         reason = p.get("reason", "")
         ans = input(f"  [{val}] {sym} — {reason}\n      appliquer ? ").strip().lower()
         if ans in ("", "y", "o"):
-            chosen.append((sym, val))
+            chosen.append((sym, val, reason))
         elif ans == "e":
             nv = (input("      valeur (y/m/n) : ").strip() or val)
-            chosen.append((sym, nv))
+            chosen.append((sym, nv, reason + " [valeur ajustee manuellement]"))
     return chosen
 
 def write_fragment(chosen, path):
     out = []
-    for sym, val in chosen:
+    for entry in chosen:
+        sym, val = entry[0], entry[1]
         base = sym if sym.startswith("CONFIG_") else "CONFIG_" + sym
         out.append(f"# {base} is not set" if val == "n" else f"{base}={val}")
     Path(path).write_text("\n".join(out) + "\n")
     return path
 
 def apply_fragment(src, config, fragment):
+    """Merge le fragment validE, PUIS montre exactement ce qu'olddefconfig
+    resout/change tout seul avant d'enteriner (point aveugle comble).
+    Retourne le ConfigDelta complet (etat initial -> etat final entérine)."""
+    before_all = config_delta.parse_config(config)
     merge = Path(src) / "scripts" / "kconfig" / "merge_config.sh"
     if merge.exists():
         run([str(merge), "-m", config, fragment], cwd=src)
     else:
         print("!! merge_config.sh absent — fragment non fusionne", file=sys.stderr)
+
+    # olddefconfig sur COPIE d'abord : on regarde ce qu'il change seul
+    try:
+        delta, resolved = config_delta.diff_around_olddefconfig(src, config)
+    except RuntimeError as e:
+        print(f"!! {e}")
+        sys.exit(1)
+
+    if delta:
+        print("\n=== olddefconfig modifierait AUSSI (resolution auto) ===")
+        print(config_delta.summarize(delta))
+        # signaler specifiquement les retraits/desactivations : potentiellement
+        # une dependance cassee par le patch -> a verifier
+        risky = delta["disabled"] + delta["removed"]
+        if risky:
+            print("\n!! attention, desactivations/retraits silencieux ci-dessus "
+                  "(dependance Kconfig possiblement cassee par le patch).")
+        ans = input("appliquer cette resolution ? [Y/n] ").strip().lower()
+        if ans not in ("", "y", "o"):
+            print("resolution refusee — .config inchange.")
+            sys.exit(0)
+    # enteriner : olddefconfig pour de vrai sur l'original
     run(["make", "-C", src, "olddefconfig"],
         env=dict(os.environ, KCONFIG_CONFIG=config))
+
+    after_all = config_delta.parse_config(config)
+    return config_delta.diff_configs(before_all, after_all)
 
 def main():
     ap = argparse.ArgumentParser()
@@ -136,6 +168,8 @@ def main():
     ap.add_argument("--endpoint", default=DEF_ENDPOINT)
     ap.add_argument("--model", default=DEF_MODEL)
     ap.add_argument("--fragment", default="/tmp/proposed.config")
+    ap.add_argument("--history", default="/fast_pool/boot/config-history",
+                    help="dossier parent d'archivage des configs validees")
     ap.add_argument("--force", action="store_true",
                     help="sauter le check de version (traiter les symboles courants)")
     a = ap.parse_args()
@@ -171,7 +205,26 @@ def main():
 
     frag = write_fragment(chosen, a.fragment)
     print(f"fragment ecrit : {frag}")
-    apply_fragment(a.src, config, frag)
+    delta = apply_fragment(a.src, config, frag)
+
+    # --- archivage historique (avant compilation) ---------------------------
+    import config_history
+    reasons = {e[0] if e[0].startswith("CONFIG_") else "CONFIG_" + e[0]: e[2]
+               for e in chosen if len(e) > 2}
+    kr = run(["make", "-C", a.src, "-s", "kernelrelease"],
+             env=dict(os.environ, KCONFIG_CONFIG=config))
+    kver = (kr.stdout.strip().splitlines() or [cur])[-1] if kr.returncode == 0 else cur
+    try:
+        dest = config_history.record(a.history, kver, config, delta, reasons,
+                                     src=a.src)
+        svg = config_history.render_graph(a.history)
+        idx = config_history.render_index(a.history)
+        print(f"\nhistorique archive : {dest}")
+        print(f"  doc/raisons : {dest}/doc.md")
+        print(f"  graphe      : {svg}")
+        print(f"  index       : {idx}")
+    except OSError as e:
+        print(f"!! archivage historique echoue ({e})")
 
     d = run(["git", "-C", a.src, "diff", "--", ".config"])
     print("\n=== diff .config ===\n" + (d.stdout or "(pas de diff git — verifie a la main)"))

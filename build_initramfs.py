@@ -127,19 +127,46 @@ def bundle_busybox(stage):
     msg("busybox (secours)")
 
 
+def _modinfo(kver, mod, field):
+    try:
+        return subprocess.run(["modinfo", "-k", kver, "-F", field, mod],
+                              capture_output=True, text=True).stdout.strip()
+    except Exception:
+        return ""
+
+
+def zfs_load_order(kver):
+    """Ordre topologique (deps d'abord) de la famille zfs, en partant de 'zfs'.
+    Robuste aux builds OpenZFS monolithiques (spl+zfs) comme splittes
+    (spl,znvpair,zcommon,icp,...). Les deps built-in (=y, pas de .ko) sont
+    ignorees : seuls les modules ayant un vrai .ko sont retenus."""
+    order, seen = [], set()
+
+    def visit(mod):
+        if mod in seen:
+            return
+        seen.add(mod)
+        for d in _modinfo(kver, mod, "depends").split(","):
+            if d.strip():
+                visit(d.strip())
+        order.append(mod)
+
+    visit("zfs")
+    return order
+
+
 def bundle_modules(stage):
-    """spl.ko + zfs.ko, decompresses si .zst/.xz (finit_module veut du brut)."""
+    """Embarque la famille zfs (deps d'abord), decompresse si .zst/.xz
+    (finit_module veut du brut), et ecrit l'ordre de chargement pour init.py."""
     extra = f"{stage}/lib/modules/{KVER}/extra"
     os.makedirs(extra, exist_ok=True)
-    for mod in ("spl", "zfs"):
-        try:
-            path = subprocess.run(["modinfo", "-k", KVER, "-n", mod],
-                                  capture_output=True, text=True).stdout.strip()
-        except Exception:
-            path = ""
-        if not path or not os.path.exists(path):
-            msg(f"ATTENTION: module {mod} introuvable pour {KVER}")
-            continue
+    bundled = []
+    for mod in zfs_load_order(KVER):
+        path = _modinfo(KVER, mod, "filename") or \
+            subprocess.run(["modinfo", "-k", KVER, "-n", mod],
+                           capture_output=True, text=True).stdout.strip()
+        if not path or path == "(builtin)" or not os.path.exists(path):
+            continue                          # built-in ou absent -> rien a embarquer
         dst = os.path.join(extra, f"{mod}.ko")
         if path.endswith(".zst"):
             with open(dst, "wb") as o:
@@ -149,9 +176,16 @@ def bundle_modules(stage):
                 subprocess.run(["xz", "-d", "-c", path], stdout=o, check=True)
         else:
             shutil.copy2(path, dst)
+        bundled.append(mod)
+    if "zfs" not in bundled:
+        msg("ATTENTION: zfs.ko introuvable pour " + KVER +
+            " -- le boot echouera (lance emerge -1 sys-fs/zfs-kmod)")
+    # ordre de chargement consomme par init.py (deps d'abord, zfs en dernier)
+    with open(os.path.join(extra, "zfs_load_order"), "w") as f:
+        f.write("\n".join(bundled) + "\n")
     # depmod dans le stage
     subprocess.run(["depmod", "-b", stage, KVER], stderr=subprocess.DEVNULL)
-    msg("modules zfs/spl (+ depmod)")
+    msg(f"modules zfs ({', '.join(bundled) or 'AUCUN'}) + ordre + depmod")
 
 
 def bundle_firmware(stage):
@@ -215,9 +249,31 @@ def main():
             os.makedirs(f"{stage}/usr/bin", exist_ok=True)
             shutil.copy2(FFMPEG_STATIC, f"{stage}/usr/bin/ffmpeg")
             os.chmod(f"{stage}/usr/bin/ffmpeg", 0o755)
-            msg("ffmpeg statique inclus")
+            # verif rapide : binaire statique (sinon il faudrait ses libs)
+            try:
+                ld = subprocess.run(["ldd", FFMPEG_STATIC],
+                                    capture_output=True, text=True)
+                if "not a dynamic executable" not in (ld.stdout + ld.stderr):
+                    msg("ATTENTION: ffmpeg fourni semble DYNAMIQUE -- privilegie "
+                        "un build statique (ffmpeg-git static), sinon libs manquantes")
+            except Exception:
+                pass
+            msg("ffmpeg statique inclus (stream console de boot des l'init)")
         else:
-            msg("ffmpeg non inclus -> stream apres switch_root (session_launch)")
+            msg("ATTENTION: ffmpeg NON inclus -> PAS de stream pendant l'initramfs. "
+                "Fournis FFMPEG_STATIC=/chemin/ffmpeg (build statique) pour "
+                "streamer la console de boot des le chargement.")
+
+        # cle de stream YouTube : deposee dans l'initramfs si fournie au build
+        yt = os.environ.get("YT_KEY", "")
+        if yt:
+            with open(f"{stage}/etc/yt.key", "w") as f:
+                f.write(yt.strip() + "\n")
+            os.chmod(f"{stage}/etc/yt.key", 0o600)
+            msg("cle YouTube deposee (/etc/yt.key, 0600)")
+        else:
+            msg("pas de YT_KEY au build -> stream initramfs inactif "
+                "(depose /etc/yt.key dans l'initramfs ou passe YT_KEY=...)")
 
         if not os.path.exists(INIT_SRC):
             sys.exit(f"init introuvable: {INIT_SRC}")

@@ -34,19 +34,45 @@ Le firmware UEFI ne lit pas ZFS : noyau et initramfs sont **stagés sur l'ESP
 
 ## Arborescence du projet
 
+Trois sous-systèmes indépendants. Seul le premier est sur le **chemin de boot
+critique** (un échec = kernel panic / pas de boot) ; les deux autres sont de
+l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
+
 ```
 .
 ├── README.md
+│
+│  ── BOOT (chemin critique) ──────────────────────────────────────────
 ├── init.py               # PID 1 de l'initramfs (ctypes) — installé comme /init
-├── session_launch.py     # post-switch_root : seatd + cage + bascule stream wayland
-├── build_initramfs.py    # construit initramfs-<ver>.zst (embarque CPython)
-├── efi_install.py        # install EFI initiale (un seul noyau)
-├── kernel_watch.py       # auto-update 1/3 : moniteur + propositions config (LLM)
-├── kernel_build.py       # auto-update 2/3 : compile + zfs-kmod + sfs + EFI + BootNext
-└── boot_confirm.py       # auto-update 3/3 : health-check + promotion BootOrder
+│                         #   pseudo-FS → charge zfs → import pool → santé →
+│                         #   overlay squashfs → réseau → stream → switch_root
+├── build_initramfs.py    # construit initramfs-<ver>.zst : CPython + busybox +
+│                         #   zpool/zfs/mount.zfs/ip + famille zfs.ko + firmware
+├── session_launch.py     # post-switch_root (PID 1 du rootfs) : seatd + cage +
+│                         #   bascule du stream fbdev → capture wayland
+├── efi_install.py        # install EFI initiale (un seul noyau, manuel)
+│
+│  ── AUTO-UPDATE DU NOYAU (espace utilisateur) ───────────────────────
+├── kernel_diagnose.py    # étape 0 : diagnostic de cohérence au démarrage
+│                         #   (.config + dmesg + lsmod + health.json), non bloquant
+├── kernel_watch.py       # étape 1 : veille amont (tags git) + nouveaux symboles
+│                         #   Kconfig → propositions LLM → validation → fragment
+├── config_delta.py       #   comparaison catégorisée de .config + ce qu'olddefconfig
+│                         #   change tout seul (point aveugle comblé)
+├── config_history.py     #   archivage versionné des configs + doc/raisons + SVG
+├── kernel_build.py       # étape 2 : compile + garde-fou zfs.ko + modules.sfs +
+│                         #   initramfs + stage ESP + entrée EFI + BootNext
+├── boot_confirm.py       # étape 3 : health-check post-boot + promotion BootOrder
+│
+│  ── INFÉRENCE / RAG / BRAINSTORM (espace utilisateur, OpenVINO) ──────
+├── ov_pipelines.py       # registre de pipelines par métaclasse (auto-enregistrement)
+│                         #   + back-ends interchangeables (OpenVINO prod / Stub test)
+├── rag.py                # RAG multi-domaines : chunking, index, recherche+rerank
+├── brainstorm.py         # fiche idée (3 couches : candidats/acté/état) + moteur
+└── github_board.py       # pont board GitHub ↔ idées + watcher de confirmation prod
 ```
 
-Fichiers déployés **dans le rootfs Gentoo** :
+Fichiers déployés **dans le rootfs Gentoo** (cf. §5) :
 
 ```
 /sbin/session_launch.py              # depuis session_launch.py
@@ -54,6 +80,13 @@ Fichiers déployés **dans le rootfs Gentoo** :
 /etc/init.d/stream-session           # service OpenRC
 /etc/init.d/boot-confirm             # service OpenRC
 ```
+
+> **État de maturité (à lire avant de booter).** Tout a été testé *en
+> isolation* (parsing, logique), jamais sur le matériel cible ni avec OpenVINO
+> réel. Le bloc inférence/RAG/brainstorm tourne avec un back-end *stub* sans
+> OpenVINO ; brancher `openvino_genai` nécessitera de vérifier les noms de
+> méthode GenAI (isolés dans `ov_pipelines.OpenVINOBackend`). Le premier boot
+> reste un test réel — d'où le filet `BootNext`/`BootOrder` (§ auto-update).
 
 ---
 
@@ -119,10 +152,20 @@ emerge -av gui-wm/cage sys-auth/seatd gui-apps/foot \
 
 # Inférence
 emerge -av sci-ml/ollama
+# numpy : requis par rag.py (recherche vectorielle). Repli pur-Python existe
+# mais numpy est fortement recommande (perf).
+emerge -av dev-python/numpy
 ```
 
 > `python3` (et donc `ctypes`) est déjà fourni par `dev-lang/python` sur Gentoo —
-> rien à installer en plus pour les scripts du projet.
+> rien à installer en plus pour les scripts du **boot**.
+
+> **Bloc inférence/RAG/brainstorm** (`ov_pipelines.py`, `rag.py`, `brainstorm.py`,
+> `github_board.py`) : OpenVINO GenAI n'est pas packagé sur Gentoo — il s'installe
+> dans un venv dédié (cf. § OpenVINO). Tant qu'il est absent, le back-end *stub*
+> prend le relais (`RAG_BACKEND=stub`) et tout reste fonctionnel pour le
+> développement, sans inférence réelle. `github_board.py` n'a besoin que de la
+> stdlib (+ un `GITHUB_TOKEN` pour le transport réel).
 
 ## 4. Accès GPU + service Ollama
 
@@ -181,15 +224,27 @@ CONFIG_DRM=y, CONFIG_DRM_XE=y, CONFIG_DRM_XE_DISPLAY=y
 CONFIG_DRM_XE_FORCE_PROBE="4c8b"
 CONFIG_DRM_I915=y                        # repli
 CONFIG_FB=y, CONFIG_FRAMEBUFFER_CONSOLE=y, CONFIG_VT=y
+CONFIG_DRM_FBDEV_EMULATION=y             # cree /dev/fb0 (capture fbdev du stream)
+CONFIG_DRM_SIMPLEDRM=y, CONFIG_SYSFB_SIMPLEFB=y  # framebuffer EFI tres tot (boot)
 CONFIG_R8169=y, CONFIG_REALTEK_PHY=y     # PHY en dur OBLIGATOIRE avec r8169=y
 CONFIG_IP_PNP=y                          # réseau configuré avant l'userspace
 CONFIG_FW_LOADER=y
 CONFIG_RD_ZSTD=y                         # décompression de l'initramfs .zst
+
+# Dépendances NOYAU de ZFS — DOIVENT être =y (en dur), sinon zfs.ko ne charge
+# pas (finit_module ne résout pas les symboles manquants -> panic à l'étape 2).
+# init.py charge zfs via finit_module SANS modprobe : aucune dépendance =m ne
+# sera auto-chargée. D'où l'obligation du =y ci-dessous.
+CONFIG_ZLIB_INFLATE=y, CONFIG_ZLIB_DEFLATE=y
+CONFIG_CRYPTO=y, CONFIG_CRYPTO_DEFLATE=y
+CONFIG_CRYPTO_SHA256=y, CONFIG_CRYPTO_SHA512=y
+CONFIG_CRYPTO_AES=y, CONFIG_CRYPTO_GCM=y  # si pools chiffrés ; sans risque sinon
 # Firmware (rtl_nic + i915 GuC/HuC/DMC) embarqué dans l'initramfs par
 # build_initramfs.py -> CONFIG_EXTRA_FIRMWARE inutile (l'initramfs est
 # décompressé AVANT les initcalls des drivers =y, donc /lib/firmware est là).
 
-# Modules hors-arbre (chargés par init.py via finit_module)
+# Modules hors-arbre (chargés par init.py via finit_module, dans l'ordre des
+# dépendances découvert par build_initramfs.py : spl -> ... -> zfs)
 zfs, spl
 ```
 
@@ -213,6 +268,104 @@ i915.force_probe=!4c8b xe.force_probe=4c8b ip=192.168.1.10::192.168.1.1:255.255.
 
 ## 7. Générer `rootfs.sfs`
 
+### 7.1 Nettoyage de la racine avant `mksquashfs`
+
+L'image devient **lecture seule** (lower de l'overlay) : tout ce qui reste
+dedans y reste pour toujours, et tout ce qui manque pour les montages fera
+échouer `init.py`/`session_launch.py` au boot. À faire sur `<racine_gentoo>`
+juste avant `mksquashfs` :
+
+```sh
+R=<racine_gentoo>
+
+# --- nettoyage Portage propre (avant de figer l'image) ----------------------
+# ATTENTION : emerge/eclean agissent sur la base Portage du systeme COURANT
+# (/var/db/pkg), pas sur $R directement. Deux cas :
+#  - tu construis le rootfs DANS un chroot/conteneur dedie -> lance ces
+#    commandes DANS ce chroot (PORTAGE_CONFIGROOT/ROOT pointent dessus par defaut)
+#  - tu pars d'une copie de ton systeme courant -> lance-les AVANT de copier
+#    vers $R, sur le systeme source, pas apres
+#
+# 1. paquets orphelins (plus references par @world/dependances)
+emerge --depclean -a
+
+# 2. tarballs sources et binpkgs obsoletes/non installes
+#    (eclean vient de app-portage/gentoolkit : emerge -av app-portage/gentoolkit si absent)
+eclean-dist --deep          # purge var/cache/distfiles (sources .tar.* telechargees)
+eclean-pkg  --deep          # purge var/cache/binpkgs (paquets binaires obsoletes)
+
+# 3. residus que depclean/eclean ne couvrent pas, a faire sur $R une fois la
+#    copie/le chroot pret : logs de build (souvent plusieurs Go) et arbre
+#    Portage legacy si tu es passe a un sync git/squashfs
+rm -rf "$R"/var/tmp/portage/*
+rm -rf "$R"/usr/portage "$R"/var/db/repos/*/.git 2>/dev/null
+
+# --- logs / etats de session du systeme qui a servi a construire l'image ---
+rm -rf "$R"/var/log/*.log "$R"/var/log/*/*.log
+rm -f  "$R"/var/lib/portage/world.lock 2>/dev/null
+rm -rf "$R"/run/* "$R"/tmp/*
+
+# --- caches Python : __pycache__/.pyc ne doivent pas figer une mauvaise version
+find "$R" -name '__pycache__' -type d -prune -exec rm -rf {} +
+find "$R" -name '*.pyc' -delete
+
+# --- historiques shell / clefs SSH ephemeres de la machine de build ---
+rm -f "$R"/root/.bash_history "$R"/root/.viminfo
+rm -rf "$R"/etc/ssh/ssh_host_*        # regeneres au premier boot (ssh-keygen)
+
+# --- machine-id : doit etre regenere, pas figé dans une image partagee ---
+rm -f "$R"/etc/machine-id
+: > "$R"/etc/machine-id 2>/dev/null || true
+
+# --- handoff initramfs : ne doit pas preexister dans l'image (cf. init.py §...) ---
+rm -f "$R"/etc/yt.key "$R"/etc/initramfs-stream.pid "$R"/etc/resolv.conf
+```
+
+> Ne supprime **pas** `/etc/portage/` (config), `/var/db/pkg/` (base de
+> paquets installes — necessaire pour `emerge` apres pivot si tu veux gerer
+> le systeme depuis la session), ni quoi que ce soit sous `/sbin/session_launch.py`,
+> `/usr/local/sbin/boot_confirm.py`, `/lib/modules/`.
+
+### 7.2 Vérification des répertoires de montage attendus
+
+`init.py` et `session_launch.py` font des `mount`/`mkdir` sur des chemins
+précis de `NEWROOT` (= la racine que tu empaquettes). Vérifie qu'ils
+existent (vides, juste les dossiers) **avant** `mksquashfs` — sinon `init.py`
+les crée lui-même au boot (`os.makedirs(..., exist_ok=True)`), mais autant
+les avoir dans l'image pour éviter toute écriture sur l'overlay dès le
+premier montage :
+
+```sh
+R=<racine_gentoo>
+
+for d in proc sys dev dev/pts run etc sbin \
+         "lib/modules/$(uname -r)"; do
+  mkdir -p "$R/$d"
+done
+
+# verif rapide : presence des cibles que init.py va peupler/monter sous NEWROOT
+for d in proc sys dev run etc "lib/modules/$(uname -r)" sbin; do
+  [ -d "$R/$d" ] || echo "MANQUANT: $R/$d"
+done
+
+# session_launch.py doit etre present et executable -> sinon init.py
+# echoue sur "switch_root: $NEWROOT/sbin/session_launch.py absent"
+[ -x "$R/sbin/session_launch.py" ] || echo "MANQUANT/non-executable: $R/sbin/session_launch.py"
+
+# binaires requis par session_launch.py (cage/sway, seatd, ffmpeg, wl-screenrec...)
+for b in cage seatd ffmpeg; do
+  [ -x "$R/usr/bin/$b" ] || [ -x "$R/usr/sbin/$b" ] || echo "MANQUANT: $b dans le rootfs"
+done
+```
+
+> Note : `proc`, `sys`, `dev`, `run` sont remontés par `session_launch.py`
+> juste après le `switch_root` — seul le **dossier** doit exister dans l'image
+> (vide), pas son contenu. `lib/modules/$(uname -r)` : si tu construis sur une
+> machine différente de la cible (ou un noyau pas encore booté), remplace
+> `$(uname -r)` par la version exacte du noyau cible
+> (`make -C /usr/src/linux -s kernelrelease`) — c'est le même nom que
+> `modules-<ver>.sfs` que monte `init.py` étape 5.
+
 ```sh
 zfs mount fast_pool/sfs
 mksquashfs <racine_gentoo> $(zfs get -H -o value mountpoint fast_pool/sfs)/rootfs.sfs \
@@ -223,19 +376,45 @@ mksquashfs <racine_gentoo> $(zfs get -H -o value mountpoint fast_pool/sfs)/rootf
 ## 8. Construire l'initramfs
 
 `build_initramfs.py` embarque CPython (interpréteur + stdlib allégée + `.so` via
-`ldd`), busybox (secours), `zpool`/`zfs`/`mount.zfs`/`ip`, décompresse
-`spl.ko`/`zfs.ko`, copie les firmware (`rtl_nic` + `i915/tgl_*`/`rkl_*` pour
+`ldd`), busybox (secours), `zpool`/`zfs`/`mount.zfs`/`ip`, décompresse la
+**famille `zfs.ko`** (ordre de dépendances découvert via `modinfo`, écrit dans
+`zfs_load_order`), copie les firmware (`rtl_nic` + `i915/tgl_*`/`rkl_*` pour
 GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
-`/dev`, et installe `init.py` comme `/init`.
+`/dev`, embarque **ffmpeg statique** (stream console de boot), et installe
+`init.py` comme `/init`.
 
 > Prérequis : `sys-kernel/linux-firmware` doit être installé sur la machine de
 > build (les blobs sont lus depuis `/lib/firmware/`). Les motifs sont
 > surchargeables via `FW_GLOBS`.
 
+### Stream de la console de boot dès l'init
+
+`init.py` démarre le stream **dès les pseudo-FS montés** (avant ZFS) : tout le
+boot est visible en direct sur YouTube. Deux conditions :
+
+- **ffmpeg statique embarqué** — passe `FFMPEG_STATIC=/chemin/ffmpeg` au build.
+  Il doit être *statique* (sinon ses libs manquent dans l'initramfs). Source
+  d'un binaire statique : les builds [johnvansickle/ffmpeg-static], ou
+  `emerge -av media-video/ffmpeg` avec `static-libs` puis link statique.
+- **clé de stream YouTube** — passe `YT_KEY=xxxx-xxxx-xxxx-xxxx` au build, qui
+  la dépose dans `/etc/yt.key` (0600) de l'initramfs. `init.py` la lit là.
+
 ```sh
 # À lancer en root, avec le python SYSTÈME (PAS dans un venv)
-sudo /usr/bin/python3 build_initramfs.py     # -> initramfs-<ver>.zst (~30-50 Mo)
+sudo env FFMPEG_STATIC=/usr/local/bin/ffmpeg-static \
+         YT_KEY=xxxx-xxxx-xxxx-xxxx \
+         /usr/bin/python3 build_initramfs.py     # -> initramfs-<ver>.zst (~50-90 Mo)
 ```
+
+> Sans `FFMPEG_STATIC` ni `YT_KEY`, l'initramfs se construit quand même mais
+> **ne streame pas** pendant le boot (le stream démarre alors plus tard, après
+> `switch_root`, via `session_launch.py`). `init.py` n'est jamais bloqué par
+> l'absence de stream : il attend `/dev/fb0` au plus 8 s puis continue.
+
+> Le framebuffer capturé est `/dev/fb0`, fourni très tôt par `simpledrm`/`efifb`
+> (console EFI), puis repris par `xe` quand le GPU s'initialise — ffmpeg lit le
+> même device en continu. Après `switch_root`, `session_launch.py` tue ce
+> ffmpeg (handoff `/etc/initramfs-stream.pid`) et bascule sur la capture wayland.
 
 ## 9. Install EFI (initiale)
 
@@ -391,12 +570,49 @@ CPU reste la cible fiable.
 - **Initramfs** : stdlib Python allégée (test/idlelib/tkinter exclus), modules décompressés une fois.
 - **Groupes** : `render,video` sur l'utilisateur pour `/dev/dri`.
 
+## Check-list de vérification avant le premier boot réel
+
+Dans l'ordre, ce qui détermine si ça boote (testé en isolation, à valider en réel) :
+
+1. **Noyau compilé + `.config` cohérent** : `grep` de cohérence (§10), et surtout
+   les **dépendances noyau de ZFS en `=y`** (§6) — c'est la cause de panic n°1
+   (`zfs.ko` ne charge pas si crypto/zlib sont en `=m`, car `init.py` n'utilise
+   pas modprobe).
+2. **`zfs.ko` existe pour le bon noyau** : `modinfo -k <kver> -n zfs` doit
+   renvoyer un chemin réel après `emerge -1 sys-fs/zfs-kmod`. `kernel_build.py`
+   le vérifie désormais et refuse de continuer sinon.
+3. **`rootfs.sfs` généré avec `-xattrs`**, racine nettoyée, handoff
+   (`/etc/yt.key`, `/etc/initramfs-stream.pid`) **absent** de l'image (§7).
+4. **Initramfs construit** : vérifier la sortie de `build_initramfs.py` —
+   « modules zfs (spl, …, zfs) » doit lister `zfs` ; « firmware: N blobs » doit
+   être > 0 ; pas de « MANQUANT ». Il écrit aussi `zfs_load_order` (ordre de
+   chargement consommé par `init.py`). Pour le **stream console de boot** :
+   « ffmpeg statique inclus » + « cle YouTube deposee » doivent apparaître
+   (sinon `FFMPEG_STATIC`/`YT_KEY` manquaient — pas de stream pendant l'init),
+   et le `.config` doit avoir `CONFIG_DRM_FBDEV_EMULATION=y` (sinon pas de
+   `/dev/fb0` à capturer).
+5. **Entrée EFI de secours déjà en place** *avant* de tester ce noyau, pour que
+   `BootNext` (essai unique) puisse retomber dessus en cas d'échec.
+6. **Cmdline EFI** : `xe.force_probe=4c8b i915.force_probe=!4c8b` + `ip=…`
+   identiques entre `efi_install.py`/`kernel_build.py` et les valeurs réelles
+   (IP, PCI ID). `init.py` a les mêmes valeurs en repli (`IP_ADDR`, etc.).
+
+Diagnostic en cas d'échec : le rescue shell de `init.py` (busybox, sinon REPL
+Python) s'ouvre sur la console au premier `die()` — lis le dernier message
+`[init]`. Les messages partent aussi sur `/dev/kmsg` (visibles via `dmesg` si
+tu atteins un shell).
+
 ## Notes / limites
 
 - `init.py` est figé sur **x86_64** (`NR_finit_module=313`, loader `ld-linux-x86-64`).
+- `init.py`, `session_launch.py` deviennent **PID 1** : s'ils plantent ou se
+  terminent, c'est un kernel panic. `init.py` a un filet (rescue) ; un
+  compositeur (cage) qui sort en fin de session reste un point de fragilité.
 - CPython embarqué gonfle l'initramfs de ~30-50 Mo (coût de « tout en Python »).
 - Les appels `mount`/`finit_module`/`switch_root` ne se valident qu'au **boot réel** ;
   le reste (parseurs, liaison ctypes) est testé hors-cible.
+- Bloc inférence/RAG/brainstorm : testé avec le back-end *stub* uniquement ;
+  les appels OpenVINO GenAI réels restent à valider contre la version installée.
 
 ## À venir
 

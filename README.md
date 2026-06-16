@@ -19,16 +19,213 @@ le chemin de boot normal (busybox n'est embarqué que comme secours).
 - **ZFS** en module hors-arbre (CDDL — jamais `=y`)
 - 128 Go DDR4, 2 NVMe en stripe — pas de NPU, l'inférence vise le CPU
 
+## Fonctionnement (schémas)
+
+### Séquence de boot
+
+```mermaid
+flowchart TD
+    A["Firmware UEFI"] -->|"charge depuis ESP FAT"| B["Noyau EFI stub + initramfs"]
+    B --> C["init.py (PID 1)"]
+    C --> D["pseudo-FS: proc, sys, dev, run"]
+    D --> E["Stream console de boot vers YouTube"]
+    E --> F["Charge spl.ko puis zfs.ko"]
+    F --> G{"Import fast_pool ?"}
+    G -->|"OK"| H["mount.zfs fast_pool/sfs"]
+    G -->|"echec NVMe"| R["MODE SECOURS: boot_pool/images"]
+    H --> I["Overlay: rootfs.sfs + tmpfs upper"]
+    R --> I
+    I --> J["mount modules-ver.sfs"]
+    J --> K["Reseau statique"]
+    K --> L["switch_root vers session_launch.py"]
+    L --> M["seatd + cage + bascule capture wayland"]
+    M --> N["Session graphique streamee"]
+```
+
+### Les trois sous-systèmes et leurs fichiers
+
+```mermaid
+flowchart LR
+    subgraph BOOT["Chemin de boot (critique)"]
+        I1["init.py"] --> S1["session_launch.py"]
+        BI["build_initramfs.py"] -.->|"construit"| I1
+    end
+    subgraph UPD["Auto-update noyau"]
+        KD["kernel_diagnose.py"] --> KW["kernel_watch.py"]
+        KW --> CD["config_delta.py"]
+        KW --> CH["config_history.py"]
+        KW --> KB["kernel_build.py"]
+        KB --> BC["boot_confirm.py"]
+        KB --> KR["kernel_registry.py"]
+        BC --> KR
+    end
+    subgraph INF["Inference / RAG / brainstorm"]
+        OV["ov_pipelines.py"] --> RAG["rag.py"]
+        RAG --> BS["brainstorm.py"]
+        BS --> GB["github_board.py"]
+    end
+    KW -.->|"LLM"| OV
+    KD -.->|"LLM"| OV
+```
+
+### Boucle compile → boot → promotion (pilotée depuis GitHub)
+
+```mermaid
+sequenceDiagram
+    participant U as Humain
+    participant G as GitHub board
+    participant S as Serveur local
+    participant K as kernel_build
+    participant B as boot_confirm
+    U->>G: pousse une idee / change label en prod
+    S->>G: watch_once lit l'etat
+    G-->>S: state prod + acte en attente
+    S->>U: confirmation sur la machine (liste actee)
+    U->>S: valide
+    S->>K: compile + zfs-kmod + modules.sfs + initramfs
+    K->>K: stage ESP + entree EFI + BootNext
+    Note over S,B: reboot (essai unique BootNext)
+    B->>B: health-check post-boot
+    B->>G: promote current (sinon fallback auto)
+```
+
+---
+
 ## Disposition ZFS
 
-| Élément | Emplacement |
-|---|---|
-| Noyau `vmlinuz-<ver>` (bzImage) | `fast_pool/boot/` → copié sur l'ESP au déploiement |
-| `rootfs.sfs` (Gentoo) | `fast_pool/sfs` |
-| `modules-<ver>.sfs` | `fast_pool/sfs` |
+Trois pools, avec des niveaux de redondance **très différents** — c'est
+structurant pour la sécurité des données :
+
+| Pool | Type | Survit à | Rôle |
+|---|---|---|---|
+| `boot_pool` | mirror SATA | 1 disque | master rootfs/init + `boot_pool/manager` (index) + déploiement |
+| `data_pool` | raidz2 SATA | 2 disques | `home`, modèles, `archives` (snapshots), `log` (réplication) |
+| `fast_pool` | **stripe** 2×NVMe | **0 disque** | rootfs de travail, overlays, sfs, logs (rapide, **fragile**) |
+
+> **`fast_pool` est un stripe (RAID0) : aucune redondance.** Si un seul NVMe
+> lâche, **tout `fast_pool` est perdu et irrécupérable** (pas de parité). Tout
+> ce qui doit survivre doit donc avoir un master/réplica sur `boot_pool` ou
+> `data_pool`. Les snapshots *locaux* de `fast_pool` ne protègent pas d'une
+> panne disque : il faut un `zfs send` vers `data_pool/archives`.
+
+Datasets principaux :
+```
+boot_pool/images        rootfs.sfs MASTER (déployé en strip sur les NVMe)
+boot_pool/manager       index/historique du gestionnaire (durable, git-friendly)
+fast_pool/sfs           rootfs.sfs (travail) + modules-<ver>.sfs
+fast_pool/rootfs,var,tmp overlays (upper) — PERDUS si un NVMe lâche
+fast_pool/log           logs (rapide)
+data_pool/log           réplication durable des logs (zfs send depuis fast_pool)
+data_pool/home          données, modèles (10 To+)
+data_pool/archives      snapshots / sauvegardes (cible des zfs send)
+```
 
 Le firmware UEFI ne lit pas ZFS : noyau et initramfs sont **stagés sur l'ESP
-(FAT32)** ; `fast_pool` ne sert que de stockage.
+FAT32**. Les **deux ESP** (`nvme0n1p1`, `nvme1n1p1`, tenues en phase par rsync)
+permettent de booter sur l'autre disque depuis le BIOS si l'un meurt.
+
+### Mode dégradé (niveau 1) — perte de `fast_pool`
+
+Si `nvme` lâche, l'ESP de l'autre disque reste bootable, **mais `fast_pool`
+(stripe) est mort**. `init.py` le détecte (import `fast_pool` échoué) et
+**bascule en secours sur `boot_pool/images/rootfs.sfs`** avec un overlay tmpfs
+neuf, en affichant clairement : rootfs de base seulement, **overlays perdus**,
+système destiné à diagnostiquer/restaurer (pas une continuité). Un marqueur
+`/etc/rescue-mode` est posé dans le rootfs de secours.
+
+> La survie des overlays (`var`/`rootfs`) n'est PAS automatique : elle suppose
+> une réplication `zfs send` régulière vers `data_pool/archives`, et une
+> remontée **manuelle** d'un snapshot répliqué. Sans cette réplication, l'upper
+> est définitivement perdu à la panne NVMe.
+
+---
+
+## Création des datasets (par type)
+
+Règles ZFS à connaître avant de créer :
+- **Les propriétés s'héritent** : posées sur le pool ou un parent, elles
+  s'appliquent à tout ce qui est en-dessous. On pose donc les valeurs communes
+  haut, et on surcharge par dataset.
+- **Une propriété ne s'applique qu'aux écritures *suivantes*** — il faut la poser
+  **à la création**, pas après coup (sinon les fichiers déjà écrits gardent
+  l'ancienne valeur). `casesensitivity` et `normalization` sont **figés** à la
+  création.
+- `xattr=sa` + `acltype=posixacl` : nécessaires partout où le rootfs porte des
+  ACL/capabilities/contextes (overlays, rootfs de secours), et plus performants
+  que les xattr « directory ».
+
+### Réglages hérités (une fois, au niveau pool)
+
+```sh
+# valeurs communes posees haut -> heritees par tous les datasets crees ensuite
+zfs set atime=off          fast_pool
+zfs set xattr=sa           fast_pool
+zfs set acltype=posixacl   fast_pool
+zfs set compression=zstd   fast_pool   # surcharge en off pour les .sfs (cf. plus bas)
+zfs set atime=off xattr=sa acltype=posixacl compression=zstd boot_pool
+zfs set atime=off xattr=sa acltype=posixacl compression=zstd data_pool
+```
+
+### Par type de dataset
+
+```sh
+# --- 1. Stockage de .sfs (deja compresses) : PAS de double compression -------
+zfs create -o compression=off -o recordsize=1M \
+           -o mountpoint=/fast_pool/sfs              fast_pool/sfs
+#   recordsize=1M : gros fichiers .sfs lus sequentiellement ; compression=off
+#   car squashfs est deja en zstd.
+
+# --- 2. Overlays (upper de overlayfs) : ACL/xattr OBLIGATOIRES ----------------
+zfs create -o compression=zstd -o xattr=sa -o acltype=posixacl \
+           -o mountpoint=/fast_pool/rootfs           fast_pool/rootfs
+zfs create -o compression=zstd -o xattr=sa -o acltype=posixacl \
+           -o mountpoint=/fast_pool/var              fast_pool/var
+zfs create -o compression=zstd -o sync=disabled \
+           -o mountpoint=/fast_pool/tmp              fast_pool/tmp
+#   tmp : sync=disabled (ephemere, perf) ; pas besoin d'ACL.
+
+# --- 3. Logs : compression forte, recordsize moyen ---------------------------
+zfs create -o compression=zstd -o recordsize=128K \
+           -o mountpoint=/fast_pool/log              fast_pool/log
+zfs create -o compression=zstd -o recordsize=128K \
+           -o mountpoint=/data_pool/log              data_pool/log   # replica durable
+
+# --- 4. Master de deploiement + index gestionnaire (boot_pool, durable) ------
+zfs create -o compression=off \
+           -o mountpoint=/boot_pool/images           boot_pool/images   # rootfs.sfs master
+zfs create -o compression=zstd \
+           -o mountpoint=/boot_pool/manager          boot_pool/manager  # index (git-friendly)
+
+# --- 5. Donnees & archives (data_pool, raidz2) -------------------------------
+zfs create -o compression=zstd -o recordsize=1M \
+           -o mountpoint=/data_pool/home             data_pool/home     # modeles, data
+zfs create -o compression=zstd \
+           -o mountpoint=/data_pool/archives         data_pool/archives # cible zfs send
+
+# --- 6. Reserve d'espace (20% de fast_pool a ne jamais remplir) --------------
+#   Plutot qu'un dataset vide (grignotable), une refreservation au niveau pool :
+zfs create -o refreservation=200G -o mountpoint=none fast_pool/reserve
+#   (ajuste 200G selon 20% de ta capacite reelle de fast_pool)
+```
+
+### Type de montage (qui monte quoi, et quand)
+
+| Dataset | Monté par | Type |
+|---|---|---|
+| `fast_pool/sfs`, `boot_pool/images` | `init.py` (initramfs) | `mount.zfs` explicite, **pas** d'auto-mount |
+| overlays `fast_pool/{rootfs,var,tmp}` | overlayfs au boot (upper) | montés *dans* l'overlay, pas directement |
+| `boot_pool/manager`, `data_pool/*` | système booté (OpenRC) | auto-mount ZFS standard (mountpoint) |
+
+> `init.py` importe les pools avec `zpool import -N` (**`-N` = ne monte aucun
+> dataset automatiquement**) puis fait des `mount.zfs` explicites : le boot
+> contrôle exactement l'ordre et les cibles. Les datasets en `mountpoint=...`
+> qui ne sont PAS sur le chemin de boot (`boot_pool/manager`, `data_pool/*`)
+> sont montés normalement par le service ZFS une fois le système démarré.
+
+> `mountpoint=none` (ex. `fast_pool/reserve`) = jamais monté, sert juste à
+> réserver/organiser. `mountpoint=legacy` = monté via `/etc/fstab` ou
+> `mount -t zfs` manuel (on ne l'utilise pas ici, on préfère `mount.zfs`
+> explicite dans `init.py`).
 
 ---
 
@@ -63,6 +260,8 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 ├── kernel_build.py       # étape 2 : compile + garde-fou zfs.ko + modules.sfs +
 │                         #   initramfs + stage ESP + entrée EFI + BootNext
 ├── boot_confirm.py       # étape 3 : health-check post-boot + promotion BootOrder
+├── kernel_registry.py    #   index des versions : dataset ZFS/version + manifeste
+│                         #   kernels.json + audit de cohérence (menage manuel)
 │
 │  ── INFÉRENCE / RAG / BRAINSTORM (espace utilisateur, OpenVINO) ──────
 ├── ov_pipelines.py       # registre de pipelines par métaclasse (auto-enregistrement)
@@ -613,6 +812,39 @@ Diagnostic en cas d'échec : le rescue shell de `init.py` (busybox, sinon REPL
 Python) s'ouvre sur la console au premier `die()` — lis le dernier message
 `[init]`. Les messages partent aussi sur `/dev/kmsg` (visibles via `dmesg` si
 tu atteins un shell).
+
+## Gestionnaire de versions de noyau
+
+`kernel_registry.py` indexe les noyaux dans **un seul dataset durable**
+`boot_pool/manager` (mirror — survit à une panne disque, contrairement à
+`fast_pool`), via une arborescence de fichiers texte (git-friendly) :
+```
+boot_pool/manager/
+  manifest.json            index des versions (statut, refs artefacts)
+  kernels/<kver>/.config   config compilée, archivée
+  configs/<nom>/           configs ÉTUDIÉES (pas forcément compilées) + notes.md
+  history.jsonl            journal append-only : inférences + compilations
+```
+Les gros artefacts (`modules.sfs`, `initramfs`, `bzImage`) sont **référencés par
+chemin** (ils vivent sur l'ESP / `fast_pool`), jamais copiés dans l'arbre.
+
+Création du dataset (une fois) :
+```sh
+zfs create -o mountpoint=/boot_pool/manager boot_pool/manager
+```
+
+Mise à jour automatique : `kernel_build.py` enregistre en `candidate` + journalise
+la compilation ; `boot_confirm.py` promeut en `current` (ancienne → `fallback`).
+Indexation **seule** — pas de nettoyage automatique :
+```sh
+python3 kernel_registry.py audit      # [PROTEGE] / [SUPPRIMABLE] + artefacts manquants
+python3 kernel_registry.py history    # journal inférences/compilations
+eclean-kernel -n 2                     # ménage manuel des noyaux
+```
+
+> Tout ce que contient `boot_pool/manager` est du **texte décisionnel** destiné
+> à être versionné dans le dépôt git (manifeste, configs, historique) — jamais
+> les `.sfs`/`initramfs` (artefacts → hors dépôt).
 
 ## Notes / limites
 

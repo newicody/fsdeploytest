@@ -39,7 +39,6 @@ def chunk_text(text, max_chars=1200):
     garde en prefixe le dernier titre vu (contexte pour le rerank).
     Genere des tuples (heading, body)."""
     heading = ""
-    buf = []
     blocks = re.split(r"\n\s*\n", text)
     for block in blocks:
         block = block.strip()

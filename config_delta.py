@@ -23,7 +23,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
 
 _SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
 _UNSET_RE = re.compile(r"^# (CONFIG_\w+) is not set$")

@@ -21,7 +21,7 @@ import tempfile
 KVER = os.environ.get("KVER", os.uname().release)
 OUT = os.environ.get("OUT", f"initramfs-{KVER}.zst")
 INIT_SRC = os.environ.get("INIT_SRC", "./init.py")
-FFMPEG_STATIC = os.environ.get("FFMPEG_STATIC", "")
+FFMPEG_STATIC = os.environ.get("FFMPEG_STATIC", "/usr/local/bin/ffmpeg")
 PYBIN = os.environ.get("PYBIN", "/usr/bin/python3")   # python SYSTEME (lancer hors venv)
 
 DIRS = ["bin", "sbin", "etc", "proc", "sys", "dev", "run", "mnt",

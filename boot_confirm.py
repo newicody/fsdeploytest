@@ -67,6 +67,17 @@ def main():
     subprocess.run(["efibootmgr", "-o", ",".join(order)],
                    stdout=subprocess.DEVNULL)
     log(f"PROMU : {LABEL} (Boot{num}) en tete de BootOrder ({','.join(order)})")
+
+    # registre : kver -> current, ancienne current -> fallback
+    try:
+        import kernel_registry
+        reg = kernel_registry.KernelRegistry()
+        if KVER in reg:
+            reg.promote(KVER)
+            log(f"registre : {KVER} = current, anciennes -> fallback")
+    except Exception as e:
+        log(f"registre non mis a jour ({e}) -- non bloquant")
+
     log(f"OK — {KVER} est desormais le noyau par defaut.")
 
 

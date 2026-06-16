@@ -3,7 +3,7 @@
 """
 efi_install.py — boot EFI stub direct (sans ZFSBootMenu).
 Stage bzImage + initramfs sur l'ESP (FAT32) et cree l'entree efibootmgr.
-Le firmware ne lit pas ZFS : le noyau de fast_pool/boot doit etre copie ici.
+Le firmware ne lit pas ZFS : le noyau (master sur boot_pool/images) doit etre copie ici.
 A lancer en root.
 """
 import os

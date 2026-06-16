@@ -25,6 +25,16 @@ ROOTFS_SFS  = "rootfs.sfs"
 MODULES_SFS = f"modules-{KVER}.sfs"
 NEWROOT     = "/mnt/root"
 
+# --- mode secours (degrade niveau 1) -----------------------------------------
+# fast_pool est un STRIPE (zero redondance) : si un NVMe lache, le pool est
+# perdu. On bascule alors sur le master durable de boot_pool (mirror). Les
+# overlays (upper) de fast_pool sont definitivement perdus -> tmpfs neuf, et on
+# l'affiche clairement. Ce n'est pas une continuite, c'est un systeme pour
+# diagnostiquer/restaurer.
+RESCUE_POOL    = "boot_pool"
+RESCUE_SFS_DS  = f"{RESCUE_POOL}/images"
+RESCUE_ROOTFS  = "rootfs.sfs"
+
 IP_ADDR  = "192.168.1.10/24"   # redondant si ip= passe par la cmdline noyau
 GATEWAY  = "192.168.1.1"
 DNS      = "8.8.8.8"
@@ -337,6 +347,8 @@ def main():
     # On streame des maintenant : tout le reste du boot (ZFS, overlay...) sera
     # visible en direct sur YouTube. ffmpeg tourne en tache de fond.
     boot_stream = start_boot_stream(read_yt_key())
+    if boot_stream is None:
+        log("(pas de stream initramfs ; demarrage normal)")
 
     # --- 2. ZFS (famille de modules, dans l'ordre des dependances) ----------
     extra = f"/lib/modules/{KVER}/extra"
@@ -357,32 +369,62 @@ def main():
             log(f"{mod} non charge ({e})")
     log(f"zfs charge (modules: {', '.join(zmods)})")
 
-    # --- 3. import pool + montage du dataset --------------------------------
-    if run(["zpool", "import", "-N", "-f", "-d", "/dev", POOL]) != 0:
-        die(f"import {POOL} echoue")
+    # --- 3. import pool : fast_pool, sinon SECOURS sur boot_pool ------------
+    rescue = False
+    sfs_ds, rootfs_name = SFS_DS, ROOTFS_SFS
+    if run(["zpool", "import", "-N", "-f", "-d", "/dev", POOL]) == 0:
+        health_check()
+        os.makedirs("/mnt/sfs", exist_ok=True)
+        if run(["mount.zfs", SFS_DS, "/mnt/sfs"]) != 0:
+            log(f"!! {SFS_DS} non montable malgre l'import -> SECOURS")
+            rescue = True
+    else:
+        log(f"!! import {POOL} echoue (NVMe en panne ? stripe = perte totale)")
+        rescue = True
 
-    # --- 3bis. sante : ZFS + disques + memoire (bloque si pool FAULTED) ------
-    health_check()
-
-    os.makedirs("/mnt/sfs", exist_ok=True)
-    if run(["mount.zfs", SFS_DS, "/mnt/sfs"]) != 0:
-        die(f"mount {SFS_DS} echoue")
-    log(f"{SFS_DS} monte sur /mnt/sfs")
+    if rescue:
+        log("=" * 56)
+        log("MODE SECOURS : fast_pool indisponible.")
+        log("  -> rootfs de base depuis boot_pool, overlays NON restaures.")
+        log("  -> les donnees de fast_pool (var/rootfs/tmp) sont perdues.")
+        log("  -> remplace le NVMe et restaure depuis boot_pool/data_pool.")
+        log("=" * 56)
+        if run(["zpool", "import", "-N", "-f", "-d", "/dev", RESCUE_POOL]) != 0:
+            die(f"import {RESCUE_POOL} (secours) echoue : aucun rootfs disponible")
+        os.makedirs("/mnt/sfs", exist_ok=True)
+        if run(["mount.zfs", RESCUE_SFS_DS, "/mnt/sfs"]) != 0:
+            die(f"mount {RESCUE_SFS_DS} (secours) echoue")
+        sfs_ds, rootfs_name = RESCUE_SFS_DS, RESCUE_ROOTFS
+    log(f"source rootfs : {sfs_ds}/{rootfs_name}"
+        + ("  [SECOURS]" if rescue else ""))
 
     # --- 4. overlay : lower=rootfs.sfs (ro, loop) + upper=tmpfs -------------
+    # En secours comme en normal, l'upper est un tmpfs NEUF (en secours,
+    # l'ancien upper de fast_pool est perdu ; on n'essaie pas de le simuler).
     for d in ("/mnt/lower", "/mnt/ovl", NEWROOT):
         os.makedirs(d, exist_ok=True)
     mount("tmpfs", "/mnt/ovl", "tmpfs")
     os.makedirs("/mnt/ovl/upper", exist_ok=True)
     os.makedirs("/mnt/ovl/work", exist_ok=True)
     try:
-        ld = losetup(f"/mnt/sfs/{ROOTFS_SFS}", readonly=True)
+        ld = losetup(f"/mnt/sfs/{rootfs_name}", readonly=True)
         mount(ld, "/mnt/lower", "squashfs", MS_RDONLY)
         mount("overlay", NEWROOT, "overlay", 0,
               "lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work")
     except OSError as e:
         die(f"overlay echoue: {e}")
-    log(f"overlay rootfs assemble sur {NEWROOT}")
+    log(f"overlay rootfs assemble sur {NEWROOT}"
+        + ("  [SECOURS]" if rescue else ""))
+
+    # marqueur secours -> NEWROOT/etc (session_launch / outils post-boot le lisent)
+    if rescue:
+        try:
+            os.makedirs(f"{NEWROOT}/etc", exist_ok=True)
+            with open(f"{NEWROOT}/etc/rescue-mode", "w") as f:
+                f.write("fast_pool indisponible ; rootfs depuis "
+                        f"{RESCUE_SFS_DS} ; overlays perdus\n")
+        except OSError:
+            pass
 
     # report sante -> NEWROOT/etc (survit au switch_root ; /run sera masque)
     try:

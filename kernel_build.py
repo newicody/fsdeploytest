@@ -128,6 +128,23 @@ def main():
         sys.exit("entree EFI introuvable apres creation")
     run(["efibootmgr", "--bootnext", new])
     msg(f"entree {label} = Boot{new} — BootNext arme (essai unique)")
+
+    # indexer la version dans le registre (statut candidate jusqu'au boot valide)
+    try:
+        import kernel_registry
+        reg = kernel_registry.KernelRegistry()
+        reg.register(kver,
+                     config=os.path.join(SRC, ".config"),
+                     modules_sfs=sfs_out,
+                     initramfs=os.path.join(dest, f"initramfs-{kver}.zst"),
+                     bzimage=os.path.join(dest, f"vmlinuz-{kver}.efi"),
+                     efi_entry=new,
+                     efi_loader=os.path.join(dest, f"vmlinuz-{kver}.efi"),
+                     status=kernel_registry.ST_CANDIDATE)
+        msg(f"registre mis a jour : {kver} = candidate")
+    except Exception as e:
+        msg(f"registre non mis a jour ({e}) -- non bloquant")
+
     print(f"\nReboote pour tester {kver} :\n"
           f"  boot OK  -> boot_confirm.py promeut {label}\n"
           f"  plantage -> power-cycle : BootNext consomme -> noyau precedent")

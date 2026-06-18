@@ -699,6 +699,21 @@ python3 sfs_build.py --rootfs-src <racine_gentoo>           # rootfs.sfs
 python3 sfs_build.py --modules <kver>                       # modules-<kver>.sfs
 # ou via l'orchestrateur :  first_boot.py --rootfs-src <racine_gentoo>
 ```
+
+**Défense en profondeur sur les pseudo-FS** : `sfs_build` passe `-e proc sys dev
+run tmp ...` à `mksquashfs` pour le rootfs (pas pour modules.sfs). Ainsi, même si
+`--rootfs-src` pointe une racine vivante **non** nettoyée par `clean_rootfs`, le
+contenu de `/proc`, `/sys`, `/dev`, `/run`, `/tmp` n'est jamais figé dans l'image.
+`clean_rootfs` (rsync) et `sfs_build` (mksquashfs) excluent donc tous les deux —
+deux filets indépendants.
+
+**Refus de figer le système vivant** : `sfs_build` exige que `--rootfs-src` soit
+une **copie nettoyée** par `clean_rootfs` (qui y dépose un marqueur
+`.cleaned-for-sfs`). Sans ce marqueur, il **refuse** — d'autant plus si la racine
+semble vivante (pseudo-FS montés dessous). `--force-live` passe outre
+explicitement. Le marqueur lui-même est exclu de l'image. Le rootfs source n'est
+jamais modifié (mksquashfs lit seulement), mais figer une racine en service donne
+un état incohérent : on l'empêche par défaut.
 Si `rootfs.sfs` est **absent au boot**, `init.py` ne fige plus l'écran : il
 affiche « IMAGE ROOTFS ABSENTE » et ouvre un shell de secours.
 

@@ -19,6 +19,47 @@ import os
 import shutil
 import subprocess
 
+# Repertoires a EXCLURE de rootfs.sfs : pseudo-FS (proc/sys/dev/run) et volatils.
+# Defense en profondeur : meme si --rootfs-src pointe une racine vivante non
+# nettoyee par clean_rootfs, mksquashfs ne fige pas leur contenu. mksquashfs -e
+# attend des chemins RELATIFS a la racine source. On garde les repertoires
+# (vides) car -e exclut le CONTENU, le dossier reste cree par l'arbo source.
+ROOTFS_EXCLUDES = ["proc", "sys", "dev", "run", "tmp", "var/tmp",
+                   "mnt", "media", "lost+found",
+                   "var/cache/distfiles", "var/cache/binpkgs",
+                   "var/tmp/portage", ".cleaned-for-sfs"]
+
+CLEANED_MARKER = ".cleaned-for-sfs"
+
+
+def _is_clean_copy(rootfs_src):
+    """Le repertoire porte-t-il le marqueur depose par clean_rootfs ? (=> c'est
+    une copie nettoyee, pas le systeme vivant)."""
+    return os.path.exists(os.path.join(rootfs_src, CLEANED_MARKER))
+
+
+def _looks_live(rootfs_src):
+    """Heuristique : rootfs_src est-il (ou contient-il) le systeme VIVANT ?
+    - c'est '/' lui-meme, ou
+    - un de ses sous-dossiers pseudo-FS est monte (proc/sys/dev actifs) -> signe
+      d'une racine en service, pas d'une copie inerte."""
+    src = os.path.abspath(rootfs_src)
+    if src == "/":
+        return True
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3 and p[2] in ("proc", "sysfs", "devtmpfs"):
+                    mnt = os.path.abspath(p[1])
+                    # un pseudo-FS monte SOUS la source = racine vivante
+                    if mnt == os.path.join(src, p[2]) or mnt.startswith(src + "/proc") \
+                       or mnt.startswith(src + "/sys") or mnt.startswith(src + "/dev"):
+                        return True
+    except OSError:
+        pass
+    return False
+
 
 class SfsResult:
     __slots__ = ("ok", "path", "reason", "size_mb")
@@ -194,10 +235,29 @@ def _in_proc_mounts(dataset):
 # API publique
 # --------------------------------------------------------------------------- #
 def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
-                     log=print, force=False):
-    """Cree rootfs.sfs depuis l'arborescence rootfs_src (la racine Gentoo a
-    figer). Staging tmpfs, nettoyage, controle. Si le fichier existe deja et
-    force=False, ne refait rien. Retourne SfsResult."""
+                     log=print, force=False, force_live=False):
+    """Cree rootfs.sfs depuis l'arborescence rootfs_src. rootfs_src DOIT etre une
+    copie nettoyee par clean_rootfs (marqueur .cleaned-for-sfs) ; sinon on REFUSE
+    de figer (risque : figer le systeme vivant, etat incoherent). --force-live
+    (force_live=True) passe outre explicitement. Retourne SfsResult."""
+    if not os.path.isdir(rootfs_src):
+        return SfsResult(False, "", f"source absente : {rootfs_src}")
+    # GARDE : ne pas figer le systeme vivant par erreur
+    if not _is_clean_copy(rootfs_src):
+        if _looks_live(rootfs_src) and not force_live:
+            return SfsResult(False, "", (
+                f"{rootfs_src} semble etre le systeme VIVANT (pseudo-FS montes "
+                f"dessous) et n'a PAS le marqueur clean_rootfs. Refus de figer. "
+                f"Fais d'abord : clean_rootfs.py --source ... --staging {rootfs_src} "
+                f"(ou --force-live pour passer outre)."))
+        if not force_live:
+            log(f"  [!] {rootfs_src} sans marqueur .cleaned-for-sfs : ce n'est "
+                f"peut-etre pas une copie nettoyee par clean_rootfs.")
+            log(f"      -> recommande : clean_rootfs.py d'abord. "
+                f"(--force-live pour ignorer cet avertissement)")
+            return SfsResult(False, "", (
+                "source non marquee comme nettoyee (clean_rootfs). "
+                "Utilise clean_rootfs ou --force-live."))
     mp = _sfs_mountpoint(sfs_dataset, log)
     if mp is None:
         return SfsResult(False, "", f"{sfs_dataset} non monte")
@@ -208,7 +268,10 @@ def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
         return SfsResult(True, dst, "deja present", int(size_mb))
     est = _dir_size_mb(rootfs_src) * 0.5       # zstd ~50 % sur un rootfs
     staging = _pick_staging(est, log)
-    return _mksquashfs(rootfs_src, dst, staging, log)
+    # exclusions pseudo-FS/volatils : -e doit etre le DERNIER flag mksquashfs
+    # (tout ce qui suit est traite comme motif d'exclusion).
+    extra = ["-e"] + ROOTFS_EXCLUDES
+    return _mksquashfs(rootfs_src, dst, staging, log, extra=extra)
 
 
 def build_modules_sfs(kver, sfs_dataset="fast_pool/sfs", log=print, force=False):
@@ -234,12 +297,16 @@ if __name__ == "__main__":
     ap.add_argument("--modules", help="version noyau pour modules-<ver>.sfs")
     ap.add_argument("--dataset", default="fast_pool/sfs")
     ap.add_argument("--force", action="store_true", help="recree meme si present")
+    ap.add_argument("--force-live", action="store_true",
+                    help="autorise a figer une racine sans marqueur clean_rootfs "
+                         "(systeme vivant) -- a tes risques")
     a = ap.parse_args()
     if not a.rootfs_src and not a.modules:
         ap.error("fournir --rootfs-src et/ou --modules")
     rc = 0
     if a.rootfs_src:
-        r = build_rootfs_sfs(a.rootfs_src, a.dataset, force=a.force)
+        r = build_rootfs_sfs(a.rootfs_src, a.dataset, force=a.force,
+                             force_live=a.force_live)
         print(repr(r))
         rc |= 0 if r.ok else 1
     if a.modules:

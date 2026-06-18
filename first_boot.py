@@ -597,6 +597,9 @@ def main():
     ap.add_argument("--src", default="/usr/src/linux")
     ap.add_argument("--rootfs-src", default=None,
                     help="racine Gentoo a figer en rootfs.sfs (si absent)")
+    ap.add_argument("--force-live", action="store_true",
+                    help="autorise rootfs.sfs depuis une racine non nettoyee "
+                         "(sans marqueur clean_rootfs)")
     ap.add_argument("--repo", default=None, help="owner/name (surcharge [git].repo)")
     ap.add_argument("--owner", default=None,
                     help="proprietaire du Project (surcharge [git].project_owner)")
@@ -689,7 +692,8 @@ def main():
     if a.rootfs_src:
         import sfs_build
         rs = sfs_build.build_rootfs_sfs(a.rootfs_src, "fast_pool/sfs",
-                                        log=lambda m: print("   " + m, flush=True))
+                                        log=lambda m: print("   " + m, flush=True),
+                                        force_live=getattr(a, "force_live", False))
         if not rs.ok:
             print(f"!! creation rootfs.sfs echouee : {rs.reason}", flush=True)
             _push_failure(rep, repo, f"rootfs.sfs : {rs.reason}")

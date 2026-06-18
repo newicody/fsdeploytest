@@ -253,8 +253,28 @@ def main():
     verify_essentials(staging)
 
     if not a.dry_run:
+        write_marker(staging, source)
         log("copie propre prete. Etape suivante :")
         log(f"  python3 sfs_build.py --rootfs-src {staging}")
+
+
+CLEANED_MARKER = ".cleaned-for-sfs"
+
+
+def write_marker(staging, source):
+    """Depose un marqueur attestant que ce staging a ete copie+nettoye (et n'est
+    donc PAS le systeme vivant). sfs_build le verifie avant de figer l'image."""
+    import json
+    import time
+    path = os.path.join(_norm(staging), CLEANED_MARKER)
+    try:
+        with open(path, "w") as f:
+            json.dump({"cleaned_at": int(time.time()),
+                       "source": _norm(source),
+                       "tool": "clean_rootfs.py"}, f)
+        log(f"marqueur depose : {path}")
+    except OSError as e:
+        log(f"[!] marqueur non depose ({e}) -- sfs_build demandera --force-live")
 
 
 if __name__ == "__main__":

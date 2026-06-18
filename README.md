@@ -732,6 +732,16 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > build (les blobs sont lus depuis `/lib/firmware/`). Les motifs sont
 > surchargeables via `FW_GLOBS`.
 
+> **Piège Gentoo `python-exec`** : sur Gentoo, `/usr/bin/python3` est un
+> **wrapper** (`dev-lang/python-exec`), pas le vrai interpréteur. Embarquer ce
+> wrapper sans `/usr/lib/python-exec/` provoque au boot « no python-exec wrapper
+> found » → `/init` ne démarre pas → **panic VFS muet**. `build_initramfs.py`
+> **résout le vrai ELF** (`/usr/lib/python-exec/python3.X/python3` via
+> `sys._base_executable`) et l'embarque directement. Un **auto-test** lance
+> `chroot <stage> /usr/bin/python3 -c "import ctypes,fcntl,..."` à la fin du
+> build : si l'interpréteur ou une `.so` manque, le **build s'arrête** au lieu
+> de produire une image qui paniquerait silencieusement.
+
 ### Stream de la console de boot dès l'init
 
 `init.py` démarre le stream **dès les pseudo-FS montés** (avant ZFS) : tout le

@@ -24,6 +24,41 @@ INIT_SRC = os.environ.get("INIT_SRC", "./init.py")
 FFMPEG_STATIC = os.environ.get("FFMPEG_STATIC", "/usr/local/bin/ffmpeg")
 PYBIN = os.environ.get("PYBIN", "/usr/bin/python3")   # python SYSTEME (lancer hors venv)
 
+
+def resolve_real_python(pybin):
+    """Sur Gentoo, /usr/bin/python3 est un WRAPPER (dev-lang/python-exec) qui
+    delegue au vrai interpreteur dans /usr/lib/python-exec/python3.X/python3.
+    Embarquer le wrapper sans /usr/lib/python-exec/ casse le boot ('no python-exec
+    wrapper found') -> panic. On resout donc le VRAI ELF a embarquer.
+
+    Methode : demander a python lui-meme sys._base_executable (pointe le vrai
+    binaire), avec repli sur la recherche dans /usr/lib/python-exec/."""
+    # 1. sys._base_executable = vrai interpreteur (contourne le wrapper)
+    try:
+        out = subprocess.run(
+            [pybin, "-c", "import sys; print(sys._base_executable or '')"],
+            capture_output=True, text=True).stdout.strip()
+        if out and os.path.exists(out) and "python-exec" not in os.path.basename(out):
+            # _base_executable peut encore etre le wrapper ; on verifie plus bas
+            real = out
+        else:
+            real = ""
+    except OSError:
+        real = ""
+    # 2. chercher le vrai binaire dans /usr/lib/python-exec/python3.X/python3
+    if not real or "/usr/bin/" in real:
+        import glob
+        for cand in sorted(glob.glob("/usr/lib/python-exec/python3.*/python3"),
+                           reverse=True):
+            if os.path.exists(cand):
+                real = cand
+                break
+    # 3. repli : le pybin tel quel (si pas de wrapper sur ce systeme)
+    if not real:
+        real = os.path.realpath(pybin)
+    return real
+
+
 DIRS = ["bin", "sbin", "etc", "proc", "sys", "dev", "run", "mnt",
         "lib", "lib64", "usr/lib", "usr/bin", "usr/sbin",
         f"lib/modules/{KVER}/extra", "lib/firmware/rtl_nic", "lib/firmware/i915"]
@@ -91,14 +126,33 @@ def copy_with_deps(binary, stage):
 
 
 def bundle_python(stage):
-    """Interpreteur + stdlib + lib-dynload + libs dynamiques."""
-    copy_with_deps(PYBIN, stage)
-    # lien stable /usr/bin/python3 -> l'interpreteur reel
+    """Interpreteur REEL (pas le wrapper python-exec) + stdlib + lib-dynload +
+    libs dynamiques."""
+    real = resolve_real_python(PYBIN)
+    if "python-exec" in real:
+        msg(f"ATTENTION : interpreteur resolu = {real} (encore un wrapper ?)")
+    msg(f"interpreteur reel resolu : {real}")
+    copy_with_deps(real, stage)
+    # /usr/bin/python3 -> le vrai ELF (chemin ABSOLU dans l'initramfs, valide car
+    # on copie 'real' a son emplacement d'origine via copy_with_deps). On cree un
+    # lien stable + on s'assure que le vrai binaire est joignable.
     os.makedirs(f"{stage}/usr/bin", exist_ok=True)
-    real = os.path.realpath(PYBIN)
     link = f"{stage}/usr/bin/python3"
-    if not os.path.exists(link):
-        os.symlink(real, link)
+    # placer le vrai binaire a /usr/bin/python3 directement (pas de wrapper) :
+    # si 'real' a ete copie ailleurs (ex /usr/lib/python-exec/...), on fait un
+    # lien relatif vers lui ; sinon copie directe.
+    real_in_stage = stage + real
+    try:
+        if os.path.lexists(link):
+            os.remove(link)
+        if os.path.exists(real_in_stage):
+            rel = os.path.relpath(real_in_stage, f"{stage}/usr/bin")
+            os.symlink(rel, link)              # lien RELATIF (robuste en initramfs)
+        else:
+            shutil.copy2(real, link)
+        os.chmod(link, 0o755) if os.path.isfile(link) else None
+    except OSError as e:
+        msg(f"ATTENTION lien python3 : {e}")
     # stdlib complete (inclut lib-dynload : _ctypes, fcntl, etc.)
     stdlib = sysconfig.get_path("stdlib")          # ex: /usr/lib/python3.13
     dst = stage + stdlib
@@ -114,7 +168,7 @@ def bundle_python(stage):
         for f in os.listdir(dynload):
             if f.endswith(".so"):
                 copy_with_deps(os.path.join(dynload, f), stage)
-    msg(f"python embarque ({real}, stdlib {stdlib})")
+    msg(f"python embarque (reel {real}, stdlib {stdlib})")
 
 
 def bundle_busybox(stage):
@@ -243,6 +297,27 @@ def main():
                 copy(ld, stage)
 
         bundle_python(stage)
+        # AUTO-TEST CRITIQUE : le python embarque s'execute-t-il REELLEMENT dans
+        # l'environnement de l'initramfs ? (chroot = exactement ce que fait le
+        # noyau au boot). Detecte le piege python-exec et les .so manquantes
+        # AVANT de produire une image qui paniquerait en silence au boot.
+        test_code = "import ctypes, fcntl, os, subprocess, sys; print('PYOK')"
+        try:
+            r = subprocess.run(["chroot", stage, "/usr/bin/python3", "-c",
+                                test_code], capture_output=True, text=True,
+                               timeout=30)
+            if "PYOK" not in r.stdout:
+                sys.exit("ECHEC AUTO-TEST PYTHON dans l'initramfs :\n"
+                         f"  stdout: {r.stdout.strip()}\n"
+                         f"  stderr: {r.stderr.strip()}\n"
+                         "  -> l'interpreteur ou une lib (.so) manque. Le boot "
+                         "paniquerait en silence. Build INTERROMPU.")
+            msg("auto-test python dans l'initramfs : OK (imports critiques passent)")
+        except FileNotFoundError:
+            msg("ATTENTION : chroot indisponible, auto-test python SAUTE "
+                "(verifie manuellement : chroot <stage> /usr/bin/python3 -c '...')")
+        except subprocess.TimeoutExpired:
+            sys.exit("AUTO-TEST PYTHON : timeout (python bloque au demarrage ?)")
         bundle_busybox(stage)
         # binaires CRITIQUES : leur absence rend l'initramfs non-bootable.
         # On ARRETE le build plutot que de produire une image cassee.

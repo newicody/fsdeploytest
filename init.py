@@ -205,6 +205,22 @@ def zfs_mountpoint(dataset):
     return out.strip() if rc == 0 else ""
 
 
+def ds_mounted(dataset):
+    """Le dataset est-il REELLEMENT monte ? Verite terrain : /proc/mounts ou la
+    propriete ZFS 'mounted'. On EVITE os.path.ismount (peu fiable sur ZFS, ex en
+    chroot : st_dev trompeur). init.py reste autonome : lecture directe."""
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3 and p[2] == "zfs" and p[0] == dataset:
+                    return True
+    except OSError:
+        pass
+    rc, out = capture(["zfs", "get", "-H", "-o", "value", "mounted", dataset])
+    return rc == 0 and out.strip() == "yes"
+
+
 # schema de remappage charge depuis le fichier plat (rempli dans main)
 _MOUNTS = {}
 
@@ -278,13 +294,14 @@ def mount_dataset(dataset, usage_path, want_mode="auto", bind=True,
 
     # non-legacy : le dataset DOIT etre monte a son chemin naturel. A l'import
     # auto c'est fait ; sinon on le monte (sans changer la propriete).
-    if not os.path.ismount(real_mp):
+    # On verifie via ds_mounted (/proc/mounts + zfs mounted), PAS os.path.ismount.
+    if not ds_mounted(dataset):
         subprocess.run(["zfs", "mount", dataset], stderr=subprocess.DEVNULL)
-    if not os.path.ismount(real_mp):
+    if not ds_mounted(dataset):
         # dernier recours : mount.zfs au chemin naturel (toujours sans set)
         os.makedirs(real_mp, exist_ok=True)
         run(["mount.zfs", dataset, real_mp])
-    if not os.path.ismount(real_mp):
+    if not ds_mounted(dataset):
         log(f"  [!] {dataset} : pas monte a son chemin naturel {real_mp}")
         return False
 

@@ -160,10 +160,17 @@ def where_mounted(dataset):
     return ""
 
 
+def zfs_mounted(dataset):
+    """Le dataset est-il monte selon ZFS lui-meme (propriete 'mounted')?
+    Plus fiable que os.path.ismount sur ZFS en chroot."""
+    return zfs_get(dataset, "mounted") == "yes"
+
+
 def is_mounted(dataset):
-    """Le dataset est-il reellement monte (where + ismount) ?"""
-    w = where_mounted(dataset)
-    return bool(w) and os.path.ismount(w)
+    """Le dataset est-il REELLEMENT monte ? Verite terrain : /proc/mounts
+    (where_mounted) ou la propriete ZFS 'mounted'. On EVITE os.path.ismount,
+    peu fiable sur ZFS en chroot (st_dev trompeur)."""
+    return bool(where_mounted(dataset)) or zfs_mounted(dataset)
 
 
 # --------------------------------------------------------------------------- #

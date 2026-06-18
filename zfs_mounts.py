@@ -87,7 +87,13 @@ def inspect(dataset):
         return st
     st.mountpoint = zfs_property(dataset, "mountpoint")
     st.where = where_mounted(dataset)
-    st.mounted = bool(st.where) and os.path.ismount(st.where)
+    # VERITE TERRAIN : present dans /proc/mounts (where) OU propriete ZFS
+    # mounted=yes. On EVITE os.path.ismount : peu fiable sur ZFS en chroot
+    # (st_dev trompeur) -> c'etait la cause du "monte vu comme non monte".
+    st.mounted = bool(st.where) or (zfs_property(dataset, "mounted") == "yes")
+    if st.mounted and not st.where:
+        # monte selon ZFS mais absent de /proc/mounts : retomber sur le mountpoint
+        st.where = st.mountpoint if st.mountpoint not in ("", "legacy") else ""
     if not st.mounted:
         st.reason = "dataset existe mais N'EST PAS monte"
     return st
@@ -197,7 +203,11 @@ def ensure_mounted(dataset, target=None, want_mode="auto", bind_from=None,
     # VERIFICATION FINALE : c'est reellement monte (+ contenu si demande)
     final = verify_mounted(dataset, expect_any)
     if target and not is_legacy:
-        if not os.path.ismount(target):
+        # verifier le target via /proc/mounts (un bind y apparait comme une
+        # ligne dont le 2e champ est le target) plutot qu'os.path.ismount.
+        target_abs = os.path.abspath(target)
+        bound = any(os.path.abspath(t) == target_abs for _, t, _ in _proc_mounts())
+        if not bound:
             log(f"  [!] {dataset} : {target} pas un point de montage apres bind")
             final.verified = False
             final.reason = "target non monte apres bind"

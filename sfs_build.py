@@ -149,9 +149,8 @@ def _safe_rm(p):
 
 def _sfs_mountpoint(dataset, log):
     """Point de montage REELLEMENT monte du dataset (le monte si besoin).
-    CORRECTION du bug : on ne se contente pas de isdir() (un dossier vide non
-    monte le passe !) -> on exige ismount() pour ne JAMAIS ecrire dans un dossier
-    vide en croyant ecrire sur le dataset."""
+    On NE se fie PAS a os.path.ismount() : peu fiable sur ZFS en chroot (st_dev
+    trompeur). Verite terrain = `zfs get mounted` + /proc/mounts."""
     subprocess.run(["zfs", "mount", dataset], stderr=subprocess.DEVNULL)
     try:
         mp = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint",
@@ -161,11 +160,34 @@ def _sfs_mountpoint(dataset, log):
     if not mp or mp == "legacy" or not os.path.isdir(mp):
         log(f"{dataset} : mountpoint inutilisable (mp={mp!r})")
         return None
-    if not os.path.ismount(mp):
-        log(f"{dataset} : {mp} existe mais N'EST PAS un point de montage "
-            f"(dataset NON monte -> refus d'ecrire dans un dossier vide)")
+    # monte ? source de verite : zfs get mounted, puis /proc/mounts en secours.
+    mounted = False
+    try:
+        m = subprocess.run(["zfs", "get", "-H", "-o", "value", "mounted",
+                            dataset], capture_output=True, text=True).stdout.strip()
+        mounted = (m == "yes")
+    except OSError:
+        pass
+    if not mounted:
+        mounted = _in_proc_mounts(dataset)
+    if not mounted:
+        log(f"{dataset} : reellement NON monte (zfs mounted=no, absent de "
+            f"/proc/mounts) -> refus d'ecrire dans un dossier vide")
         return None
     return mp
+
+
+def _in_proc_mounts(dataset):
+    """Le dataset apparait-il dans /proc/mounts (verite terrain) ?"""
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 3 and p[2] == "zfs" and p[0] == dataset:
+                    return True
+    except OSError:
+        pass
+    return False
 
 
 # --------------------------------------------------------------------------- #

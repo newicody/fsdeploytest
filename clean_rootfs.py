@@ -85,15 +85,36 @@ def safety_checks(source, staging):
     return source, staging
 
 
+# Pseudo-systemes de fichiers et repertoires volatils a NE JAMAIS copier dans
+# l'image : si la racine source les a montes, rsync descendrait dans des fichiers
+# virtuels (ex /proc/kcore = taille de la RAM -> blocage/explosion) ou copierait
+# l'etat volatil de la machine de build. On veut des POINTS DE MONTAGE VIDES dans
+# l'image (l'initramfs/le systeme les remplit au boot), pas leur contenu.
+RSYNC_EXCLUDES = [
+    "/proc/*", "/sys/*", "/dev/*", "/run/*",       # pseudo-FS (contenu, pas le dir)
+    "/tmp/*", "/var/tmp/*",                          # volatils
+    "/mnt/*", "/media/*",                            # points de montage externes
+    "/lost+found",
+    "/var/cache/distfiles/*", "/var/cache/binpkgs/*",  # gros caches Portage
+    "/var/tmp/portage/*",
+]
+
+
 def rsync_copy(source, staging, dry=False):
-    """Copie source -> staging avec preservation totale (xattr/ACL/hardlinks).
+    """Copie source -> staging avec preservation totale (xattr/ACL/hardlinks),
+    en EXCLUANT les pseudo-FS (proc/sys/dev/run) et les volatils. Les dossiers
+    eux-memes sont conserves (vides) car on exclut '/proc/*' et non '/proc'.
     Le slash final sur source copie le CONTENU dans staging."""
     os.makedirs(staging, exist_ok=True)
     cmd = ["rsync", "-aHAX", "--numeric-ids", "--info=progress2",
-           source.rstrip("/") + "/", staging.rstrip("/") + "/"]
+           "--one-file-system"]              # ne traverse pas les points de montage
+    for ex in RSYNC_EXCLUDES:
+        cmd += ["--exclude", ex]
+    cmd += [source.rstrip("/") + "/", staging.rstrip("/") + "/"]
     if dry:
         cmd.insert(1, "--dry-run")
-    log("rsync " + ("(dry-run) " if dry else "") + f"{source} -> {staging}")
+    log("rsync " + ("(dry-run) " if dry else "")
+        + f"{source} -> {staging} (pseudo-FS exclus)")
     try:
         rc = subprocess.run(cmd).returncode
     except FileNotFoundError:
@@ -161,6 +182,24 @@ def clean_copy(staging, dry=False):
             open(mid, "w").close()
         except OSError:
             pass
+    # POINTS DE MONTAGE VIDES : doivent exister dans l'image (l'initramfs/le
+    # systeme y montent les pseudo-FS au boot), mais VIDES (jamais le contenu
+    # de la machine de build). Exclus du rsync, on s'assure qu'ils existent.
+    if not dry:
+        for d in ("proc", "sys", "dev", "run", "tmp", "mnt", "media",
+                  "mnt/usr-src", "var/log"):
+            try:
+                os.makedirs(os.path.join(staging, d), exist_ok=True)
+            except OSError:
+                pass
+        # /tmp en 1777 (sticky), classique
+        try:
+            os.chmod(os.path.join(staging, "tmp"), 0o1777)
+        except OSError:
+            pass
+    else:
+        log("  [dry] garantirait les points de montage vides "
+            "(proc/sys/dev/run/tmp/mnt + mnt/usr-src + var/log)")
     return n
 
 

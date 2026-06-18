@@ -97,10 +97,40 @@ def resolve_esp():
             os.environ.get("PART", "1"))
 
 
+def load_kernel_opts():
+    """Lit [kernel] de infra.conf : src, jobs, make_flags, cmdline. Les env-vars
+    (SRC/JOBS/CMDLINE) restent PRIORITAIRES pour un override ponctuel. Retourne
+    (src, jobs, make_flags_list, cmdline)."""
+    src, jobs, flags, cmdline = SRC, JOBS, [], CMDLINE
+    try:
+        import boot_layout  # apporte load_config indirectement
+    except Exception:
+        pass
+    try:
+        from configobj import ConfigObj
+        cfg = ConfigObj(os.environ.get("INFRA_CONF", "infra.conf"))
+        k = cfg.get("kernel", {})
+        if "SRC" not in os.environ and k.get("src"):
+            src = k.get("src")
+        if "JOBS" not in os.environ and k.get("jobs"):
+            jobs = str(k.get("jobs"))
+        if "CMDLINE" not in os.environ and k.get("cmdline"):
+            cmdline = k.get("cmdline")
+        mf = k.get("make_flags", "")
+        if isinstance(mf, list):
+            flags = [x for x in mf if x]
+        elif mf:
+            flags = mf.split()
+    except Exception as e:
+        msg(f"[kernel] non lu ({e}) -> valeurs par defaut/env")
+    return src, jobs, flags, cmdline
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("root requis")
-    global ESP, DISK, PART
+    global ESP, DISK, PART, SRC, JOBS, CMDLINE
+    SRC, JOBS, make_flags, CMDLINE = load_kernel_opts()
     ESP, DISK, PART = resolve_esp()
     if not os.path.ismount(ESP):
         sys.exit(f"ESP non monte sur {ESP} (verifie [efi] dans infra.conf ou "
@@ -109,11 +139,12 @@ def main():
         sys.exit(f".config absent dans {SRC} (lance kernel_watch.py d'abord)")
 
     kver = out(["make", "-C", SRC, "-s", "kernelrelease"]).strip()
-    msg(f"build noyau {kver} (-j{JOBS})")
+    msg(f"build noyau {kver} (-j{JOBS}"
+        + (f" {' '.join(make_flags)}" if make_flags else "") + ")")
 
     # 1. noyau + modules in-tree
-    run(["make", "-C", SRC, f"-j{JOBS}"])
-    run(["make", "-C", SRC, "modules_install"])
+    run(["make", "-C", SRC, f"-j{JOBS}"] + make_flags)
+    run(["make", "-C", SRC, "modules_install"] + make_flags)
 
     # 2. zfs/spl hors-arbre contre ce noyau (voie Gentoo)
     link = "/usr/src/linux"

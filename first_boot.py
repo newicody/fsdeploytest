@@ -285,6 +285,18 @@ def check_datasets(cfg, rep):
         import zfs_mounts
     except ImportError:
         zfs_mounts = None
+    # 0. les pools sont-ils importes ? (sinon les datasets paraissent absents)
+    pools = set()
+    for ds in cfg.get("datasets", {}):
+        pools.add(ds.split("/", 1)[0])
+    rc, imported, _ = sh(["zpool", "list", "-H", "-o", "name"])
+    imported_set = set(imported.split()) if rc == 0 else set()
+    for pool in sorted(pools):
+        if pool in imported_set:
+            rep.ok(f"pool {pool} importe")
+        else:
+            rep.crit(f"pool {pool} NON importe "
+                     f"(zpool import {pool}) -> ses datasets seront introuvables")
     sect = cfg.get("datasets", {})
     for ds, decl in sect.items():
         if not isinstance(decl, dict):

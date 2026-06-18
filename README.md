@@ -582,6 +582,13 @@ Il purge : caches Portage (`var/tmp/portage`, distfiles, binpkgs), logs de build
 `etc/portage`, `var/db/pkg`, `lib/modules`, et les scripts de session. Un
 `verify_essentials` avertit si un élément critique manque dans la copie.
 
+**Exclusion des pseudo-FS** (sinon `rsync` copierait des fichiers virtuels comme
+`/proc/kcore` = taille de la RAM → blocage) : `clean_rootfs.py` exclut du rsync
+`/proc`, `/sys`, `/dev`, `/run`, `/tmp`, `/var/tmp`, `/mnt`, `/media` (avec
+`--one-file-system`), puis **recrée ces points de montage VIDES** dans l'image
+(l'initramfs/le système les remplit au boot). C'est ce qui évite de figer l'état
+volatil de la machine de build dans le rootfs.sfs.
+
 **Méthode manuelle** (équivalente, si tu préfères tout contrôler à la main) :
 À faire sur `<racine_gentoo>`
 juste avant `mksquashfs` :
@@ -1336,6 +1343,20 @@ Création du dataset (une fois) :
 ```sh
 zfs create -o mountpoint=/boot_pool/manager boot_pool/manager
 ```
+
+### Options de compilation (`[kernel]`)
+
+Les flags de compilation sont dans l'ini (les env-vars `JOBS`/`CMDLINE`/`SRC`
+restent prioritaires pour un override ponctuel) :
+```ini
+[kernel]
+src = /usr/src/linux
+jobs = 13                 # make -jN (i5-11400 = 6c/12t)
+make_flags =              # ex: LLVM=1 (clang), V=1 (verbose)
+cmdline = i915.force_probe=!4c8b xe.force_probe=4c8b ip=... console=tty0 loglevel=4
+```
+`kernel_build.py` applique `-j<jobs>` et `make_flags` à `make` et
+`modules_install`.
 
 Mise à jour automatique : `kernel_build.py` enregistre en `candidate` + journalise
 la compilation ; `boot_confirm.py` promeut en `current` (ancienne → `fallback`).

@@ -165,7 +165,6 @@ def check_runtime(cfg, mods, dmesg):
 ZFS_EXPECTED = {
     "fast_pool/sfs":     {"compression": "off",  "atime": "off"},
     "fast_pool/rootfs":  {"xattr": "sa", "acltype": "posixacl", "atime": "off"},
-    "fast_pool/var":     {"xattr": "sa", "acltype": "posixacl", "atime": "off"},
     "fast_pool/log":     {"compression": "zstd", "atime": "off"},
     "fast_pool/usr-src": {"atime": "off"},
     "boot_pool/images":  {"compression": "off"},

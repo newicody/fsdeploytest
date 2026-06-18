@@ -110,20 +110,12 @@ def main():
                  f"  (rien n'a ete stage sur l'ESP, BootNext non arme.)")
     msg(f"zfs.ko present : {zko}")
 
-    # 3. modules-<ver>.sfs sur fast_pool/sfs
-    subprocess.run(["zfs", "mount", "fast_pool/sfs"], stderr=subprocess.DEVNULL)
-    sfs_mnt = out(["zfs", "get", "-H", "-o", "value", "mountpoint",
-                   "fast_pool/sfs"]).strip()
-    if not os.path.isdir(sfs_mnt):
-        sys.exit(f"fast_pool/sfs non monte ({sfs_mnt})")
-    sfs_out = os.path.join(sfs_mnt, f"modules-{kver}.sfs")
-    msg(f"squashfs modules -> {sfs_out}")
-    tmp = sfs_out + ".new"
-    if os.path.exists(tmp):
-        os.remove(tmp)
-    run(["mksquashfs", f"/lib/modules/{kver}", tmp, "-comp", "zstd",
-         "-noappend", "-quiet"])
-    os.replace(tmp, sfs_out)
+    # 3. modules-<ver>.sfs sur fast_pool/sfs (via le module dedie)
+    import sfs_build
+    r = sfs_build.build_modules_sfs(kver, "fast_pool/sfs", log=msg, force=True)
+    if not r.ok:
+        sys.exit(f"creation modules.sfs echouee : {r.reason}")
+    sfs_out = r.path
 
     # 4. initramfs-<ver>.zst
     msg("initramfs")
@@ -162,6 +154,42 @@ def main():
                  + out(["efibootmgr"]))
     run(["efibootmgr", "--bootnext", new])
     msg(f"entree {label} = Boot{new} — BootNext arme (essai unique)")
+
+    # 6bis. UKI multi-profils (si [uki] enabled) : binaires EFI autonomes avec
+    # cmdline embarquee, places sur les 2 ESP + fallback BOOTX64.EFI. Permet de
+    # booter un profil 'safe' (nomodeset) pour diagnostiquer, sans toucher a
+    # l'entree classique ci-dessus. Secure Boot off (non signes).
+    try:
+        import uki_build
+        infra = os.environ.get("INFRA_CONF", "infra.conf")
+        enabled, profiles = uki_build.load_profiles(infra)
+        if enabled and profiles:
+            vmlinuz_src = os.path.join(dest, f"vmlinuz-{kver}.efi")
+            initrd_src = os.path.join(dest, f"initramfs-{kver}.zst")
+            # ESP(s) : 1ere = celle qu'on vient de stager ; 2e si declaree en env
+            esps = [(ESP, DISK, PART)]
+            esp2 = os.environ.get("ESP2")
+            if esp2 and os.path.isdir(esp2):
+                esps.append((esp2, os.environ.get("DISK2", ""),
+                             os.environ.get("PART2", "1")))
+
+            def _mk_entry(lbl, disk, part, loader):
+                if not disk:
+                    return                      # ESP sans entree NVRAM (fallback)
+                old = efi_entry(lbl)
+                if old:
+                    run(["efibootmgr", "-b", old, "-B"])
+                run(["efibootmgr", "--create", "--disk", disk, "--part", part,
+                     "--label", lbl, "--loader", loader])
+
+            msg(f"UKI : {len(profiles)} profil(s) -> {len(esps)} ESP")
+            res = uki_build.deploy_profiles(profiles, vmlinuz_src, initrd_src,
+                                            esps, log=msg, build_dir="/tmp",
+                                            efibootmgr_fn=_mk_entry)
+            ok = sum(1 for r in res if r.ok)
+            msg(f"UKI : {ok}/{len(res)} construits et deployes")
+    except Exception as e:
+        msg(f"UKI non construits ({e}) -- non bloquant, entree classique OK")
 
     # indexer la version dans le registre (statut candidate jusqu'au boot valide)
     try:

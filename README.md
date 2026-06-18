@@ -113,8 +113,8 @@ Datasets principaux :
 boot_pool/images        rootfs.sfs MASTER (déployé en strip sur les NVMe)
 boot_pool/manager       index/historique du gestionnaire (durable, git-friendly)
 fast_pool/sfs           rootfs.sfs (travail) + modules-<ver>.sfs
-fast_pool/rootfs,var,tmp overlays (upper) — PERDUS si un NVMe lâche
-fast_pool/log           logs (rapide)
+fast_pool/rootfs        overlay racine (upper) — PERDU si un NVMe lâche
+fast_pool/log           /var/log persistant (rapide)
 data_pool/log           réplication durable des logs (zfs send depuis fast_pool)
 data_pool/home          données, modèles (10 To+)
 data_pool/archives      snapshots / sauvegardes (cible des zfs send)
@@ -222,11 +222,11 @@ zfs create -o compression=off -o recordsize=1M \
 # upper de l'overlay racine -> systeme mutable et persistant entre les boots.
 zfs create -o compression=zstd -o xattr=sa -o acltype=posixacl \
            -o mountpoint=/fast_pool/rootfs           fast_pool/rootfs
-zfs create -o compression=zstd -o xattr=sa -o acltype=posixacl \
-           -o mountpoint=/fast_pool/var              fast_pool/var
+# /var lui-meme reste DANS l'overlay rootfs (pas de dataset separe). Seul
+# /var/log est persistant (journaux qui survivent aux reboots) :
 zfs create -o compression=zstd -o recordsize=128K \
            -o mountpoint=/fast_pool/log              fast_pool/log
-#   rootfs = upper de l'overlay ; var monte sur /var ; log sur /var/log.
+#   rootfs = upper de l'overlay ; log monte sur /var/log (/var vient de l'overlay).
 #   init.py les monte automatiquement (sautes en mode secours -> tmpfs).
 #   /tmp reste un tmpfs volatile : PAS de dataset (ephemere par nature).
 
@@ -271,7 +271,7 @@ zfs create -o refreservation=200G -o mountpoint=none fast_pool/reserve
 |---|---|---|
 | `fast_pool/sfs`, `boot_pool/images` | `init.py` (initramfs) | `mount.zfs` explicite, **pas** d'auto-mount |
 | `fast_pool/rootfs` (upper) | `init.py` | upper de l'overlay racine (persistant) |
-| `fast_pool/var`, `fast_pool/log`, `fast_pool/usr-src` | `init.py` | `mount.zfs` sur `NEWROOT/{var,var/log,usr/src}` |
+| `fast_pool/log`, `fast_pool/usr-src` | `init.py` | `mount.zfs` sur `NEWROOT/{var/log,usr/src}` (`/var` vient de l'overlay) |
 | `boot_pool/manager`, `data_pool/*` | système booté (OpenRC) | auto-mount ZFS standard (mountpoint) |
 
 > En **mode secours** (fast_pool absent), `init.py` saute tous les datasets
@@ -301,6 +301,10 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 .
 ├── README.md
 │
+├── common.py             # SOCLE userspace : sh() unifie + helpers ZFS partages
+│                         #   + Result observable + is_true + ConfigView.
+│                         #   JAMAIS importe par le chemin de boot (init reste autonome)
+│
 │  ── BOOT (chemin critique) ──────────────────────────────────────────
 ├── init.py               # PID 1 de l'initramfs (ctypes) — installé comme /init
 │                         #   pseudo-FS → charge zfs → import pool → santé →
@@ -309,6 +313,18 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 │                         #   zpool/zfs/mount.zfs/ip + famille zfs.ko + firmware
 ├── initramfs_verify.py   # verifie le contenu d'un initramfs (sans booter) +
 │                         #   checksums SHA-256 + manifeste d'integrite
+├── sfs_build.py          # cree rootfs.sfs + modules-<ver>.sfs (staging tmpfs,
+│                         #   nettoyage, controle) -- appele par first_boot/kernel_build
+├── clean_rootfs.py       # prepare une racine Gentoo PROPRE sur une COPIE (rsync
+│                         #   -aHAX) avant de figer en rootfs.sfs (jamais automatique)
+├── uki_build.py          # UKI multi-profils (vmlinuz+initramfs+cmdline via objcopy)
+│                         #   sur les 2 ESP + fallback BOOTX64.EFI ; pilote par [uki]
+├── zfs_mounts.py         # detection/verification/montage de datasets (ismount +
+│                         #   /proc/mounts + contenu) -- distingue 'monte' de 'dossier vide'
+├── validate_boot.py      # valide SFS (montable + contenu) et ESP (vfat + place)
+│                         #   avant de compter dessus -- module commun
+├── zfs_replicate.py      # replication incrementale (zfs send -i) fast_pool/log
+│                         #   -> data_pool/log (durable) ; rotation des snapshots
 ├── session_launch.py     # post-switch_root (PID 1 du rootfs) : seatd + cage +
 │                         #   bascule du stream fbdev → capture wayland
 ├── efi_install.py        # install EFI initiale (un seul noyau, manuel)
@@ -545,9 +561,27 @@ i915.force_probe=!4c8b xe.force_probe=4c8b ip=192.168.1.10::192.168.1.1:255.255.
 
 ### 7.1 Nettoyage de la racine avant `mksquashfs`
 
-L'image devient **lecture seule** (lower de l'overlay) : tout ce qui reste
-dedans y reste pour toujours, et tout ce qui manque pour les montages fera
-échouer `init.py`/`session_launch.py` au boot. À faire sur `<racine_gentoo>`
+**Méthode sûre (recommandée)** : `clean_rootfs.py` copie le rootfs source vers
+un staging fourni (`rsync -aHAX` : préserve xattr/ACL/hardlinks/permissions),
+nettoie **la copie**, et laisse le système source **intact**. Jamais automatique,
+garde-fous stricts (refuse `/` et les chemins système, refuse source==staging) :
+
+```sh
+# le staging doit avoir la place (plusieurs Go) et N'EST PAS un chemin systeme
+python3 clean_rootfs.py --source <racine_gentoo> --staging /data_pool/staging
+python3 clean_rootfs.py --source <racine> --staging /data_pool/staging --dry-run  # voir sans agir
+# puis figer la copie propre :
+python3 sfs_build.py --rootfs-src /data_pool/staging
+```
+
+Il purge : caches Portage (`var/tmp/portage`, distfiles, binpkgs), logs de build,
+`__pycache__`/`.pyc`, `machine-id` (vidé, régénéré au boot), clés SSH hôte
+(régénérées), handoff initramfs (`yt.key`, `initramfs-stream.pid`). Il **protège**
+`etc/portage`, `var/db/pkg`, `lib/modules`, et les scripts de session. Un
+`verify_essentials` avertit si un élément critique manque dans la copie.
+
+**Méthode manuelle** (équivalente, si tu préfères tout contrôler à la main) :
+À faire sur `<racine_gentoo>`
 juste avant `mksquashfs` :
 
 ```sh
@@ -648,6 +682,17 @@ mksquashfs <racine_gentoo> $(zfs get -H -o value mountpoint fast_pool/sfs)/rootf
 ```
 (la racine doit contenir python3, les paquets §3, et les scripts §5)
 
+**Automatisable** : plutôt que la commande manuelle ci-dessus (souvent oubliée —
+c'est ce qui a causé un boot raté faute de `rootfs.sfs`), `sfs_build.py` le fait
+avec staging tmpfs `/tmp`, nettoyage et contrôle du fichier final :
+```sh
+python3 sfs_build.py --rootfs-src <racine_gentoo>           # rootfs.sfs
+python3 sfs_build.py --modules <kver>                       # modules-<kver>.sfs
+# ou via l'orchestrateur :  first_boot.py --rootfs-src <racine_gentoo>
+```
+Si `rootfs.sfs` est **absent au boot**, `init.py` ne fige plus l'écran : il
+affiche « IMAGE ROOTFS ABSENTE » et ouvre un shell de secours.
+
 ## 8. Construire l'initramfs
 
 `build_initramfs.py` embarque CPython (interpréteur + stdlib allégée + `.so` via
@@ -691,7 +736,93 @@ sudo env FFMPEG_STATIC=/usr/local/bin/ffmpeg-static \
 > même device en continu. Après `switch_root`, `session_launch.py` tue ce
 > ffmpeg (handoff `/etc/initramfs-stream.pid`) et bascule sur la capture wayland.
 
+### Vérification des montages (`zfs_mounts.py`) — ne jamais supposer
+
+Leçon d'un bug réel : **créer un point de montage (`os.makedirs`) ne garantit pas
+que le dataset est monté**. On se retrouve avec un **dossier vide** là où on
+croyait un dataset → données écrites au mauvais endroit, rootfs pollué.
+`zfs_mounts.py` ne suppose jamais : il **vérifie** via `os.path.ismount` +
+`/proc/mounts` (la vérité terrain, pas la propriété ZFS), et optionnellement la
+présence d'un **contenu attendu** (distingue « monté » de « monté mais vide »).
+
+API : `inspect(ds)` (état sans monter), `verify_mounted(ds, expect_any=[...])`,
+`ensure_mounted(ds, target, want_mode, ...)` (monte SI besoin et **confirme**),
+`report(datasets)` (générateur d'état, pour un preflight). Utilisé par
+`first_boot.py` (preflight signale les datasets existants mais non montés) et
+`sfs_build.py` (refuse d'écrire dans un `fast_pool/sfs` non monté — c'était la
+cause des SFS écrits dans le vide). `init.py` garde sa logique autonome
+(initramfs), même esprit.
+
+```sh
+python3 zfs_mounts.py fast_pool/sfs fast_pool/log          # etat
+python3 zfs_mounts.py fast_pool/log --mount --target /var/log  # monte + verifie
+```
+
+**Garde anti-masquage** : monter un dataset sur un point de montage **non-vide**
+masque les fichiers qui s'y trouvent. `zfs_mounts.ensure_mounted` et
+`init.mount_dataset` **refusent** ce cas (erreur), sauf `allow_nonempty=True`
+(remplacement voulu, ex: `/var/log` où le contenu du rootfs est attendu).
+
+### Valider les artefacts de boot (`validate_boot.py`)
+
+Avant de compter sur un SFS ou une ESP, on **vérifie qu'ils passeront** :
+- **SFS** (`validate_sfs`) : signature squashfs (`hsqs`), taille, puis **montage
+  RO réel** (loop) + présence du contenu attendu (rootfs : `sbin/etc/usr/lib` ;
+  modules : `kernel/`). Détecte un SFS tronqué/corrompu avant le boot.
+- **ESP** (`validate_esp`) : type `vfat`, accessible (montée ou montable), place
+  suffisante pour vmlinuz + initramfs + UKI.
+
+`sfs_build.py` valide **automatiquement** chaque SFS juste après création (échec
+= `SfsResult` non-ok, on ne livre pas un SFS invalide).
+
+```sh
+python3 validate_boot.py --rootfs /mnt/sfs/rootfs.sfs \
+        --modules /mnt/sfs/modules-6.12.sfs --esp /dev/nvme0n1p1   # root requis (montages)
+```
+
+
+### Remappage des montages (`[mounts]`) — bind, sans toucher aux `mountpoint`
+
+
+
+Les datasets gardent leur propriété `mountpoint=/fast_pool/...`, `/boot_pool/...`,
+`/data_pool/...` (vision pratique : `zfs list` montre tout rangé par pool). Au
+boot, `init.py` **remappe** vers l'emplacement d'usage **sans modifier la
+propriété** (jamais de `zfs set`) :
+
+- **non-legacy** (ton cas) : ZFS monte le dataset à son chemin naturel (auto à
+  l'import), puis `init.py` fait un `mount --bind` vers l'emplacement d'usage.
+- **legacy** : ZFS ne monte rien → `init.py` monte directement avec `mount.zfs`.
+
+`init.py` **détecte le mode réel** (`zfs get mountpoint`) et s'adapte ; l'ini
+précise le mode attendu (`mode = property|legacy|auto`) et le code alerte en cas
+de divergence. La table de remappage est déclarée dans `[mounts]` de `infra.conf`
+et **générée en fichier plat** `/etc/mounts.map` (embarqué dans l'initramfs), que
+`init.py` lit sans configobj (parsing trivial). Changer l'ini change le remappage.
+
+```ini
+[mounts]
+    [[fast_pool/sfs]]
+    usage = /mnt/sfs            # images (lecture)
+    mode = auto
+    [[fast_pool/rootfs]]
+    usage = /mnt/ovl            # upper de l'overlay
+    mode = auto
+    [[fast_pool/log]]
+    usage = NEWROOT/var/log     # journaux persistants
+    mode = auto
+    [[fast_pool/usr-src]]
+    usage = NEWROOT/mnt/usr-src # sources noyau (PAS /usr/src : evite de masquer Gentoo)
+    mode = auto
+```
+
+> `fast_pool/usr-src` se monte sur **`/mnt/usr-src`** (pas `/usr/src`) pour ne
+> pas masquer le répertoire de travail Gentoo. Le symlink `/usr/src/linux` (géré
+> par `eselect kernel`) pointe vers l'arbre dans `/mnt/usr-src`.
+
 ### Vérifier l'initramfs (sans booter) + checksums
+
+
 
 `build_initramfs.py` vérifie **automatiquement** le contenu de l'image générée
 (post-build) : présence de `/init`, `zfs.ko`, `zfs_load_order`, `zpool`/`zfs`/
@@ -921,22 +1052,77 @@ enabled = false      # force false en chroot ; true en systeme boote
 
 ### Prérequis chroot (vérifiés par `preflight`)
 
-`first_boot.py` lance un **preflight** qui détecte les prérequis hors `infra.conf`
-et **propose les commandes** (sans les exécuter) :
+`first_boot.py` lance un **preflight exhaustif** qui détecte tout ce qui peut
+casser **avant d'agir** ; un point **critique stoppe** (exit 4), et les commandes
+de correction sont **proposées sans être exécutées** :
 
-- **efivarfs non monté** → `efibootmgr` échoue (`exit 2`, « EFI variables not
-  supported »). Monte-le : `mount -t efivarfs efivarfs /sys/firmware/efi/efivars`.
-  (`kernel_build.py` tente aussi de le monter automatiquement.)
-- **`/usr/src/linux` cassé** (boucle de symlink → « too many levels of symbolic
-  links ») : `rm /usr/src/linux ; ln -s /usr/src/linux-<version> /usr/src/linux`.
-- **2e ESP non montée** (rsync impossible) : `mount /dev/nvme1n1p1 /mnt/esp2`.
+- **mode UEFI** (`/sys/firmware/efi`) — sinon le boot EFI stub est impossible
+  (active UEFI / désactive le CSM dans le BIOS). **Critique.**
+- **architecture x86_64** (init.py y est figé). **Critique.**
+- **outils** : `make`, `gcc`, `ld`, `emerge`, `mksquashfs`, `efibootmgr`, `zstd`,
+  `zpool`, `zfs`, `mount.zfs`, `depmod`, `modinfo`. Manquant = **critique**.
+- **espace disque** : ~8 Go sur `/usr/src`, ~6 Go sur `/var/tmp` (compilation +
+  zfs-kmod). Insuffisant = **critique**.
+- **mémoire** (info ; réduire `-j` si faible).
+- **efivarfs** non monté → `mount -t efivarfs efivarfs /sys/firmware/efi/efivars`.
+- **`/usr/src/linux`** cassé (boucle de symlink) → `rm` + `ln -s` proposés.
+- **2e ESP** non montée → `mount /dev/nvme1n1p1 /mnt/esp1` proposé.
 
-> Les binaires `zpool`/`zfs`/`mount.zfs` **doivent** être trouvables (`sys-fs/zfs`
-> installé, `/sbin` accessible). `build_initramfs.py` les cherche d'abord dans
-> `/sbin` (robuste en chroot où le PATH est incomplet) et **arrête le build**
-> s'ils manquent (image non-bootable sinon). Vérifie : `which zpool zfs mount.zfs`.
+Les échecs (infra, preflight, build) sont **remontés sur le board git** (statut
+`drop`) si la config git est présente.
+
+### Config git (`[git]` dans `infra.conf`, surchargeable par CLI)
+
+```ini
+[git]
+repo = newicody/gentoo-stream     # owner/nom (mode issues)
+mode = project                    # issues | project
+project_owner = newicody          # Project v2 (mode project)
+project_number = 1
+```
+Surcharge : `--repo owner/nom`, `--owner`, `--number`. Le **token** vient
+toujours de `GITHUB_TOKEN` (jamais dans le fichier).
 
 
+
+## UKI multi-profils (`uki_build.py`, section `[uki]`)
+
+Un **UKI** (Unified Kernel Image) bundle `vmlinuz` + `initramfs` + `cmdline` dans
+**un seul binaire EFI**, bootable sans argument — donc utilisable au chemin de
+secours `\EFI\BOOT\BOOTX64.EFI` (qui est lancé sans cmdline). Comme le noyau a
+`CONFIG_EFI_STUB=y`, le `vmlinuz` **est** déjà un binaire EFI : on greffe les
+sections `.cmdline`/`.initrd`/`.osrel` dessus par `objcopy`, **sans aucune
+dépendance** (pas de stub systemd — adapté à OpenRC). Secure Boot **désactivé**
+pour l'instant (UKI non signés ; signature ajoutable plus tard avec tes clés MOK).
+
+Chaque profil de `[uki]` produit 1 UKI, **placé sur les 2 ESP** (chaque disque
+bootable seul) ; `register_uefi=true` crée l'entrée `efibootmgr` ; `fallback=true`
+écrit aussi `\EFI\BOOT\BOOTX64.EFI`. La **cmdline est dans l'ini** : tu y mets/
+retires les options qui peuvent faire planter, et tu crées des profils de
+diagnostic. Exemple fourni :
+
+```ini
+[uki]
+enabled = true
+    [[normal]]
+    label = Gentoo
+    cmdline = i915.force_probe=!4c8b xe.force_probe=4c8b ip=... console=tty0 loglevel=4
+    register_uefi = true
+    fallback = true        # sert aussi de \EFI\BOOT\BOOTX64.EFI
+    [[safe]]
+    label = Gentoo-safe
+    cmdline = nomodeset ip=... console=tty0 loglevel=7   # diagnostic : affichage VGA lisible
+    register_uefi = true
+    fallback = false
+```
+
+`kernel_build.py` construit les UKI automatiquement après le staging classique
+(non bloquant si ça échoue). Pour la 2e ESP, exporte `ESP2`/`DISK2`/`PART2`.
+
+> **Diagnostic d'un boot qui gèle** : boote le profil `safe` (nomodeset,
+> loglevel=7) depuis le menu UEFI. Si l'écran reste lisible → le coupable est le
+> pilote graphique (`xe`/`force_probe`), pas le reste. C'est l'outil pour isoler
+> le gel « écran en bruit coloré ».
 
 ## Boucle d'auto-update du noyau
 
@@ -984,6 +1170,28 @@ zfs send -R boot_pool@$(date +%F) | zfs recv -F data_pool/archives/boot_pool
 ```
 (à déclencher depuis le board / un timer ; voir réplication des logs idem
 `fast_pool/log` → `data_pool/log`.)
+
+### Réplication incrémentale des logs (`zfs_replicate.py`)
+
+`fast_pool/log` vit sur le **stripe sans redondance** (1 NVMe perdu = pool
+perdu). `zfs_replicate.py` le réplique vers `data_pool/log` (raidz2, durable)
+par **snapshots incrémentaux** : 1er envoi `full`, ensuite `zfs send -i` depuis
+le dernier snapshot commun. Rotation automatique (garde `keep` snapshots de
+chaque côté). Si l'incrémental échoue (bases divergentes), repli sur un `full`.
+
+```sh
+python3 zfs_replicate.py --from-config        # lit [replication] de infra.conf
+python3 zfs_replicate.py --src fast_pool/log --dst data_pool/log --keep 14
+```
+```ini
+[replication]
+    [[logs]]
+    src = fast_pool/log
+    dst = data_pool/log
+    keep = 14
+```
+À lancer par un timer (cron OpenRC) ou depuis le board. Réutilisable pour
+d'autres paires (overlays → `data_pool/archives`, etc.).
 
 ---
 
@@ -1057,13 +1265,27 @@ tu atteins un shell).
 `fast_pool`), via une arborescence de fichiers texte (git-friendly) :
 ```
 boot_pool/manager/
-  manifest.json            index des versions (statut, refs artefacts)
+  manifest.json            index des versions (statut, refs artefacts, rev)
+  manifest.json.bak        sauvegarde auto (avant chaque ecriture)
   kernels/<kver>/.config   config compilée, archivée
   configs/<nom>/           configs ÉTUDIÉES (pas forcément compilées) + notes.md
   history.jsonl            journal append-only : inférences + compilations
 ```
 Les gros artefacts (`modules.sfs`, `initramfs`, `bzImage`) sont **référencés par
 chemin** (ils vivent sur l'ESP / `fast_pool`), jamais copiés dans l'arbre.
+
+**Protections anti-perte d'historique** (le manager ne s'auto-supprime jamais) :
+- **écriture atomique** du manifeste (`.tmp` + `os.replace`) : jamais de fichier
+  à moitié écrit, même si le process est interrompu ;
+- **backup** `manifest.json.bak` avant chaque écriture, et `_load` retombe
+  dessus si le manifeste est corrompu ;
+- **garde anti-vide** : refuse d'écraser un index peuplé par un index vide
+  (détecte une corruption en mémoire) ;
+- **versionning des entrées** : re-`register` d'une version n'écrase pas —
+  l'état précédent est archivé dans `revisions[]` et `rev` s'incrémente ;
+- `history.jsonl` est **append-only** (jamais réécrit) ;
+- `audit()` ne marque `[SUPPRIMABLE]` qu'une version **non protégée ET `stale`**,
+  et ne supprime jamais rien (ménage manuel uniquement).
 
 Création du dataset (une fois) :
 ```sh

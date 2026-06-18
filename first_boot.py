@@ -281,6 +281,10 @@ def check_pools(cfg, rep):
 
 
 def check_datasets(cfg, rep):
+    try:
+        import zfs_mounts
+    except ImportError:
+        zfs_mounts = None
     sect = cfg.get("datasets", {})
     for ds, decl in sect.items():
         if not isinstance(decl, dict):
@@ -299,10 +303,16 @@ def check_datasets(cfg, rep):
             if g_rc == 0 and got and got != str(want):
                 diverg.append(f"{prop}={got} (attendu {want})")
         if diverg:
-            (rep.warn)(f"dataset {ds} present mais divergent : "
-                       + ", ".join(diverg))   # proprietes = warning, pas stop
+            rep.warn(f"dataset {ds} present mais divergent : " + ", ".join(diverg))
         else:
             rep.ok(f"dataset {ds} conforme")
+        # VERIFICATION DE MONTAGE (le bug : dossier cree mais pas monte).
+        # Non bloquant ici (init.py monte au boot), mais on le SIGNALE.
+        if zfs_mounts:
+            st = zfs_mounts.inspect(ds)
+            if not st.mounted:
+                rep.warn(f"dataset {ds} existe mais N'EST PAS monte actuellement "
+                         f"(verifier qu'init.py le montera, pas un dossier vide)")
 
 
 def check_efi(cfg, rep):
@@ -359,56 +369,116 @@ def verify_infra(cfg, rep):
 # --------------------------------------------------------------------------- #
 # build (reutilise les modules existants par import)
 # --------------------------------------------------------------------------- #
+def _disk_free_gb(path):
+    """Espace libre en Go sur le FS contenant path (0 si inaccessible)."""
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / (1024 ** 3)
+    except OSError:
+        return 0.0
+
+
 def preflight(cfg, src, rep):
-    """Verifie les prerequis de build qui ne sont PAS dans infra.conf mais
-    bloquent en chroot : efivarfs monte, ESP montees, /usr/src/linux sain.
-    PROPOSE les commandes de correction sans les executer (choix : non
-    intrusif). Retourne la liste des commandes a lancer (vide si tout est bon)."""
+    """Detecte TOUT ce qui peut casser AVANT d'agir : UEFI, arch, espace
+    disque, outils, montages, /usr/src. Remplit rep (crit = stop). PROPOSE les
+    commandes de correction sans les executer. Retourne la liste de commandes."""
     todo = []
 
-    # 1. efivarfs (sinon efibootmgr -> exit 2 'EFI variables not supported')
-    if not os.path.ismount("/sys/firmware/efi/efivars") and \
-       not os.path.exists("/sys/firmware/efi/efivars/dummy"):
-        # heuristique : repertoire vide ou absent => pas monte
-        try:
-            empty = not os.listdir("/sys/firmware/efi/efivars")
-        except OSError:
-            empty = True
-        if empty:
-            rep.warn("efivarfs non monte -> efibootmgr echouera")
-            todo.append("mount -t efivarfs efivarfs /sys/firmware/efi/efivars")
+    # --- 1. mode UEFI (sans /sys/firmware/efi, tout le schema EFI stub est mort)
+    if not os.path.isdir("/sys/firmware/efi"):
+        rep.crit("machine NON demarree en UEFI (/sys/firmware/efi absent) : "
+                 "le boot EFI stub est impossible. Active UEFI dans le BIOS "
+                 "(desactive le CSM/Legacy).")
 
-    # 2. /usr/src/linux : boucle de symlink / cible cassee
-    link = src
+    # --- 2. architecture (init.py est fige sur x86_64) ----------------------
+    arch = os.uname().machine
+    if arch != "x86_64":
+        rep.crit(f"architecture {arch} : ce projet est fige sur x86_64 "
+                 "(init.py : NR_finit_module, loader).")
+
+    # --- 3. outils indispensables (manquant = echec garanti plus tard) ------
+    tools = {"make": True, "gcc": True, "ld": True, "emerge": True,
+             "mksquashfs": True, "efibootmgr": True, "zstd": True,
+             "zpool": True, "zfs": True, "mount.zfs": True,
+             "depmod": True, "modinfo": True}
+    import shutil as _sh
+    for tool, critical in tools.items():
+        found = _sh.which(tool) or any(
+            os.path.exists(os.path.join(d, tool))
+            for d in ("/sbin", "/usr/sbin", "/usr/bin", "/bin"))
+        if not found:
+            (rep.crit if critical else rep.warn)(
+                f"outil '{tool}' introuvable (installe le paquet correspondant)")
+
+    # --- 4. espace disque (compiler + sfs + initramfs = plusieurs Go) -------
+    checks = [(src, 8.0, "sources/compilation noyau"),
+              ("/var/tmp", 6.0, "build portage (zfs-kmod)")]
+    # ESP : besoin de qq centaines de Mo pour vmlinuz+initramfs
+    esp = cfg.get("esp", {}) if hasattr(cfg, "get") else {}
+    for path, need, what in checks:
+        if os.path.exists(path):
+            free = _disk_free_gb(path)
+            if free < need:
+                rep.crit(f"espace insuffisant sur {path} : {free:.1f} Go libres, "
+                         f"~{need:.0f} Go requis ({what})")
+            else:
+                rep.ok(f"espace {path} : {free:.1f} Go libres ({what})")
+
+    # --- 5. memoire (info ; 128 Go chez nous, mais on signale si maigre) -----
     try:
-        real = os.path.realpath(link)
-        if not os.path.isdir(real):
-            rep.crit(f"{link} -> {real} : cible invalide (symlink casse ?)")
-            todo.append(f"# corrige le lien : rm {link} ; "
-                        f"ln -s /usr/src/linux-<version> {link}")
-        elif not os.path.exists(os.path.join(real, "Makefile")):
-            rep.warn(f"{link} ne contient pas de Makefile noyau")
-    except OSError as e:
-        rep.crit(f"{link} illisible ({e}) -- boucle de symlink ?")
-        todo.append(f"# corrige le lien : rm {link} ; "
-                    f"ln -s /usr/src/linux-<version> {link}")
+        mem = open("/proc/meminfo").read()
+        total_kb = int(next(l.split()[1] for l in mem.splitlines()
+                            if l.startswith("MemTotal")))
+        gb = total_kb / (1024 ** 2)
+        if gb < 4:
+            rep.warn(f"memoire faible ({gb:.1f} Go) : reduis -j pour compiler")
+        else:
+            rep.ok(f"memoire : {gb:.0f} Go")
+    except (OSError, StopIteration, ValueError):
+        pass
 
-    # 3. ESP du second disque (declarees mais non montees en chroot)
+    # --- 6. efivarfs monte (sinon efibootmgr exit 2) ------------------------
+    if not _efivars_ok():
+        rep.warn("efivarfs non monte -> efibootmgr echouera")
+        todo.append("mount -t efivarfs efivarfs /sys/firmware/efi/efivars")
+
+    # --- 7. /usr/src/linux sain (boucle de symlink ?) -----------------------
+    try:
+        real = os.path.realpath(src)
+        if not os.path.isdir(real):
+            rep.crit(f"{src} -> {real} : cible invalide (symlink casse ?)")
+            todo.append(f"# rm {src} ; ln -s /usr/src/linux-<version> {src}")
+        elif not os.path.exists(os.path.join(real, "Makefile")):
+            rep.warn(f"{src} sans Makefile noyau")
+    except OSError as e:
+        rep.crit(f"{src} illisible ({e}) -- boucle de symlink ?")
+        todo.append(f"# rm {src} ; ln -s /usr/src/linux-<version> {src}")
+
+    # --- 8. ESP du 2e disque non montee (rsync impossible) ------------------
     efi = cfg.get("efi", {}) if hasattr(cfg, "get") else {}
     parts = efi.get("partitions", []) if efi else []
     if isinstance(parts, str):
         parts = [parts]
-    # quelles ESP sont effectivement montees ?
     try:
         mounts = open("/proc/mounts").read()
     except OSError:
         mounts = ""
-    for p in parts:
+    for i, p in enumerate(parts):
         if os.path.exists(p) and p not in mounts:
-            rep.warn(f"ESP {p} presente mais NON montee (rsync 2e ESP impossible)")
-            todo.append(f"mkdir -p /mnt/esp2 ; mount {p} /mnt/esp2  "
-                        f"# pour synchroniser la 2e ESP")
+            rep.warn(f"ESP {p} presente mais NON montee")
+            todo.append(f"mkdir -p /mnt/esp{i} ; mount {p} /mnt/esp{i}")
+
     return todo
+
+
+def _efivars_ok():
+    p = "/sys/firmware/efi/efivars"
+    if os.path.ismount(p):
+        return True
+    try:
+        return bool(os.listdir(p))
+    except OSError:
+        return False
 
 
 def run_build(config_path, rep, src="/usr/src/linux"):
@@ -493,7 +563,13 @@ def main():
     ap.add_argument("--infra", default="infra.conf",
                     help="declaration de l'infrastructure voulue")
     ap.add_argument("--src", default="/usr/src/linux")
-    ap.add_argument("--repo", default=None, help="owner/name pour le board git")
+    ap.add_argument("--rootfs-src", default=None,
+                    help="racine Gentoo a figer en rootfs.sfs (si absent)")
+    ap.add_argument("--repo", default=None, help="owner/name (surcharge [git].repo)")
+    ap.add_argument("--owner", default=None,
+                    help="proprietaire du Project (surcharge [git].project_owner)")
+    ap.add_argument("--number", default=None, type=int,
+                    help="numero du Project (surcharge [git].project_number)")
     ap.add_argument("--no-inference", action="store_true",
                     help="(force en chroot) desactive tout appel d'inference")
     ap.add_argument("--enable-inference", action="store_true",
@@ -513,6 +589,12 @@ def main():
 
     cfg_raw = ConfigObj(a.infra)
     cfg = ConfigView(cfg_raw, "infra")
+    # config git : [git] dans infra.conf, surchargee par les options CLI
+    gitc = cfg.get("git", {})
+    repo = a.repo or (gitc.repo if gitc else None)
+    git_mode = (gitc.mode if gitc else None) or "issues"
+    proj_owner = a.owner or (gitc.project_owner if gitc else None)
+    proj_number = a.number or (gitc.project_number if gitc else None)
     # AFFICHER la config avant de l'utiliser (par attributs/generateur)
     cfg.show(title=f"infra.conf (profil {cfg.profile or '?'})")
 
@@ -539,26 +621,30 @@ def main():
     if not coherent:
         print("!! ECART(S) CRITIQUE(S) -> first-boot STOPPE. "
               "Corrige l'infra (cf. rapport) puis relance.", flush=True)
-        _push_failure(rep, a.repo, "infra non conforme")
+        _push_failure(rep, repo, "infra non conforme")
         stop_stream(stream)
         sys.exit(2)
 
-    # preflight : prerequis de build hors infra.conf (efivarfs, ESP, /usr/src)
-    print(">> preflight (efivarfs, ESP, /usr/src/linux)...", flush=True)
+    # preflight EXHAUSTIF : UEFI, arch, espace, outils, montages, /usr/src
+    print(">> preflight (UEFI, arch, espace disque, outils, montages)...",
+          flush=True)
+    crit_before = len(rep.criticals)
     todo = preflight(cfg, a.src, rep)
     print(rep.text(), flush=True)
-    if todo:
-        print("!! prerequis manquants. Commandes a lancer AVANT de relancer "
-              "first_boot :", flush=True)
-        for cmd in todo:
-            print(f"    {cmd}", flush=True)
-        # un prerequis critique (rep.criticals nouveau) stoppe ; sinon on
-        # laisse l'utilisateur decider (warnings) mais on s'arrete par securite
-        # car efibootmgr/rsync echoueraient.
-        print("\n   Lance ces commandes puis relance first_boot.py.", flush=True)
-        _push_failure(rep, a.repo, "prerequis preflight manquants")
+    new_crit = len(rep.criticals) > crit_before
+    if new_crit or todo:
+        if new_crit:
+            print("!! CONTEXTE INCOMPATIBLE (ecart critique) -> first-boot "
+                  "STOPPE. Corrige les points [CRIT] ci-dessus.", flush=True)
+        if todo:
+            print("!! Commandes a lancer AVANT de relancer first_boot :",
+                  flush=True)
+            for cmd in todo:
+                print(f"    {cmd}", flush=True)
+        _push_failure(rep, repo, "preflight : contexte incompatible")
         stop_stream(stream)
         sys.exit(4)
+    print(">> contexte compatible.", flush=True)
 
     if a.dry_run:
         print(">> dry-run : infra conforme + preflight OK, arret avant build.",
@@ -567,17 +653,31 @@ def main():
         return
 
     print(">> build du noyau et du boot...", flush=True)
+    # rootfs.sfs : le creer s'il est absent (sinon init.py ne peut pas monter /)
+    if a.rootfs_src:
+        import sfs_build
+        rs = sfs_build.build_rootfs_sfs(a.rootfs_src, "fast_pool/sfs",
+                                        log=lambda m: print("   " + m, flush=True))
+        if not rs.ok:
+            print(f"!! creation rootfs.sfs echouee : {rs.reason}", flush=True)
+            _push_failure(rep, repo, f"rootfs.sfs : {rs.reason}")
+            stop_stream(stream)
+            sys.exit(3)
+        rep.ok(f"rootfs.sfs : {rs.path} ({rs.size_mb} Mo)")
+    else:
+        rep.warn("--rootfs-src non fourni : rootfs.sfs suppose deja present "
+                 "(verifie qu'il existe dans fast_pool/sfs !)")
     built = run_build(a.config, rep, src=a.src)
     write_report(rep)
     if not built:
         print("!! build echoue (cf. sortie kernel_build). Rien arme.", flush=True)
-        _push_failure(rep, a.repo, "build echoue")
+        _push_failure(rep, repo, "build echoue")
         stop_stream(stream)
         sys.exit(3)
 
     kver = detect_kver(a.src)
     print(">> demande d'autorisation (git/local)...", flush=True)
-    authorized = request_git_authorization(rep, repo=a.repo, kver=kver)
+    authorized = request_git_authorization(rep, repo=repo, kver=kver)
     write_report(rep)
     if authorized:
         print(f">> first-boot termine pour {kver}. BootNext arme (essai unique). "

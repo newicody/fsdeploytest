@@ -41,8 +41,7 @@ RESCUE_ROOTFS  = "rootfs.sfs"
 # upper de l'overlay racine + montages directs. En mode SECOURS (fast_pool
 # absent), aucun n'est disponible -> on retombe sur un upper tmpfs volatile.
 UPPER_DS   = f"{POOL}/rootfs"     # upper de l'overlay racine (systeme mutable)
-VAR_DS     = f"{POOL}/var"        # monte sur NEWROOT/var
-LOG_DS     = f"{POOL}/log"        # monte sur NEWROOT/var/log (replique vers data_pool)
+LOG_DS     = f"{POOL}/log"        # monte sur NEWROOT/var/log (persistant ; /var lui-meme reste dans l'overlay rootfs)
 USRSRC_DS  = f"{POOL}/usr-src"    # monte sur NEWROOT/usr/src (sources noyau, build)
 
 IP_ADDR  = "192.168.1.10/24"   # redondant si ip= passe par la cmdline noyau
@@ -169,6 +168,135 @@ def capture(cmd):
         return p.returncode, p.stdout.decode(errors="replace")
     except (OSError, ValueError) as e:
         return 1, str(e)
+
+
+MOUNTS_FILE = "/etc/mounts.map"   # fichier plat genere depuis l'ini au build
+
+
+def load_mounts_map(path=MOUNTS_FILE):
+    """Charge le schema de remappage genere depuis infra.conf (section [mounts]).
+    Format PLAT (parsing trivial, PAS de configobj dans l'initramfs) :
+        # commentaire
+        dataset <tab/espaces> usage_path <tab/espaces> mode
+    mode = property | legacy | auto. Lignes vides/commentaires ignorees.
+    Retourne une liste de tuples (dataset, usage_path, mode). Vide si absent
+    (init.py retombe alors sur ses constantes codees en dur)."""
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    ds = parts[0]
+                    usage = parts[1]
+                    mode = parts[2] if len(parts) >= 3 else "auto"
+                    rows.append((ds, usage, mode))
+    except OSError:
+        pass
+    return rows
+
+
+def zfs_mountpoint(dataset):
+    """Valeur de la propriete mountpoint du dataset ('legacy', '/chemin', ou '')."""
+    rc, out = capture(["zfs", "get", "-H", "-o", "value", "mountpoint", dataset])
+    return out.strip() if rc == 0 else ""
+
+
+# schema de remappage charge depuis le fichier plat (rempli dans main)
+_MOUNTS = {}
+
+
+def usage_for(dataset, default, newroot=""):
+    """Point d'usage d'un dataset selon la map (fichier plat). 'NEWROOT/...' est
+    resolu en remplacant NEWROOT par le chemin reel. Repli sur `default` si le
+    dataset n'est pas dans la map (init.py reste fonctionnel sans map)."""
+    entry = _MOUNTS.get(dataset)
+    if not entry:
+        return default
+    usage = entry[0]
+    if usage.startswith("NEWROOT/"):
+        usage = usage.replace("NEWROOT", newroot.rstrip("/"), 1)
+    elif usage == "NEWROOT":
+        usage = newroot
+    return usage
+
+
+def mode_for(dataset, default="auto"):
+    entry = _MOUNTS.get(dataset)
+    return entry[1] if entry else default
+
+
+def mount_dataset(dataset, usage_path, want_mode="auto", bind=True,
+                  allow_nonempty=False):
+    """Rend le contenu de `dataset` disponible a `usage_path`, SANS toucher a la
+    propriete mountpoint (pas de zfs set). Strategie 'remapper sans remonter' :
+
+      - non-legacy (mountpoint=/chemin) : le dataset est deja monte a son chemin
+        naturel (auto a l'import). On fait un BIND de ce chemin vers usage_path.
+      - legacy : ZFS ne monte rien -> on monte d'abord avec mount.zfs au chemin
+        naturel implicite (sinon directement a usage_path), puis bind si besoin.
+
+    GARDE MASQUAGE : si usage_path contient deja des fichiers, monter par-dessus
+    les masque -> refus, sauf allow_nonempty=True (ex: /var/log ou le contenu du
+    rootfs est attendu et le dataset le remplace volontairement).
+
+    want_mode ('property'|'legacy'|'auto') vient de l'ini ; le code VERIFIE le
+    mode reel via zfs get et s'adapte (alerte si divergence). Retourne True/False.
+    """
+    # garde masquage
+    if not allow_nonempty:
+        try:
+            if os.path.isdir(usage_path) and os.listdir(usage_path):
+                log(f"  [!] {dataset} : {usage_path} NON-VIDE -> refus "
+                    f"(masquerait des fichiers ; allow_nonempty pour forcer)")
+                return False
+        except OSError:
+            pass
+    real_mp = zfs_mountpoint(dataset)
+    is_legacy = (real_mp == "legacy")
+    # verification de coherence avec ce que l'ini annonce
+    if want_mode == "legacy" and not is_legacy:
+        log(f"  [!] {dataset} : ini dit legacy mais mountpoint={real_mp} "
+            f"(j'utilise le mode reel)")
+    elif want_mode == "property" and is_legacy:
+        log(f"  [!] {dataset} : ini dit property mais mountpoint=legacy "
+            f"(j'utilise le mode reel)")
+
+    os.makedirs(usage_path, exist_ok=True)
+
+    if is_legacy:
+        # legacy : monter directement a l'emplacement d'usage (pas de chemin
+        # naturel ZFS). C'est le cas le plus simple : un seul montage.
+        if run(["mount.zfs", dataset, usage_path]) == 0:
+            log(f"  {dataset} (legacy) -> {usage_path}")
+            return True
+        log(f"  [!] {dataset} (legacy) : mount.zfs echoue")
+        return False
+
+    # non-legacy : le dataset DOIT etre monte a son chemin naturel. A l'import
+    # auto c'est fait ; sinon on le monte (sans changer la propriete).
+    if not os.path.ismount(real_mp):
+        subprocess.run(["zfs", "mount", dataset], stderr=subprocess.DEVNULL)
+    if not os.path.ismount(real_mp):
+        # dernier recours : mount.zfs au chemin naturel (toujours sans set)
+        os.makedirs(real_mp, exist_ok=True)
+        run(["mount.zfs", dataset, real_mp])
+    if not os.path.ismount(real_mp):
+        log(f"  [!] {dataset} : pas monte a son chemin naturel {real_mp}")
+        return False
+
+    if not bind or os.path.abspath(real_mp) == os.path.abspath(usage_path):
+        log(f"  {dataset} -> {real_mp} (usage direct)")
+        return True
+    # BIND : remapper sans remonter, sans toucher au mountpoint
+    if run(["mount", "--bind", real_mp, usage_path]) == 0:
+        log(f"  {dataset} : {real_mp} --bind-> {usage_path}")
+        return True
+    log(f"  [!] bind {real_mp} -> {usage_path} echoue")
+    return False
 
 
 def disk_inventory():
@@ -429,6 +557,8 @@ def snapshot_and_reset_upper(old_crc, sfs_crc):
 
 def main():
     os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+    global _MOUNTS
+    _MOUNTS = {ds: (usage, mode) for ds, usage, mode in load_mounts_map()}
 
     # --- 1. pseudo-FS --------------------------------------------------------
     mount("proc", "/proc", "proc")
@@ -554,8 +684,18 @@ def main():
         log("upper volatile : tmpfs (rien ne sera ecrit sur un dataset corrompu)")
     os.makedirs("/mnt/ovl/upper", exist_ok=True)
     os.makedirs("/mnt/ovl/work", exist_ok=True)
+    sfs_path = f"/mnt/sfs/{rootfs_name}"
+    if not os.path.exists(sfs_path):
+        # CAUSE FREQUENTE : l'image n'a jamais ete creee (build incomplet, ou
+        # mksquashfs jamais lance). Sans lower, pas de rootfs -> on l'explique
+        # clairement et on ouvre un shell de secours plutot qu'un ecran fige.
+        die(f"IMAGE ROOTFS ABSENTE : {sfs_path} introuvable.\n"
+            f"  Le systeme ne peut pas monter sa racine. Cree l'image :\n"
+            f"  python3 sfs_build.py --rootfs-src <racine> "
+            f"(ou first_boot.py --rootfs-src ...)\n"
+            f"  puis verifie : ls -la /mnt/sfs/")
     try:
-        ld = losetup(f"/mnt/sfs/{rootfs_name}", readonly=True)
+        ld = losetup(sfs_path, readonly=True)
         mount(ld, "/mnt/lower", "squashfs", MS_RDONLY)
         mount("overlay", NEWROOT, "overlay", 0,
               "lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work")
@@ -564,28 +704,23 @@ def main():
     log(f"overlay rootfs assemble sur {NEWROOT}")
 
     # --- 4bis. couches persistantes (normal + upper persistant sain) -------
-    # var, log, usr-src : datasets ZFS directs. Corruption d'un dataset EXISTANT
-    # = on ne le monte pas + degrade (pas de die). Absent = non bloquant.
+    # /var lui-meme reste dans l'overlay rootfs (PAS un dataset). Seuls /var/log
+    # (journaux) et usr-src (sources noyau, monte sur /mnt/usr-src pour NE PAS
+    # masquer /usr/src de Gentoo) sont des datasets, remappes via le schema de
+    # l'ini (bind en non-legacy, montage direct en legacy). Corruption = degrade.
     if use_persistent_upper:
-        for ds, sub, critical in ((VAR_DS, "var", True),
-                                  (LOG_DS, "var/log", False),
-                                  (USRSRC_DS, "usr/src", False)):
-            tgt = f"{NEWROOT}/{sub}"
-            os.makedirs(tgt, exist_ok=True)
-            if ds_exists(ds):
-                if run(["mount.zfs", ds, tgt]) != 0:
-                    degraded_reasons.append(
-                        f"{ds} existe mais ne se monte pas (corruption ?)")
-                elif critical and not writable_test(tgt):
-                    run(["umount", tgt])
-                    degraded_reasons.append(
-                        f"{ds} non inscriptible (corruption ?) -> demonte")
-                else:
-                    log(f"persistant : {ds} -> /{sub}")
-            else:
+        for ds, default_sub, allow_ne in ((LOG_DS, "var/log", True),
+                                          (USRSRC_DS, "mnt/usr-src", False)):
+            if not ds_exists(ds):
                 log(f"{ds} absent (cree-le : zfs create {ds})")
+                continue
+            tgt = usage_for(ds, f"{NEWROOT}/{default_sub}", newroot=NEWROOT)
+            if not mount_dataset(ds, tgt, want_mode=mode_for(ds),
+                                 allow_nonempty=allow_ne):
+                degraded_reasons.append(
+                    f"{ds} existe mais montage/remappage echoue (corruption ?)")
     elif not rescue:
-        degraded_reasons.append("couches var/log/usr-src non montees (upper degrade)")
+        degraded_reasons.append("couches var/log + usr-src non montees (upper degrade)")
 
     # --- 4ter. mode degrade : rapport + temoin (session de reparation) ------
     degraded = rescue or bool(degraded_reasons)
@@ -661,6 +796,21 @@ def main():
                     d.write(s.read())
             except OSError as e:
                 log(f"handoff {name} non recopie ({e})")
+
+    # propager la cle YouTube de l'INITRAMFS vers le rootfs, MEME si le stream
+    # n'a pas demarre (sinon on la perd au switch_root). Persistance : si l'upper
+    # est persistant, elle restera dans /etc du rootfs pour les prochains boots.
+    key = read_yt_key()                          # lit /etc/yt.key de l'initramfs
+    dst = f"{NEWROOT}/etc/yt.key"
+    if key and not os.path.exists(dst):
+        try:
+            os.makedirs(f"{NEWROOT}/etc", exist_ok=True)
+            with open(dst, "w") as f:
+                f.write(key + "\n")
+            os.chmod(dst, 0o600)
+            log("cle YouTube propagee vers le rootfs (/etc/yt.key)")
+        except OSError as e:
+            log(f"cle YouTube non propagee ({e})")
 
     # --- 8. switch_root en Python (PAS pivot_root : on est en rootfs) -------
     nxt = f"{NEWROOT}/sbin/session_launch.py"

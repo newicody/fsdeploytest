@@ -64,11 +64,42 @@ class KernelRegistry:
         try:
             return json.loads(self.manifest_path.read_text())
         except (OSError, json.JSONDecodeError):
-            return {"versions": {}}
+            # manifest absent OU corrompu : tenter le backup avant d'abandonner
+            try:
+                data = json.loads((self.root / "manifest.json.bak").read_text())
+                return data
+            except (OSError, json.JSONDecodeError):
+                return {"versions": {}}
 
     def _save(self):
+        """Sauvegarde ATOMIQUE + backup, avec garde anti-perte d'historique.
+        - refuse d'ecraser un manifest non-vide par un _data vide (corruption
+          en memoire) -> protege contre l'auto-suppression de l'index.
+        - ecrit dans un .tmp puis os.replace (atomique : jamais de fichier a
+          moitie ecrit, meme si interrompu).
+        - garde l'ancien manifest en .bak avant de remplacer."""
         self.root.mkdir(parents=True, exist_ok=True)
-        self.manifest_path.write_text(json.dumps(self._data, indent=2))
+        # garde : ne pas remplacer un index peuple par un index vide
+        if not self._data.get("versions"):
+            if self.manifest_path.exists():
+                try:
+                    old = json.loads(self.manifest_path.read_text())
+                    if old.get("versions"):
+                        raise RuntimeError(
+                            "refus de sauver un manifeste VIDE par-dessus un "
+                            "manifeste peuple (protection anti-perte). "
+                            "Verifie l'etat en memoire.")
+                except json.JSONDecodeError:
+                    pass
+        tmp = self.manifest_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(self._data, indent=2))
+        # backup de l'ancien avant de remplacer
+        if self.manifest_path.exists():
+            try:
+                shutil.copy2(self.manifest_path, self.root / "manifest.json.bak")
+            except OSError:
+                pass
+        os.replace(tmp, self.manifest_path)     # atomique
         return str(self.manifest_path)
 
     # --- acces avec messages ----------------------------------------------
@@ -134,8 +165,17 @@ class KernelRegistry:
             except OSError:
                 archived_cfg = None
         existing = self._data["versions"].get(kver, {})
+        # VERSIONNING : on ne perd pas l'etat precedent. A chaque re-register,
+        # on archive l'ancienne entree dans 'revisions' (incremental) et on
+        # incremente 'rev'. L'historique de la version est ainsi conserve.
+        revisions = existing.get("revisions", [])
+        if existing:
+            snapshot = {k: v for k, v in existing.items() if k != "revisions"}
+            revisions = revisions + [snapshot]
+        rev = existing.get("rev", 0) + 1 if existing else 1
         entry = {
             "kver": kver,
+            "rev": rev,
             "config": archived_cfg or existing.get("config"),
             "modules_sfs": modules_sfs,
             "bzimage": bzimage,
@@ -145,10 +185,12 @@ class KernelRegistry:
             "status": existing.get("status", status),
             "registered": existing.get("registered", int(time.time())),
             "updated": int(time.time()),
+            "revisions": revisions,            # historique des etats precedents
         }
         self._data["versions"][kver] = entry
         self._save()
-        self.log_event(EV_COMPILE, kver, f"register status={entry['status']}")
+        self.log_event(EV_COMPILE, kver,
+                       f"register rev={rev} status={entry['status']}")
         return entry
 
     # --- configs etudiees (pas forcement compilees) -----------------------

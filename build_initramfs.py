@@ -47,36 +47,6 @@ def msg(s):
 INFRA_CONF = os.environ.get("INFRA_CONF", "infra.conf")
 
 
-def gen_mounts_map(dest):
-    """Genere le fichier PLAT /etc/mounts.map depuis la section [mounts] de
-    infra.conf (configobj dispo cote build). Une ligne par dataset :
-        dataset  usage_path  mode
-    init.py le lira sans configobj. Si infra.conf ou la section manque, ecrit
-    un fichier d'en-tete vide (init.py retombe sur ses constantes)."""
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    lines = ["# genere depuis infra.conf [mounts] -- NE PAS editer a la main",
-             "# format : dataset  usage_path  mode(property|legacy|auto)"]
-    try:
-        from configobj import ConfigObj
-        cfg = ConfigObj(INFRA_CONF)
-        mounts = cfg.get("mounts", {})
-        for ds, decl in mounts.items():
-            if not isinstance(decl, dict):
-                continue
-            usage = decl.get("usage", "")
-            mode = decl.get("mode", "auto")
-            if usage:
-                lines.append(f"{ds}\t{usage}\t{mode}")
-        msg(f"mounts.map genere ({len(lines) - 2} entrees) depuis {INFRA_CONF}")
-    except ImportError:
-        msg("configobj absent au build -> mounts.map vide "
-            "(init.py utilisera ses constantes)")
-    except Exception as e:
-        msg(f"mounts.map : lecture infra.conf impossible ({e}) -> fichier vide")
-    with open(dest, "w") as f:
-        f.write("\n".join(lines) + "\n")
-
-
 def need_root():
     if os.geteuid() != 0:
         sys.exit("root requis (mknod, depmod)")
@@ -325,9 +295,17 @@ def main():
             msg("pas de YT_KEY au build -> stream initramfs inactif "
                 "(depose /etc/yt.key dans l'initramfs ou passe YT_KEY=...)")
 
-        # schema de remappage : genere /etc/mounts.map (fichier PLAT) depuis
-        # la section [mounts] de infra.conf. init.py le lit sans configobj.
-        gen_mounts_map(f"{stage}/etc/mounts.map")
+        # init.py ne lit PLUS de mounts.map : le montage (overlay + remontage
+        # var/log + usr-src) est code en dur de facon epuree dans init.py. On
+        # embarque en revanche infra.conf tel quel : utile pour les checkups et
+        # la compilation automatique declenches depuis le systeme (PAS pour le
+        # montage au boot). Optionnel : absent => l'initramfs boote quand meme.
+        if os.path.exists(INFRA_CONF):
+            try:
+                shutil.copy2(INFRA_CONF, f"{stage}/etc/infra.conf")
+                msg(f"infra.conf embarque ({INFRA_CONF} -> /etc/infra.conf)")
+            except OSError as e:
+                msg(f"infra.conf non embarque ({e}) -- non bloquant")
 
         if not os.path.exists(INIT_SRC):
             sys.exit(f"init introuvable: {INIT_SRC}")

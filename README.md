@@ -700,12 +700,13 @@ python3 sfs_build.py --modules <kver>                       # modules-<kver>.sfs
 # ou via l'orchestrateur :  first_boot.py --rootfs-src <racine_gentoo>
 ```
 
-**Défense en profondeur sur les pseudo-FS** : `sfs_build` passe `-e proc sys dev
-run tmp ...` à `mksquashfs` pour le rootfs (pas pour modules.sfs). Ainsi, même si
-`--rootfs-src` pointe une racine vivante **non** nettoyée par `clean_rootfs`, le
-contenu de `/proc`, `/sys`, `/dev`, `/run`, `/tmp` n'est jamais figé dans l'image.
-`clean_rootfs` (rsync) et `sfs_build` (mksquashfs) excluent donc tous les deux —
-deux filets indépendants.
+**Staging et cross-device** : `sfs_build` écrit le `.sfs` temporaire en priorité
+**dans le dossier de destination** (`fast_pool/sfs`) — même FS → `os.replace`
+atomique, zéro erreur cross-device. Si la destination manque de place, il bascule
+sur le dataset dédié `fast_pool/staging` (même pool), puis `/var/tmp` en dernier
+recours. Plus de staging dans le `/tmp` du chroot. Si jamais le tmp finit sur un
+FS différent, la publication se fait par copie vers un `.new` **local** à la
+destination puis rename atomique (jamais de `shutil.move` cross-device fragile).
 
 **Refus de figer le système vivant** : `sfs_build` exige que `--rootfs-src` soit
 une **copie nettoyée** par `clean_rootfs` (qui y dépose un marqueur
@@ -798,9 +799,10 @@ python3 boot_layout.py --show-partuuid     # voir les PARTUUID reels (pour figer
 python3 boot_layout.py --mount             # monter les ESP a leur install_mount
 ```
 
-Les `usage` de `[mounts]` (initramfs) sont déjà des chemins **finaux** : `/mnt/sfs`
-et `/mnt/ovl` sont internes à l'initramfs, `NEWROOT/...` est la racine finale —
-jamais un chemin d'installation. La config du boot reflète donc le système final.
+Le montage au boot (`init.py`) utilise des chemins **finaux** : `/mnt/sfs` et
+`/mnt/ovl` sont internes à l'initramfs, `NEWROOT/var/log` et `NEWROOT/mnt/usr-src`
+sont sous la racine finale — jamais un chemin d'installation. La config du boot
+reflète donc le système final.
 
 ### Vérification des montages (`zfs_mounts.py`) — ne jamais supposer
 
@@ -848,44 +850,30 @@ python3 validate_boot.py --rootfs /mnt/sfs/rootfs.sfs \
 ```
 
 
-### Remappage des montages (`[mounts]`) — bind, sans toucher aux `mountpoint`
+### Montage au boot — approche épurée (`init.py`)
 
+`init.py` ne fait que le strict nécessaire au montage, **sans parier sur
+l'automount** et **sans fichier de configuration de montage** :
 
+1. importe le pool, monte l'**overlay racine** (lower=`rootfs.sfs` ro +
+   upper=`fast_pool/rootfs`) — ZFS ne peut pas le faire seul ;
+2. **remonte explicitement** deux datasets vers leur place finale sous NEWROOT :
+   `fast_pool/log` → `NEWROOT/var/log` et `fast_pool/usr-src` → `NEWROOT/mnt/usr-src`.
 
-Les datasets gardent leur propriété `mountpoint=/fast_pool/...`, `/boot_pool/...`,
-`/data_pool/...` (vision pratique : `zfs list` montre tout rangé par pool). Au
-boot, `init.py` **remappe** vers l'emplacement d'usage **sans modifier la
-propriété** (jamais de `zfs set`) :
-
-- **non-legacy** (ton cas) : ZFS monte le dataset à son chemin naturel (auto à
-  l'import), puis `init.py` fait un `mount --bind` vers l'emplacement d'usage.
-- **legacy** : ZFS ne monte rien → `init.py` monte directement avec `mount.zfs`.
-
-`init.py` **détecte le mode réel** (`zfs get mountpoint`) et s'adapte ; l'ini
-précise le mode attendu (`mode = property|legacy|auto`) et le code alerte en cas
-de divergence. La table de remappage est déclarée dans `[mounts]` de `infra.conf`
-et **générée en fichier plat** `/etc/mounts.map` (embarqué dans l'initramfs), que
-`init.py` lit sans configobj (parsing trivial). Changer l'ini change le remappage.
-
-```ini
-[mounts]
-    [[fast_pool/sfs]]
-    usage = /mnt/sfs            # images (lecture)
-    mode = auto
-    [[fast_pool/rootfs]]
-    usage = /mnt/ovl            # upper de l'overlay
-    mode = auto
-    [[fast_pool/log]]
-    usage = NEWROOT/var/log     # journaux persistants
-    mode = auto
-    [[fast_pool/usr-src]]
-    usage = NEWROOT/mnt/usr-src # sources noyau (PAS /usr/src : evite de masquer Gentoo)
-    mode = auto
-```
+Les datasets gardent leur propriété `mountpoint=/fast_pool/...` (vision pratique :
+`zfs list` rangé par pool). `init.py` les laisse monter à leur chemin naturel
+puis fait un `mount --bind` vers la cible finale — **sans toucher à la propriété**
+(`remount_to`). En `legacy`, montage direct. Garde anti-masquage : refuse un
+target non-vide sauf `/var/log` (où le contenu de l'overlay est attendu).
 
 > `fast_pool/usr-src` se monte sur **`/mnt/usr-src`** (pas `/usr/src`) pour ne
 > pas masquer le répertoire de travail Gentoo. Le symlink `/usr/src/linux` (géré
 > par `eselect kernel`) pointe vers l'arbre dans `/mnt/usr-src`.
+
+> **Pas de `mounts.map`** : l'ancienne machinerie (fichier plat configurable +
+> modes dynamiques) a été retirée — une seule convention, codée en dur de façon
+> épurée. `infra.conf` est embarqué dans l'initramfs **uniquement** pour les
+> checkups et la compilation automatique, jamais pour décider des montages.
 
 ### Vérifier l'initramfs (sans booter) + checksums
 

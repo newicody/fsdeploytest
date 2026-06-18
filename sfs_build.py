@@ -86,15 +86,45 @@ def _free_mb(path):
         return 0.0
 
 
-def _pick_staging(estimate_mb, log):
-    """Choisit le repertoire de staging : /tmp (tmpfs) si assez de place, sinon
-    /var/tmp avec alerte. estimate_mb = taille presumee du .sfs final."""
-    need = max(estimate_mb * 1.3, 512)         # marge 30 %, plancher 512 Mo
-    tmp_free = _free_mb("/tmp")
-    if tmp_free >= need:
-        return "/tmp"
-    log(f"/tmp insuffisant ({tmp_free:.0f} Mo libres, ~{need:.0f} requis) "
-        f"-> repli /var/tmp (ATTENTION : salit l'overlay si persistant)")
+def _same_fs(a, b):
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def _staging_dataset_mp(log):
+    """Point de montage de fast_pool/staging (le monte au besoin). '' si absent."""
+    ds = os.environ.get("STAGING_DS", "fast_pool/staging")
+    subprocess.run(["zfs", "mount", ds], stderr=subprocess.DEVNULL)
+    try:
+        mp = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint", ds],
+                            capture_output=True, text=True).stdout.strip()
+    except OSError:
+        return ""
+    return mp if mp and mp != "legacy" and os.path.isdir(mp) else ""
+
+
+def _pick_staging(estimate_mb, dest_dir, log):
+    """Choisit OU ecrire le .sfs temporaire, par ordre de preference :
+      1. dest_dir lui-meme (meme FS que la destination -> os.replace ATOMIQUE,
+         zero cross-device). C'est le cas ideal.
+      2. fast_pool/staging (dataset dedie, meme pool que sfs).
+      3. /var/tmp en dernier recours (avec alerte).
+    estimate_mb = taille presumee du .sfs final."""
+    need = max(estimate_mb * 1.3, 512)             # marge 30 %, plancher 512 Mo
+    # 1. destination elle-meme (le meilleur : meme FS -> rename atomique)
+    if _free_mb(dest_dir) >= need:
+        log(f"staging = destination {dest_dir} (meme FS, rename atomique)")
+        return dest_dir
+    # 2. dataset dedie fast_pool/staging
+    sds = _staging_dataset_mp(log)
+    if sds and _free_mb(sds) >= need:
+        log(f"staging = {sds} (dataset dedie)")
+        return sds
+    # 3. repli
+    log(f"destination et fast_pool/staging insuffisants (~{need:.0f} Mo requis) "
+        f"-> repli /var/tmp")
     return "/var/tmp"
 
 
@@ -144,17 +174,29 @@ def _mksquashfs(src, dst, staging, log, extra=None):
     if size < 4096:
         _safe_rm(tmp)
         return SfsResult(False, dst, f"squashfs anormalement petit ({size} o)")
-    # deplacement atomique vers la destination finale (meme FS si possible)
+    # publication vers la destination finale, SANS cross-device :
+    #  - meme FS  -> os.replace (atomique, instantane)
+    #  - FS differents -> copie vers un .new DANS le dossier de destination
+    #    (meme FS que dst), puis os.replace local atomique. Jamais de
+    #    shutil.move cross-device fragile.
+    moved = False
     try:
         if _same_fs(staging, os.path.dirname(dst)):
-            os.replace(tmp, dst)
+            os.replace(tmp, dst)               # tmp et dst sur le meme FS
+            moved = True
         else:
-            shutil.move(tmp, dst)              # staging tmpfs -> dataset : copie
+            local_tmp = dst + ".new"
+            _safe_rm(local_tmp)
+            shutil.copyfile(tmp, local_tmp)
+            os.replace(local_tmp, dst)         # rename local atomique
+            _safe_rm(tmp)                      # nettoie le tmp distant
+            moved = True
     except OSError as e:
         _safe_rm(tmp)
-        return SfsResult(False, dst, f"deplacement echoue : {e}")
-    finally:
-        _safe_rm(tmp)
+        _safe_rm(dst + ".new")
+        return SfsResult(False, dst, f"publication echouee : {e}")
+    if not moved:
+        return SfsResult(False, dst, "publication non effectuee")
     size_mb = os.path.getsize(dst) / (1024 * 1024)
     log(f"OK {dst} ({size_mb:.0f} Mo)")
     # VALIDATION post-creation : le SFS est-il reellement montable + bon contenu ?
@@ -171,13 +213,6 @@ def _mksquashfs(src, dst, staging, log, extra=None):
     except Exception as e:
         log(f"  validation non effectuee ({e}) -- non bloquant")
     return SfsResult(True, dst, "", int(size_mb))
-
-
-def _same_fs(a, b):
-    try:
-        return os.stat(a).st_dev == os.stat(b).st_dev
-    except OSError:
-        return False
 
 
 def _safe_rm(p):
@@ -267,7 +302,7 @@ def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
         log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree (force=False)")
         return SfsResult(True, dst, "deja present", int(size_mb))
     est = _dir_size_mb(rootfs_src) * 0.5       # zstd ~50 % sur un rootfs
-    staging = _pick_staging(est, log)
+    staging = _pick_staging(est, mp, log)
     # exclusions pseudo-FS/volatils : -e doit etre le DERNIER flag mksquashfs
     # (tout ce qui suit est traite comme motif d'exclusion).
     extra = ["-e"] + ROOTFS_EXCLUDES
@@ -286,7 +321,7 @@ def build_modules_sfs(kver, sfs_dataset="fast_pool/sfs", log=print, force=False)
         log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree")
         return SfsResult(True, dst, "deja present", int(size_mb))
     est = _dir_size_mb(src) * 0.5
-    staging = _pick_staging(est, log)
+    staging = _pick_staging(est, mp, log)
     return _mksquashfs(src, dst, staging, log)
 
 

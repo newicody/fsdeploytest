@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 SRC = os.environ.get("SRC", "/usr/src/linux")
-ESP = os.environ.get("ESP", "/boot/efi")
+ESP = os.environ.get("ESP", "/mnt/esp1")     # resolu via boot_layout dans main()
 DISK = os.environ.get("DISK", "/dev/nvme0n1")
 PART = os.environ.get("PART", "1")
 BUILD_INITRAMFS = os.environ.get("BUILD_INITRAMFS", "./build_initramfs.py")
@@ -73,11 +73,38 @@ def _safe_listdir(p):
         return []
 
 
+def resolve_esp():
+    """Resout l'ESP primaire via boot_layout/infra.conf (install_mount +
+    PARTUUID -> disk/part). Repli sur les env-vars ESP/DISK/PART si l'ini ou
+    boot_layout sont absents. Retourne (esp_mount, disk, part)."""
+    try:
+        import boot_layout
+        infra = os.environ.get("INFRA_CONF", "infra.conf")
+        esp = boot_layout.primary_esp(infra)
+        if esp:
+            mp = esp.mount_for_install(log=msg)
+            disk, part = esp.disk_and_part()
+            if mp and disk:
+                msg(f"ESP resolue via infra.conf : {esp.name} -> {mp} "
+                    f"(disk={disk} part={part})")
+                return mp, disk, part
+            msg(f"ESP {esp.name} : resolution incomplete (mp={mp}, disk={disk}) "
+                f"-> repli env-vars")
+    except Exception as e:
+        msg(f"boot_layout indisponible ({e}) -> repli env-vars ESP/DISK/PART")
+    return (os.environ.get("ESP", "/mnt/esp1"),
+            os.environ.get("DISK", "/dev/nvme0n1"),
+            os.environ.get("PART", "1"))
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("root requis")
+    global ESP, DISK, PART
+    ESP, DISK, PART = resolve_esp()
     if not os.path.ismount(ESP):
-        sys.exit(f"ESP non monte sur {ESP}")
+        sys.exit(f"ESP non monte sur {ESP} (verifie [efi] dans infra.conf ou "
+                 f"monte-la a son install_mount)")
     if not os.path.isfile(os.path.join(SRC, ".config")):
         sys.exit(f".config absent dans {SRC} (lance kernel_watch.py d'abord)")
 
@@ -166,12 +193,26 @@ def main():
         if enabled and profiles:
             vmlinuz_src = os.path.join(dest, f"vmlinuz-{kver}.efi")
             initrd_src = os.path.join(dest, f"initramfs-{kver}.zst")
-            # ESP(s) : 1ere = celle qu'on vient de stager ; 2e si declaree en env
-            esps = [(ESP, DISK, PART)]
-            esp2 = os.environ.get("ESP2")
-            if esp2 and os.path.isdir(esp2):
-                esps.append((esp2, os.environ.get("DISK2", ""),
-                             os.environ.get("PART2", "1")))
+            # ESP(s) via boot_layout : chaque ESP montee a son install_mount,
+            # identite (disk/part) derivee du PARTUUID. Repli sur env si absent.
+            esps = []
+            try:
+                import boot_layout
+                for e in boot_layout.load_esps(infra):
+                    mp = e.mount_for_install(log=msg)
+                    disk, part = e.disk_and_part()
+                    # entree NVRAM seulement si register_uefi ; sinon disk='' =>
+                    # uki_build ecrit le fallback BOOTX64 sans entree nommee.
+                    if mp:
+                        esps.append((mp, disk if e.register_uefi else "", part))
+            except Exception as e:
+                msg(f"boot_layout indisponible pour UKI ({e}) -> repli env")
+            if not esps:
+                esps = [(ESP, DISK, PART)]
+                esp2 = os.environ.get("ESP2")
+                if esp2 and os.path.isdir(esp2):
+                    esps.append((esp2, os.environ.get("DISK2", ""),
+                                 os.environ.get("PART2", "1")))
 
             def _mk_entry(lbl, disk, part, loader):
                 if not disk:

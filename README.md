@@ -304,6 +304,8 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 ├── common.py             # SOCLE userspace : sh() unifie + helpers ZFS partages
 │                         #   + Result observable + is_true + ConfigView.
 │                         #   JAMAIS importe par le chemin de boot (init reste autonome)
+├── boot_layout.py        # source de verite des ESP : distingue install_mount
+│                         #   (echafaudage) de l'identite finale (PARTUUID) ; garde anti-/boot
 │
 │  ── BOOT (chemin critique) ──────────────────────────────────────────
 ├── init.py               # PID 1 de l'initramfs (ctypes) — installé comme /init
@@ -736,7 +738,50 @@ sudo env FFMPEG_STATIC=/usr/local/bin/ffmpeg-static \
 > même device en continu. Après `switch_root`, `session_launch.py` tue ce
 > ffmpeg (handoff `/etc/initramfs-stream.pid`) et bascule sur la capture wayland.
 
+### Montage d'installation vs montage final (`boot_layout.py`)
+
+Distinction **fondamentale** pour la cohérence de toute la chaîne : le point de
+montage **pendant l'installation** (échafaudage chroot/USB) n'a aucune raison
+d'être celui du **système final**. Une entrée EFI ne référence pas un point de
+montage — elle référence une **partition** (par PARTUUID, stable) + un chemin
+**relatif à la racine de l'ESP** (`\EFI\gentoo\...`).
+
+`boot_layout.py` est la source de vérité : chaque ESP de `[efi]` déclare son
+**identité finale** (`partuuid`, stable, survit aux renumérotations `/dev/nvmeXnY`)
+et son **point de montage d'installation** (`install_mount`, ex `/mnt/esp1`).
+Le code monte l'ESP à `install_mount` pour **copier** les fichiers, mais crée
+l'entrée EFI avec l'**identité de la partition** (disque + numéro dérivés du
+PARTUUID), indépendamment du point de montage.
+
+**Garde anti-`/boot`** : `install_mount` ne peut jamais être `/boot` ni
+`/boot/efi` (qui peuvent contenir le `/boot` de Gentoo, sans rapport). Défauts :
+`/mnt/esp1`, `/mnt/esp2`. `kernel_build.py`, `first_boot.py` et `efi_install.py`
+résolvent tous l'ESP via `boot_layout` (repli env-vars si l'ini est absente).
+
+```ini
+[efi]
+    [[esp1]]
+    partuuid = 1234-5678-...      # blkid -s PARTUUID -o value /dev/nvme0n1p1
+    partition = /dev/nvme0n1p1    # repli si partuuid vide
+    install_mount = /mnt/esp1     # echafaudage (JAMAIS /boot/efi)
+    primary = true                # entree EFI nommee + BootNext
+    register_uefi = true
+    [[esp2]]
+    partuuid = ...
+    install_mount = /mnt/esp2
+    primary = false               # fallback BOOTX64, pas d'entree NVRAM
+```
+```sh
+python3 boot_layout.py --show-partuuid     # voir les PARTUUID reels (pour figer l'ini)
+python3 boot_layout.py --mount             # monter les ESP a leur install_mount
+```
+
+Les `usage` de `[mounts]` (initramfs) sont déjà des chemins **finaux** : `/mnt/sfs`
+et `/mnt/ovl` sont internes à l'initramfs, `NEWROOT/...` est la racine finale —
+jamais un chemin d'installation. La config du boot reflète donc le système final.
+
 ### Vérification des montages (`zfs_mounts.py`) — ne jamais supposer
+
 
 Leçon d'un bug réel : **créer un point de montage (`os.makedirs`) ne garantit pas
 que le dataset est monté**. On se retrouve avec un **dossier vide** là où on

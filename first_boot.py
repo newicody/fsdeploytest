@@ -318,24 +318,44 @@ def check_datasets(cfg, rep):
 def check_efi(cfg, rep):
     sect = cfg.get("efi", {})
     crit = is_true(sect.get("critical", "true"))
-    parts = sect.get("partitions", [])
-    if isinstance(parts, str):
-        parts = [parts]
     fstype = sect.get("fstype", "vfat")
+    try:
+        import boot_layout
+        esps = boot_layout.load_esps(os.environ.get("INFRA_CONF", "infra.conf"))
+    except Exception as e:
+        rep.warn(f"boot_layout indisponible ({e}) : verif ESP limitee")
+        esps = []
+    if not esps:
+        (rep.crit if crit else rep.warn)("aucune ESP declaree dans [efi]")
+        return
     found = 0
-    for p in parts:
-        if not os.path.exists(p):
-            rep.warn(f"ESP {p} declaree mais absente")
+    for e in esps:
+        dev = e.device()
+        if not dev:
+            rep.warn(f"ESP {e.name} : device introuvable "
+                     f"(partuuid={e.partuuid or '-'}, part={e.partition or '-'})")
             continue
-        rc, out, _ = sh(["blkid", "-o", "value", "-s", "TYPE", p])
-        if fstype in out:
-            rep.ok(f"ESP {p} presente ({out})")
-            found += 1
-        else:
-            rep.warn(f"ESP {p} type {out or '?'} (attendu {fstype})")
+        rc, out, _ = sh(["blkid", "-o", "value", "-s", "TYPE", dev])
+        if fstype not in out:
+            rep.warn(f"ESP {e.name} ({dev}) type {out or '?'} (attendu {fstype})")
+            continue
+        # garde anti-/boot sur l'install_mount
+        safe = e.safe_install_mount()
+        if not safe:
+            rep.warn(f"ESP {e.name} : {e.reason}")
+            continue
+        # figer le PARTUUID si absent dans l'ini (conseille pour la stabilite)
+        if not e.partuuid:
+            real = e.current_partuuid()
+            if real:
+                rep.warn(f"ESP {e.name} : PARTUUID absent de l'ini "
+                         f"(ajoute 'partuuid = {real}' pour la stabilite)")
+        rep.ok(f"ESP {e.name} : {dev} ({out}) -> install {safe} "
+               f"{'[primary]' if e.primary else ''}")
+        found += 1
     if found == 0:
         (rep.crit if crit else rep.warn)(
-            "aucune ESP valide trouvee -> impossible de stager le noyau")
+            "aucune ESP valide -> impossible de stager le noyau")
 
 
 def check_firmware(cfg, rep, fw_root="/lib/firmware"):

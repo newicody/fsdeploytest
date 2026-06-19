@@ -25,38 +25,80 @@ FFMPEG_STATIC = os.environ.get("FFMPEG_STATIC", "/usr/local/bin/ffmpeg")
 PYBIN = os.environ.get("PYBIN", "/usr/bin/python3")   # python SYSTEME (lancer hors venv)
 
 
-def resolve_real_python(pybin):
-    """Sur Gentoo, /usr/bin/python3 est un WRAPPER (dev-lang/python-exec) qui
-    delegue au vrai interpreteur dans /usr/lib/python-exec/python3.X/python3.
-    Embarquer le wrapper sans /usr/lib/python-exec/ casse le boot ('no python-exec
-    wrapper found') -> panic. On resout donc le VRAI ELF a embarquer.
+def _is_real_interpreter(path):
+    """Distingue le VRAI interpreteur du wrapper python-exec. Le wrapper fait
+    ~10-30 Ko et ne depend PAS de libpython. Le vrai python est soit gros
+    (statique, plusieurs Mo) soit lie a libpython3.X.so. Critere combine :
+    taille >= 100 Ko OU dependance libpython (ldd). Le CHEMIN n'entre pas en
+    compte (le vrai binaire vit legitimement sous /usr/lib/python-exec/)."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        if os.path.getsize(path) >= 100 * 1024:
+            return True
+        # petit binaire : vrai seulement s'il depend de libpython
+        out = subprocess.run(["ldd", path], capture_output=True,
+                             text=True).stdout
+        return "libpython" in out
+    except OSError:
+        return False
 
-    Methode : demander a python lui-meme sys._base_executable (pointe le vrai
-    binaire), avec repli sur la recherche dans /usr/lib/python-exec/."""
-    # 1. sys._base_executable = vrai interpreteur (contourne le wrapper)
+
+def _resolves_to_wrapper(path):
+    """Le chemin (apres resolution des liens) mene-t-il au wrapper python-exec2c ?"""
+    try:
+        target = os.path.realpath(path)
+        return "python-exec" in os.path.basename(target)
+    except OSError:
+        return True
+
+
+def resolve_real_python(pybin):
+    """Sur Gentoo, /usr/bin/python3 (generique) est un lien vers le wrapper
+    python-exec2c. Le VRAI interpreteur est le binaire VERSIONNE /usr/bin/
+    python3.X (gros ELF). On le cible directement.
+
+    Strategie : determiner la version (X.Y) via le pybin, puis chercher
+    /usr/bin/python3.X et /usr/lib/python-exec/python3.X/python3.X ; resoudre
+    les liens (realpath) ; rejeter tout ce qui mene a python-exec2c ; retenir
+    le premier vrai interpreteur (gros ELF / lie a libpython)."""
+    # version X.Y du pybin (ex '3.14')
+    ver = ""
+    try:
+        ver = subprocess.run(
+            [pybin, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True).stdout.strip()
+    except OSError:
+        pass
+
+    candidates = []
+    if ver:
+        # binaire VERSIONNE : c'est le vrai ELF sur Gentoo
+        candidates.append(f"/usr/bin/python{ver}")
+        candidates.append(f"/usr/lib/python-exec/python{ver}/python{ver}")
+    # sys._base_executable en complement
     try:
         out = subprocess.run(
             [pybin, "-c", "import sys; print(sys._base_executable or '')"],
             capture_output=True, text=True).stdout.strip()
-        if out and os.path.exists(out) and "python-exec" not in os.path.basename(out):
-            # _base_executable peut encore etre le wrapper ; on verifie plus bas
-            real = out
-        else:
-            real = ""
+        if out:
+            candidates.append(out)
     except OSError:
-        real = ""
-    # 2. chercher le vrai binaire dans /usr/lib/python-exec/python3.X/python3
-    if not real or "/usr/bin/" in real:
-        import glob
-        for cand in sorted(glob.glob("/usr/lib/python-exec/python3.*/python3"),
-                           reverse=True):
-            if os.path.exists(cand):
-                real = cand
-                break
-    # 3. repli : le pybin tel quel (si pas de wrapper sur ce systeme)
-    if not real:
-        real = os.path.realpath(pybin)
-    return real
+        pass
+    # tous les binaires versionnes connus, en dernier recours
+    import glob
+    candidates += sorted(glob.glob("/usr/bin/python3.*"), reverse=True)
+    candidates += sorted(glob.glob("/usr/lib/python-exec/python3.*/python3.*"),
+                         reverse=True)
+
+    for c in candidates:
+        if not c or _resolves_to_wrapper(c):
+            continue
+        real = os.path.realpath(c)             # resoudre tous les liens
+        if _is_real_interpreter(real):
+            return real
+    # rien trouve : repli (l'auto-test post-build avertira)
+    return os.path.realpath(pybin)
 
 
 DIRS = ["bin", "sbin", "etc", "proc", "sys", "dev", "run", "mnt",
@@ -129,28 +171,27 @@ def bundle_python(stage):
     """Interpreteur REEL (pas le wrapper python-exec) + stdlib + lib-dynload +
     libs dynamiques."""
     real = resolve_real_python(PYBIN)
-    if "python-exec" in real:
-        msg(f"ATTENTION : interpreteur resolu = {real} (encore un wrapper ?)")
-    msg(f"interpreteur reel resolu : {real}")
+    if not _is_real_interpreter(real):
+        msg(f"ATTENTION : '{real}' ne ressemble pas a un vrai interpreteur "
+            f"(taille {os.path.getsize(real) if os.path.isfile(real) else 0} o). "
+            f"L'auto-test post-build confirmera si python demarre.")
+    else:
+        msg(f"interpreteur reel resolu : {real} "
+            f"({os.path.getsize(real) // 1024} Ko)")
     copy_with_deps(real, stage)
-    # /usr/bin/python3 -> le vrai ELF (chemin ABSOLU dans l'initramfs, valide car
-    # on copie 'real' a son emplacement d'origine via copy_with_deps). On cree un
-    # lien stable + on s'assure que le vrai binaire est joignable.
+    # /usr/bin/python3 dans l'initramfs DOIT etre le vrai ELF (le shebang de
+    # init.py est #!/usr/bin/python3). Le plus robuste : copier le vrai binaire
+    # DIRECTEMENT a /usr/bin/python3 (pas de lien a resoudre au boot, pas de
+    # wrapper). On copie aussi sous son nom versionne (deja fait par copy_with_deps
+    # si real = /usr/bin/python3.X).
     os.makedirs(f"{stage}/usr/bin", exist_ok=True)
     link = f"{stage}/usr/bin/python3"
-    # placer le vrai binaire a /usr/bin/python3 directement (pas de wrapper) :
-    # si 'real' a ete copie ailleurs (ex /usr/lib/python-exec/...), on fait un
-    # lien relatif vers lui ; sinon copie directe.
-    real_in_stage = stage + real
     try:
         if os.path.lexists(link):
             os.remove(link)
-        if os.path.exists(real_in_stage):
-            rel = os.path.relpath(real_in_stage, f"{stage}/usr/bin")
-            os.symlink(rel, link)              # lien RELATIF (robuste en initramfs)
-        else:
-            shutil.copy2(real, link)
-        os.chmod(link, 0o755) if os.path.isfile(link) else None
+        shutil.copy2(real, link)               # copie directe du vrai ELF
+        os.chmod(link, 0o755)
+        msg(f"/usr/bin/python3 = copie directe du vrai interpreteur")
     except OSError as e:
         msg(f"ATTENTION lien python3 : {e}")
     # stdlib complete (inclut lib-dynload : _ctypes, fcntl, etc.)

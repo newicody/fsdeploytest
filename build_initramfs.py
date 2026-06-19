@@ -464,6 +464,48 @@ def make_nodes(stage):
         os.mknod(null, stat.S_IFCHR | 0o666, os.makedev(1, 3))
 
 
+def verify_bootable(stage):
+    """Verifie les INVARIANTS de bootabilite AVANT de packager. Un initramfs qui
+    rate l'un de ces points donne 'Failed to execute /init' ou un panic. On
+    ARRETE le build plutot que de produire une image non-bootable."""
+    errs = []
+    init = os.path.join(stage, "init")
+    # 1. /init existe et est executable
+    if not os.path.isfile(init):
+        errs.append("/init absent")
+    elif not os.access(init, os.X_OK):
+        errs.append("/init non executable")
+    else:
+        # 2. l'interpreteur du shebang existe et est executable
+        with open(init, "rb") as f:
+            first = f.readline().decode("latin1", "replace").strip()
+        if first.startswith("#!"):
+            interp = first[2:].strip().split()[0]      # ex /bin/busybox
+            ip = stage + interp
+            if not os.path.isfile(ip):
+                errs.append(f"interpreteur du shebang absent : {interp} "
+                            f"(shebang '{first}')")
+            elif not os.access(ip, os.X_OK):
+                errs.append(f"interpreteur du shebang non executable : {interp}")
+    # 3. python utilisable (wrapper OU vrai binaire versionne)
+    py_ok = any(os.path.isfile(os.path.join(stage, p)) for p in
+                ("usr/bin/python3", "usr/bin/python3.14", "usr/bin/python3.13",
+                 "usr/bin/python3.12"))
+    if not py_ok:
+        errs.append("aucun python dans /usr/bin")
+    # 4. /init.py present (le vrai code)
+    if not os.path.isfile(os.path.join(stage, "init.py")):
+        errs.append("/init.py absent (le code de init)")
+    # 5. busybox a /bin/busybox (le lanceur en depend via shebang ET commandes)
+    if not os.path.isfile(os.path.join(stage, "bin/busybox")):
+        errs.append("/bin/busybox absent (lanceur non executable)")
+
+    if errs:
+        sys.exit("INITRAMFS NON-BOOTABLE -- build INTERROMPU :\n  - "
+                 + "\n  - ".join(errs))
+    msg("verify_bootable : /init + interpreteur + python + busybox OK")
+
+
 def pack(stage, out):
     find = subprocess.Popen(["find", ".", "-print0"], cwd=stage,
                             stdout=subprocess.PIPE)
@@ -661,6 +703,7 @@ exec busybox sh
         os.chmod(dst_init, 0o755)
         msg(f"/init = lanceur robuste (EPYTHON={epython}, panic=0, fallback python3.14)")
 
+        verify_bootable(stage)        # ARRETE si /init/interpreteur/python/busybox KO
         pack(stage, OUT)
         size = subprocess.run(["du", "-h", OUT], capture_output=True, text=True).stdout.split()[0]
         msg(f"OK -> {OUT}  ({size})")

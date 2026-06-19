@@ -71,7 +71,40 @@ LOOP_SET_FD       = 0x4C00
 NR_finit_module   = 313        # x86_64
 EEXIST = 17
 
-libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+
+def _load_libc():
+    """Charge la libc via ctypes. find_library('c') depend de gcc/ldconfig/
+    objdump, ABSENTS de l'initramfs -> on essaie des chemins explicites. Gentoo
+    met la libc dans /usr/lib64 ; on couvre les emplacements usuels."""
+    candidates = []
+    try:
+        f = ctypes.util.find_library("c")
+        if f:
+            candidates.append(f)
+    except Exception:
+        pass
+    candidates += ["libc.so.6",
+                   "/usr/lib64/libc.so.6", "/lib64/libc.so.6",
+                   "/usr/lib/libc.so.6", "/lib/libc.so.6",
+                   "/usr/lib/x86_64-linux-gnu/libc.so.6"]
+    last = None
+    for c in candidates:
+        try:
+            return ctypes.CDLL(c, use_errno=True)
+        except OSError as e:
+            last = e
+    # echec total : message sur kmsg/console AVANT de mourir (sinon crash muet)
+    msg = f"FATAL: libc introuvable ({last}). Essais: {candidates}"
+    for dev in ("/dev/kmsg", "/dev/console"):
+        try:
+            with open(dev, "w") as fh:
+                fh.write("[init.py] " + msg + "\n")
+        except OSError:
+            pass
+    raise SystemExit(msg)
+
+
+libc = _load_libc()
 libc.mount.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
                        ctypes.c_ulong, ctypes.c_char_p]
 libc.mount.restype = ctypes.c_int

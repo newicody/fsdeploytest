@@ -265,6 +265,37 @@ def bundle_python(stage):
             copy_with_deps(b, stage)
     msg(f"binaires python embarques : {', '.join(os.path.basename(x) for x in py_bins)}")
 
+    # GARANTIE pour le fallback du lanceur : /usr/bin/python3 ET /usr/bin/
+    # python3.<ver> doivent EXISTER et etre executables dans l'initramfs. On
+    # determine le vrai ELF (en suivant les liens) et on le copie aux deux noms.
+    # Ainsi le lanceur peut exec /usr/bin/python3.14 meme si le wrapper foire.
+    ver = determine_epython().replace("python", "")     # ex '3.14'
+    real_elf = None
+    for cand in (f"/usr/bin/python{ver}", "/usr/bin/python3"):
+        if os.path.lexists(cand):
+            rp = os.path.realpath(cand)
+            if os.path.isfile(rp):
+                real_elf = rp
+                break
+    if real_elf:
+        for name in (f"python{ver}", "python3"):
+            tgt = f"{stage}/usr/bin/{name}"
+            # NE PAS ecraser le wrapper python3 (il peut etre voulu) : on ne
+            # force QUE le binaire versionne en copie directe du vrai ELF ; pour
+            # python3, on laisse ce que bundle a mis SAUF s'il manque.
+            if name != "python3" or not os.path.exists(tgt):
+                try:
+                    if os.path.lexists(tgt):
+                        os.remove(tgt)
+                    shutil.copy2(real_elf, tgt)
+                    os.chmod(tgt, 0o755)
+                except OSError as e:
+                    msg(f"copie {name} : {e}")
+        copy_with_deps(real_elf, stage)        # ses .so (libpython, etc.)
+        msg(f"fallback garanti : /usr/bin/python{ver} = vrai ELF ({real_elf})")
+    else:
+        msg("ATTENTION : vrai ELF python introuvable pour le fallback !")
+
     # 2. TOUT /usr/lib/python-exec/ (wrapper + liens + vrais binaires dedans)
     pexec = "/usr/lib/python-exec"
     if os.path.isdir(pexec):
@@ -322,15 +353,31 @@ def bundle_python(stage):
 def bundle_busybox(stage):
     bb = which("busybox")
     if not bb:
-        msg("busybox absent (pas de shell de secours)")
+        msg("busybox absent (pas de shell de secours NI de lanceur /init !)")
         return
-    copy_with_deps(bb, stage)
     real = os.path.realpath(bb)
-    for ap in ("sh", "mount", "umount", "ls", "cat", "dmesg"):
-        link = f"{stage}/bin/{ap}"
-        if not os.path.exists(link):
-            os.symlink(real, link)
-    msg("busybox (secours)")
+    copy_with_deps(real, stage)                # le binaire reel + ses .so
+    # PLACER busybox a /bin/busybox ET /sbin/busybox (copie directe du vrai ELF,
+    # pas un lien : le shebang '#!/bin/busybox' DOIT resoudre quel que soit
+    # l'emplacement d'origine -- Gentoo le met souvent dans /sbin).
+    for fixed in (f"{stage}/bin/busybox", f"{stage}/sbin/busybox"):
+        os.makedirs(os.path.dirname(fixed), exist_ok=True)
+        if not os.path.exists(fixed):
+            shutil.copy2(real, fixed)
+            os.chmod(fixed, 0o755)
+    # applets en liens ABSOLUS vers /bin/busybox (garanti present) -> jamais de
+    # lien casse meme si l'applet est dans /sbin et busybox 'logiquement' ailleurs.
+    applets = ("sh", "mount", "umount", "ls", "cat", "dmesg", "mkdir", "mdev",
+               "sleep", "timeout", "readlink", "mknod", "switch_root", "echo")
+    for d in ("bin", "sbin"):
+        for ap in applets:
+            link = f"{stage}/{d}/{ap}"
+            if not os.path.lexists(link):
+                try:
+                    os.symlink("/bin/busybox", link)   # ABSOLU
+                except OSError:
+                    pass
+    msg(f"busybox -> /bin/busybox + /sbin/busybox + applets (origine {bb})")
 
 
 def _modinfo(kver, mod, field):
@@ -555,52 +602,64 @@ def main():
         epython = determine_epython()
         shutil.copy2(INIT_SRC, f"{stage}/init.py")     # le vrai code -> /init.py
         os.chmod(f"{stage}/init.py", 0o755)
+        # Le lanceur utilise 'busybox' SANS chemin absolu apres avoir mis
+        # /bin et /sbin dans PATH : robuste meme si busybox est dans l'un ou
+        # l'autre. Le shebang reste #!/bin/busybox (garanti par bundle_busybox
+        # qui copie busybox a /bin/busybox ET /sbin/busybox).
         launcher = f"""#!/bin/busybox sh
-# Lanceur PID1 : etablit l'environnement Gentoo (python-exec) puis lance
-# init.py. Genere par build_initramfs.py -- ne pas editer a la main.
+# Lanceur PID1 (genere par build_initramfs.py -- ne pas editer).
 export EPYTHON={epython}
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:/lib64:/lib
 
-# pseudo-FS minimaux AVANT tout (pour /dev/kmsg, /proc/cmdline, et un shell util)
-/bin/busybox mkdir -p /proc /sys /dev 2>/dev/null
-/bin/busybox mount -t proc proc /proc 2>/dev/null
-/bin/busybox mount -t sysfs sys /sys 2>/dev/null
-/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null || /bin/busybox mdev -s 2>/dev/null
+# pseudo-FS minimaux d'abord (kmsg, cmdline, shell utilisable)
+busybox mkdir -p /proc /sys /dev 2>/dev/null
+busybox mount -t proc proc /proc 2>/dev/null
+busybox mount -t sysfs sys /sys 2>/dev/null
+busybox mount -t devtmpfs dev /dev 2>/dev/null
 
-say() {{ echo "[init-launcher] $1"; echo "[init-launcher] $1" > /dev/kmsg 2>/dev/null; }}
+# NE JAMAIS rebooter sur panic : laisse l'ecran lisible (critique pour debugger)
+echo 0 > /proc/sys/kernel/panic 2>/dev/null
 
-CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+say() {{ echo ""; echo "[init-launcher] $1"; echo "[init-launcher] $1" > /dev/kmsg 2>/dev/null; }}
+pause() {{ say "$1"; say "PAUSE 30s pour lecture (ou Entree)..."; busybox timeout -t 30 busybox sh -c 'read x' 2>/dev/null || busybox sleep 30; }}
 
-# break=launcher : shell AVANT python (debug independant de python, toujours dispo)
+CMDLINE=$(busybox cat /proc/cmdline 2>/dev/null)
+say "lanceur demarre. EPYTHON=$EPYTHON"
+say "cmdline: $CMDLINE"
+
+# break=launcher : shell AVANT python (debug independant de python)
 case "$CMDLINE" in
-  *break=launcher*)
-    say "BREAK=launcher : shell de debug (exit pour continuer vers python)"
-    /bin/busybox sh
-    ;;
+  *break=launcher*) say "BREAK=launcher : shell (exit pour continuer)"; busybox sh ;;
 esac
 
-# verif que python peut demarrer (message clair sinon, pas de panic muet)
+# diagnostic python AVANT de lancer init.py : message clair + pause si echec
 if ! /usr/bin/python3 -c "import sys" 2>/tmp/pyerr; then
-  say "ECHEC : /usr/bin/python3 ne demarre pas. Detail :"
-  /bin/busybox cat /tmp/pyerr 2>/dev/null
-  /bin/busybox cat /tmp/pyerr > /dev/kmsg 2>/dev/null
-  say "ouverture d'un shell de secours (busybox)."
-  exec /bin/busybox sh
+  say "ECHEC : /usr/bin/python3 ne demarre PAS. Detail :"
+  busybox cat /tmp/pyerr
+  busybox cat /tmp/pyerr > /dev/kmsg 2>/dev/null
+  say "Tentative avec python3.14 direct..."
+  if ! /usr/bin/python3.14 -c "import sys" 2>/tmp/pyerr2; then
+    busybox cat /tmp/pyerr2
+    pause "python INUTILISABLE. Shell de secours ensuite."
+    exec busybox sh
+  else
+    say "python3.14 OK ! on l'utilise directement (wrapper contourne)."
+    exec /usr/bin/python3.14 /init.py "$@"
+  fi
 fi
 
-say "EPYTHON=$EPYTHON, lancement de init.py..."
+say "python OK, lancement de init.py..."
 exec /usr/bin/python3 /init.py "$@"
 
-# si exec echoue malgre tout :
-say "ECHEC exec python /init.py -- shell de secours."
-exec /bin/busybox sh
+say "ECHEC exec -- shell de secours."
+exec busybox sh
 """
         dst_init = f"{stage}/init"
         with open(dst_init, "w") as f:
             f.write(launcher)
         os.chmod(dst_init, 0o755)
-        msg(f"/init = lanceur shell (EPYTHON={epython}, break=launcher dispo) -> /init.py")
+        msg(f"/init = lanceur robuste (EPYTHON={epython}, panic=0, fallback python3.14)")
 
         pack(stage, OUT)
         size = subprocess.run(["du", "-h", OUT], capture_output=True, text=True).stdout.split()[0]

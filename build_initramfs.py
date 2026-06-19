@@ -168,34 +168,59 @@ def copy_with_deps(binary, stage):
 
 
 def bundle_python(stage):
-    """Interpreteur REEL (pas le wrapper python-exec) + stdlib + lib-dynload +
-    libs dynamiques."""
+    """Interpreteur REEL (pas le wrapper python-exec) + libpython + stdlib +
+    lib-dynload + libs dynamiques. Python Gentoo est en SHARED : le binaire est
+    petit, l'interpreteur vit dans libpython3.X.so.1.0 -> on l'embarque
+    imperativement (via ldd), sinon python ne demarre pas."""
     real = resolve_real_python(PYBIN)
     if not _is_real_interpreter(real):
         msg(f"ATTENTION : '{real}' ne ressemble pas a un vrai interpreteur "
-            f"(taille {os.path.getsize(real) if os.path.isfile(real) else 0} o). "
-            f"L'auto-test post-build confirmera si python demarre.")
+            f"(taille {os.path.getsize(real) if os.path.isfile(real) else 0} o).")
     else:
         msg(f"interpreteur reel resolu : {real} "
             f"({os.path.getsize(real) // 1024} Ko)")
+    # copie du vrai binaire + TOUTES ses .so (ldd) -> inclut libpython3.X.so
     copy_with_deps(real, stage)
-    # /usr/bin/python3 dans l'initramfs DOIT etre le vrai ELF (le shebang de
-    # init.py est #!/usr/bin/python3). Le plus robuste : copier le vrai binaire
-    # DIRECTEMENT a /usr/bin/python3 (pas de lien a resoudre au boot, pas de
-    # wrapper). On copie aussi sous son nom versionne (deja fait par copy_with_deps
-    # si real = /usr/bin/python3.X).
+    # /usr/bin/python3 = copie DIRECTE du vrai ELF (le shebang de init.py est
+    # #!/usr/bin/python3 ; pas de wrapper, pas de lien a resoudre au boot).
     os.makedirs(f"{stage}/usr/bin", exist_ok=True)
     link = f"{stage}/usr/bin/python3"
     try:
         if os.path.lexists(link):
             os.remove(link)
-        shutil.copy2(real, link)               # copie directe du vrai ELF
+        shutil.copy2(real, link)
         os.chmod(link, 0o755)
-        msg(f"/usr/bin/python3 = copie directe du vrai interpreteur")
+        msg("/usr/bin/python3 = copie directe du vrai interpreteur (sans wrapper)")
     except OSError as e:
         msg(f"ATTENTION lien python3 : {e}")
+    # GARANTIE libpython : faire le ldd sur le BINAIRE COPIE et verifier que
+    # libpython est bien embarquee (Gentoo shared). Copie explicite si besoin.
+    try:
+        out = subprocess.run(["ldd", real], capture_output=True, text=True).stdout
+    except OSError:
+        out = ""
+    libpython_found = False
+    for m in re.finditer(r"(/[^\s]+/lib[^\s]*\.so[^\s]*)", out):
+        lib = m.group(1)
+        if os.path.exists(lib):
+            copy(lib, stage)
+            if "libpython" in os.path.basename(lib):
+                libpython_found = True
+    # repli : chercher libpython explicitement si ldd ne l'a pas listee
+    if not libpython_found:
+        import glob
+        for pat in ("/usr/lib*/libpython3.*.so*", "/lib*/libpython3.*.so*"):
+            for lib in glob.glob(pat):
+                copy(lib, stage)
+                libpython_found = True
+        if libpython_found:
+            msg("libpython embarquee (repli glob)")
+    if libpython_found:
+        msg("libpython presente dans l'initramfs")
+    else:
+        msg("NOTE : pas de libpython detectee (python peut-etre statique, OK)")
     # stdlib complete (inclut lib-dynload : _ctypes, fcntl, etc.)
-    stdlib = sysconfig.get_path("stdlib")          # ex: /usr/lib/python3.13
+    stdlib = sysconfig.get_path("stdlib")          # ex: /usr/lib/python3.14
     dst = stage + stdlib
     ignore = shutil.ignore_patterns("test", "tests", "idlelib", "tkinter",
                                     "turtledemo", "ensurepip", "lib2to3",
@@ -355,8 +380,26 @@ def main():
                          "paniquerait en silence. Build INTERROMPU.")
             msg("auto-test python dans l'initramfs : OK (imports critiques passent)")
         except FileNotFoundError:
-            msg("ATTENTION : chroot indisponible, auto-test python SAUTE "
-                "(verifie manuellement : chroot <stage> /usr/bin/python3 -c '...')")
+            msg("ATTENTION : chroot indisponible, auto-test complet SAUTE")
+            # verification de SECOURS sans chroot : python3 embarque ne doit pas
+            # etre le wrapper python-exec (petit + reference 'python-exec').
+            pyembed = f"{stage}/usr/bin/python3"
+            try:
+                size = os.path.getsize(pyembed)
+                with open(pyembed, "rb") as f:
+                    blob = f.read()
+                is_wrapper = (size < 100 * 1024 and b"python-exec" in blob)
+                # petit MAIS lie a libpython = OK (shared) ; petit ET python-exec = wrapper
+                if is_wrapper:
+                    sys.exit("ECHEC : /usr/bin/python3 embarque est le WRAPPER "
+                             "python-exec (cherche /usr/lib/python-exec au boot "
+                             "-> panic). resolve_real_python n'a pas trouve le "
+                             "vrai ELF. Force PYBIN=/usr/bin/python3.<ver>. "
+                             "Build INTERROMPU.")
+                msg(f"verif secours : python3 embarque OK (taille {size // 1024} Ko, "
+                    "pas le wrapper)")
+            except OSError as e:
+                msg(f"verif secours impossible ({e})")
         except subprocess.TimeoutExpired:
             sys.exit("AUTO-TEST PYTHON : timeout (python bloque au demarrage ?)")
         bundle_busybox(stage)

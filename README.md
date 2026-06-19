@@ -736,11 +736,19 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > **wrapper** (`dev-lang/python-exec`), pas le vrai interpréteur. Embarquer ce
 > wrapper sans `/usr/lib/python-exec/` provoque au boot « no python-exec wrapper
 > found » → `/init` ne démarre pas → **panic VFS muet**. `build_initramfs.py`
-> **résout le vrai ELF** (`/usr/lib/python-exec/python3.X/python3` via
-> `sys._base_executable`) et l'embarque directement. Un **auto-test** lance
-> `chroot <stage> /usr/bin/python3 -c "import ctypes,fcntl,..."` à la fin du
-> build : si l'interpréteur ou une `.so` manque, le **build s'arrête** au lieu
-> de produire une image qui paniquerait silencieusement.
+> **résout le vrai ELF** (`/usr/bin/python3.X` versionné) et l'embarque
+> directement comme `/usr/bin/python3` (sans wrapper).
+>
+> **Python en SHARED** : sur Gentoo, l'interpréteur est compilé en partagé — le
+> binaire `python3.X` est petit, le cœur est dans **`libpython3.X.so.1.0`**.
+> `build_initramfs` embarque impérativement cette lib (via `ldd` + repli glob),
+> sinon python ne démarre pas. Pour lever toute ambiguïté, on peut forcer
+> l'interpréteur exact au build : `PYBIN=/usr/bin/python3.14 python3 build_initramfs.py`.
+>
+> **Auto-test** : `chroot <stage> /usr/bin/python3 -c "import ctypes,fcntl,..."`
+> à la fin du build ; si chroot indispo, une vérif de secours refuse un python3
+> qui serait le wrapper. Le build s'arrête plutôt que de produire une image qui
+> paniquerait silencieusement.
 
 ### Stream de la console de boot dès l'init
 

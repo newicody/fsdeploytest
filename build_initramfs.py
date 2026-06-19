@@ -150,6 +150,30 @@ def copy(src, stage):
     return dst
 
 
+def _copy_lib_with_soname(soname, real_path, stage):
+    """Copie la lib reelle ET recree la chaine de liens SONAME qui pointe vers
+    elle. ldd donne 'libpython3.14.so.0 => /usr/lib64/libpython3.14.so.1.0' : le
+    binaire cherche le SONAME (gauche), le fichier reel a un autre nom (droite).
+    Sans le lien, le loader ne trouve pas la lib au boot."""
+    real = os.path.realpath(real_path)
+    copy(real, stage)                          # le fichier reel (contenu)
+    # recreer TOUS les intermediaires : real_path peut etre lui-meme un lien.
+    # on cree le lien <dir>/<soname> -> basename(real), et le lien fourni par ldd.
+    rdir = os.path.dirname(real)
+    for linkname in {soname, os.path.basename(real_path)}:
+        if not linkname or linkname == os.path.basename(real):
+            continue
+        link_src = os.path.join(rdir, linkname)
+        dst_link = stage + link_src
+        os.makedirs(os.path.dirname(dst_link), exist_ok=True)
+        if not os.path.lexists(dst_link):
+            try:
+                os.symlink(os.path.basename(real), dst_link)
+            except OSError:
+                # repli : copie du contenu si le lien echoue
+                copy(real, stage)
+
+
 def copy_with_deps(binary, stage):
     src = which(binary) if "/" not in binary else binary
     if not src or not os.path.exists(src):
@@ -160,10 +184,32 @@ def copy_with_deps(binary, stage):
         out = subprocess.run(["ldd", src], capture_output=True, text=True).stdout
     except Exception:
         out = ""
-    for m in re.finditer(r"(/[^\s]+\.so[^\s]*)", out):
-        lib = m.group(1)
-        if os.path.exists(lib):
-            copy(lib, stage)
+    # parser 'SONAME => /chemin/reel' pour recreer le lien SONAME ; et capturer
+    # aussi les chemins absolus seuls (ld-linux, vdso ignore).
+    for line in out.splitlines():
+        line = line.strip()
+        if "=>" in line:
+            left, right = line.split("=>", 1)
+            soname = left.strip()
+            mreal = re.search(r"(/[^\s]+\.so[^\s]*)", right)
+            if mreal and os.path.exists(mreal.group(1)):
+                _copy_lib_with_soname(soname, mreal.group(1), stage)
+        else:
+            # ligne sans => : ex '/lib64/ld-linux-x86-64.so.2 (0x...)'
+            mreal = re.search(r"(/[^\s]+\.so[^\s]*)", line)
+            if mreal and os.path.exists(mreal.group(1)):
+                copy(os.path.realpath(mreal.group(1)), stage)
+                # recreer le lien sous son nom d'origine aussi
+                orig = mreal.group(1)
+                if os.path.realpath(orig) != orig:
+                    dst_link = stage + orig
+                    os.makedirs(os.path.dirname(dst_link), exist_ok=True)
+                    if not os.path.lexists(dst_link):
+                        try:
+                            os.symlink(os.path.basename(os.path.realpath(orig)),
+                                       dst_link)
+                        except OSError:
+                            pass
     return True
 
 
@@ -510,22 +556,51 @@ def main():
         shutil.copy2(INIT_SRC, f"{stage}/init.py")     # le vrai code -> /init.py
         os.chmod(f"{stage}/init.py", 0o755)
         launcher = f"""#!/bin/busybox sh
-# lanceur PID1 : etablit l'environnement Gentoo pour python-exec puis lance
+# Lanceur PID1 : etablit l'environnement Gentoo (python-exec) puis lance
 # init.py. Genere par build_initramfs.py -- ne pas editer a la main.
 export EPYTHON={epython}
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:/lib64:/lib
-echo "[init-launcher] EPYTHON=$EPYTHON, lancement de python..." > /dev/kmsg 2>/dev/null
+
+# pseudo-FS minimaux AVANT tout (pour /dev/kmsg, /proc/cmdline, et un shell util)
+/bin/busybox mkdir -p /proc /sys /dev 2>/dev/null
+/bin/busybox mount -t proc proc /proc 2>/dev/null
+/bin/busybox mount -t sysfs sys /sys 2>/dev/null
+/bin/busybox mount -t devtmpfs dev /dev 2>/dev/null || /bin/busybox mdev -s 2>/dev/null
+
+say() {{ echo "[init-launcher] $1"; echo "[init-launcher] $1" > /dev/kmsg 2>/dev/null; }}
+
+CMDLINE=$(cat /proc/cmdline 2>/dev/null)
+
+# break=launcher : shell AVANT python (debug independant de python, toujours dispo)
+case "$CMDLINE" in
+  *break=launcher*)
+    say "BREAK=launcher : shell de debug (exit pour continuer vers python)"
+    /bin/busybox sh
+    ;;
+esac
+
+# verif que python peut demarrer (message clair sinon, pas de panic muet)
+if ! /usr/bin/python3 -c "import sys" 2>/tmp/pyerr; then
+  say "ECHEC : /usr/bin/python3 ne demarre pas. Detail :"
+  /bin/busybox cat /tmp/pyerr 2>/dev/null
+  /bin/busybox cat /tmp/pyerr > /dev/kmsg 2>/dev/null
+  say "ouverture d'un shell de secours (busybox)."
+  exec /bin/busybox sh
+fi
+
+say "EPYTHON=$EPYTHON, lancement de init.py..."
 exec /usr/bin/python3 /init.py "$@"
-# si exec echoue, on arrive ici :
-echo "[init-launcher] ECHEC du lancement de python /init.py" > /dev/kmsg 2>/dev/null
+
+# si exec echoue malgre tout :
+say "ECHEC exec python /init.py -- shell de secours."
 exec /bin/busybox sh
 """
         dst_init = f"{stage}/init"
         with open(dst_init, "w") as f:
             f.write(launcher)
         os.chmod(dst_init, 0o755)
-        msg(f"/init = lanceur shell (EPYTHON={epython}) -> /init.py")
+        msg(f"/init = lanceur shell (EPYTHON={epython}, break=launcher dispo) -> /init.py")
 
         pack(stage, OUT)
         size = subprocess.run(["du", "-h", OUT], capture_output=True, text=True).stdout.split()[0]

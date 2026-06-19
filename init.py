@@ -174,6 +174,10 @@ def mount(src, tgt, fstype, flags=0, data=None):
     d = data.encode() if data else None
     if libc.mount(s, t, f, ctypes.c_ulong(flags), d) != 0:
         e = ctypes.get_errno()
+        # EBUSY (16) = deja monte (le lanceur /init monte proc/sys/dev tot pour
+        # le debug). Ce n'est pas une erreur : la cible est disponible.
+        if e == 16:
+            return
         raise OSError(e, f"mount({src} -> {tgt}, {fstype}): {os.strerror(e)}")
 
 

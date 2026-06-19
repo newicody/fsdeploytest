@@ -213,55 +213,59 @@ def main():
     run(["efibootmgr", "--bootnext", new])
     msg(f"entree {label} = Boot{new} — BootNext arme (essai unique)")
 
-    # 6bis. UKI multi-profils (si [uki] enabled) : binaires EFI autonomes avec
-    # cmdline embarquee, places sur les 2 ESP + fallback BOOTX64.EFI. Permet de
-    # booter un profil 'safe' (nomodeset) pour diagnostiquer, sans toucher a
-    # l'entree classique ci-dessus. Secure Boot off (non signes).
+    # 6bis. Une entree EFI CLASSIQUE par profil (normal/safe/i915), noyau+initrd
+    # SEPARES (initrd=\EFI\... passe par le firmware). Methode fiable : pas de
+    # section PE a bricoler (l'UKI objcopy ne passait pas l'initrd au noyau ->
+    # prepare_namespace -> panic VFS). Chaque profil = sa cmdline ; sur les 2 ESP.
     try:
-        import uki_build
+        import uki_build                       # reutilise load_profiles ([uki])
         infra = os.environ.get("INFRA_CONF", "infra.conf")
         enabled, profiles = uki_build.load_profiles(infra)
         if enabled and profiles:
-            vmlinuz_src = os.path.join(dest, f"vmlinuz-{kver}.efi")
-            initrd_src = os.path.join(dest, f"initramfs-{kver}.zst")
-            # ESP(s) via boot_layout : chaque ESP montee a son install_mount,
-            # identite (disk/part) derivee du PARTUUID. Repli sur env si absent.
-            esps = []
+            # ESP(s) : staging deja fait pour la 1ere ; stager aussi sur la 2e.
+            esps = [(ESP, DISK, PART)]
             try:
                 import boot_layout
                 for e in boot_layout.load_esps(infra):
                     mp = e.mount_for_install(log=msg)
-                    disk, part = e.disk_and_part()
-                    # entree NVRAM seulement si register_uefi ; sinon disk='' =>
-                    # uki_build ecrit le fallback BOOTX64 sans entree nommee.
-                    if mp:
-                        esps.append((mp, disk if e.register_uefi else "", part))
+                    d, p = e.disk_and_part()
+                    if mp and os.path.abspath(mp) != os.path.abspath(ESP):
+                        esps.append((mp, d, p))
             except Exception as e:
-                msg(f"boot_layout indisponible pour UKI ({e}) -> repli env")
-            if not esps:
-                esps = [(ESP, DISK, PART)]
-                esp2 = os.environ.get("ESP2")
-                if esp2 and os.path.isdir(esp2):
-                    esps.append((esp2, os.environ.get("DISK2", ""),
-                                 os.environ.get("PART2", "1")))
+                msg(f"boot_layout indisponible ({e}) -> 1 seule ESP")
 
-            def _mk_entry(lbl, disk, part, loader):
+            efi_dir_bs = DEST_DIR.replace("/", "\\")
+            for esp_mnt, disk, part in esps:
+                # s'assurer que noyau+initrd sont sur CETTE ESP
+                dst_dir = os.path.join(esp_mnt, DEST_DIR)
+                os.makedirs(dst_dir, exist_ok=True)
+                vm = os.path.join(dst_dir, f"vmlinuz-{kver}.efi")
+                it = os.path.join(dst_dir, f"initramfs-{kver}.zst")
+                if not os.path.exists(vm):
+                    shutil.copy2(os.path.join(dest, f"vmlinuz-{kver}.efi"), vm)
+                if not os.path.exists(it):
+                    shutil.copy2(os.path.join(dest, f"initramfs-{kver}.zst"), it)
                 if not disk:
-                    return                      # ESP sans entree NVRAM (fallback)
-                old = efi_entry(lbl)
-                if old:
-                    run(["efibootmgr", "-b", old, "-B"])
-                run(["efibootmgr", "--create", "--disk", disk, "--part", part,
-                     "--label", lbl, "--loader", loader])
-
-            msg(f"UKI : {len(profiles)} profil(s) -> {len(esps)} ESP")
-            res = uki_build.deploy_profiles(profiles, vmlinuz_src, initrd_src,
-                                            esps, log=msg, build_dir="/tmp",
-                                            efibootmgr_fn=_mk_entry)
-            ok = sum(1 for r in res if r.ok)
-            msg(f"UKI : {ok}/{len(res)} construits et deployes")
+                    msg(f"  {esp_mnt} : pas de disk/part -> pas d'entree NVRAM "
+                        f"(fichiers stages quand meme)")
+                    continue
+                for prof in profiles:
+                    lbl = prof.get("label", prof["name"])
+                    cmd = prof.get("cmdline", CMDLINE)
+                    old = efi_entry(lbl)
+                    if old:
+                        run(["efibootmgr", "-b", old, "-B"])
+                    run(["efibootmgr", "--create", "--disk", disk, "--part", part,
+                         "--label", lbl,
+                         "--loader", f"\\{efi_dir_bs}\\vmlinuz-{kver}.efi",
+                         "--unicode",
+                         f"initrd=\\{efi_dir_bs}\\initramfs-{kver}.zst {cmd}"])
+                    msg(f"  entree '{lbl}' -> {disk}p{part} "
+                        f"(initrd separe + cmdline profil)")
+            msg(f"entrees EFI par profil creees ({len(profiles)} profils "
+                f"x {len([e for e in esps if e[1]])} ESP avec NVRAM)")
     except Exception as e:
-        msg(f"UKI non construits ({e}) -- non bloquant, entree classique OK")
+        msg(f"entrees profils non creees ({e}) -- non bloquant, entree classique OK")
 
     # indexer la version dans le registre (statut candidate jusqu'au boot valide)
     try:

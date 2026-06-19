@@ -1152,19 +1152,22 @@ toujours de `GITHUB_TOKEN` (jamais dans le fichier).
 
 ## UKI multi-profils (`uki_build.py`, section `[uki]`)
 
-Un **UKI** (Unified Kernel Image) bundle `vmlinuz` + `initramfs` + `cmdline` dans
-**un seul binaire EFI**, bootable sans argument — donc utilisable au chemin de
-secours `\EFI\BOOT\BOOTX64.EFI` (qui est lancé sans cmdline). Comme le noyau a
-`CONFIG_EFI_STUB=y`, le `vmlinuz` **est** déjà un binaire EFI : on greffe les
-sections `.cmdline`/`.initrd`/`.osrel` dessus par `objcopy`, **sans aucune
-dépendance** (pas de stub systemd — adapté à OpenRC). Secure Boot **désactivé**
-pour l'instant (UKI non signés ; signature ajoutable plus tard avec tes clés MOK).
+> **IMPORTANT — méthode de boot** : l'UKI fabriqué par `objcopy` (greffe de la
+> section `.initrd` sur le vmlinuz) **ne fonctionne pas de façon fiable** : le
+> stub EFI ne charge pas toujours la section `.initrd` (les en-têtes PE
+> `SizeOfImage` ne sont pas mis à jour par `objcopy`), le noyau démarre **sans
+> initramfs**, appelle `prepare_namespace` → `mount_root_generic` et **panique**
+> (`VFS: Unable to mount root fs`). Symptôme confirmé sur la machine.
+>
+> **Méthode retenue : entrées EFI classiques** (noyau + initrd **séparés**). Le
+> firmware charge l'initrd via `initrd=\EFI\gentoo\initramfs-<ver>.zst` passé en
+> ligne de commande. `kernel_build.py` crée **une entrée EFI par profil** (les
+> cmdlines de `[uki]` deviennent les cmdlines des entrées), sur les 2 ESP. Pas
+> de section PE à bricoler, méthode éprouvée. Les profils gardent leur rôle :
+> `safe` (nomodeset) pour diagnostiquer, etc.
 
-Chaque profil de `[uki]` produit 1 UKI, **placé sur les 2 ESP** (chaque disque
-bootable seul) ; `register_uefi=true` crée l'entrée `efibootmgr` ; `fallback=true`
-écrit aussi `\EFI\BOOT\BOOTX64.EFI`. La **cmdline est dans l'ini** : tu y mets/
-retires les options qui peuvent faire planter, et tu crées des profils de
-diagnostic. Exemple fourni :
+La section `[uki]` sert toujours à déclarer les **profils** (label + cmdline),
+mais ils sont déployés en entrées EFI classiques, pas en binaires UKI uniques.
 
 ```ini
 [uki]
@@ -1188,6 +1191,27 @@ enabled = true
 > loglevel=7) depuis le menu UEFI. Si l'écran reste lisible → le coupable est le
 > pilote graphique (`xe`/`force_probe`), pas le reste. C'est l'outil pour isoler
 > le gel « écran en bruit coloré ».
+
+## Debug du boot (`debug`, `break=<etape>`, options noyau)
+
+Piloté par la **cmdline** (profil `debug` fourni dans `[uki]`), lu par `init.py` :
+
+- **`debug`** : logs verbeux (`debug_log`) + `init.py` écrit `0` dans
+  `/proc/sys/kernel/panic` → **pas de reboot au panic**, l'écran reste lisible.
+- **`break=<etape>`** : ouvre un **shell** AVANT l'étape nommée, le boot reprend
+  à la sortie (`exit`). Étapes : `pseudofs` (après /proc,/sys,/dev), `zfs` (avant
+  chargement des modules), `overlay` (avant l'assemblage racine), `switch` (avant
+  switch_root). Permet d'inspecter l'état à la main (`zpool import`, `ls`, etc.).
+- **`ignore_loglevel panic=0`** : côté noyau, tous les messages + pas de reboot.
+
+Options noyau de diagnostic (vérifiées par `kernel_diagnose.py`, à activer dans
+la config) :
+- **`CONFIG_BLK_DEV_INITRD=y`** — *critique* : sans elle le noyau **ignore
+  l'initramfs** et panique (`VFS unable to mount root`). Première chose à vérifier.
+- **`CONFIG_PSTORE_RAM=y`** (ramoops) : les logs du crash **survivent au reboot**,
+  lisibles dans `/sys/fs/pstore/` au boot suivant — le remède au « panic muet ».
+- **`CONFIG_MAGIC_SYSRQ=y`** : reprise d'un système figé (REISUB).
+- **`CONFIG_LOG_BUF_SHIFT=18`** : buffer kmsg plus grand (ne rien perdre au début).
 
 ## Boucle d'auto-update du noyau
 

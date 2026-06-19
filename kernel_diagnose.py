@@ -62,6 +62,14 @@ REQUIRED = [
     ("CONFIG_IP_PNP",       "y",  WARN, "config IP par cmdline (ip=) inoperante"),
     ("CONFIG_FW_LOADER",    "y",  CRIT, "firmware GuC/HuC/rtl_nic non chargeable"),
     ("CONFIG_DRM",          "y",  CRIT, "aucun affichage"),
+    # CRITIQUE : sans initrd support, le noyau IGNORE l'initramfs et cherche un
+    # root reel -> 'VFS unable to mount root' (panic). Decouvert en debug reel.
+    ("CONFIG_BLK_DEV_INITRD", "y", CRIT, "initramfs IGNORE par le noyau -> panic VFS"),
+    # --- diagnostic / debug (tres utiles pour analyser un boot rate) --------
+    ("CONFIG_PSTORE",       "y",  WARN, "pas de logs persistants apres crash"),
+    ("CONFIG_PSTORE_RAM",   "y",  WARN, "ramoops absent : dmesg du crash perdu au reboot"),
+    ("CONFIG_MAGIC_SYSRQ",  "y",  WARN, "SysRq indisponible (reprise systeme fige)"),
+    ("CONFIG_PRINTK",       "y",  CRIT, "aucun message noyau (debug impossible)"),
 ]
 # au moins un des deux pilotes GPU
 GPU_DRIVERS = ["CONFIG_DRM_XE", "CONFIG_DRM_I915"]

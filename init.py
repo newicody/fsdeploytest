@@ -109,6 +109,64 @@ def die(msg):
     os._exit(1)
 
 
+# --- debug pilote par /proc/cmdline ---------------------------------------- #
+# 'debug'         -> logs verbeux (debug_log visible) + ne pas rebooter au panic
+# 'break=<etape>' -> ouvre un shell AVANT l'etape nommee (pseudofs|zfs|overlay|
+#                    persist|switch). Permet d'inspecter l'etat a la main.
+_CMDLINE = None
+
+
+def cmdline():
+    """Contenu de /proc/cmdline (cache). '' si illisible."""
+    global _CMDLINE
+    if _CMDLINE is None:
+        try:
+            with open("/proc/cmdline") as f:
+                _CMDLINE = f.read().strip()
+        except OSError:
+            _CMDLINE = ""
+    return _CMDLINE
+
+
+def debug_enabled():
+    toks = cmdline().split()
+    return "debug" in toks or "init_debug" in toks
+
+
+def debug_log(msg):
+    """Message visible uniquement si 'debug' dans la cmdline."""
+    if debug_enabled():
+        log(f"DEBUG {msg}")
+
+
+def break_requested(stage):
+    """L'utilisateur a-t-il demande 'break=<stage>' (ou 'break' seul = a la fin) ?"""
+    for tok in cmdline().split():
+        if tok == f"break={stage}":
+            return True
+    return False
+
+
+def debug_shell(stage):
+    """Ouvre un shell interactif AVANT l'etape `stage` si demande. Le boot
+    reprend a la sortie du shell (exit). Ne tue PAS le boot (contrairement a
+    die)."""
+    if not break_requested(stage):
+        return
+    log(f"=== BREAK avant '{stage}' : shell de debug (exit pour continuer) ===")
+    log(f"    cmdline: {cmdline()}")
+    for sh in ("/bin/sh", "/bin/busybox"):
+        if os.path.exists(sh):
+            try:
+                # subprocess : on REVIENT apres l'exit du shell (pas execv)
+                subprocess.run([sh] if sh.endswith("sh") else [sh, "sh"])
+                log(f"=== reprise apres '{stage}' ===")
+                return
+            except OSError:
+                pass
+    log("    (aucun shell disponible)")
+
+
 def mount(src, tgt, fstype, flags=0, data=None):
     s = src.encode() if src else None
     t = tgt.encode()
@@ -520,6 +578,18 @@ def main():
     mount("tmpfs", "/run", "tmpfs")
     log("pseudo-FS montes")
 
+    # debug : si 'debug' dans la cmdline, ne pas rebooter au panic (ecran
+    # lisible) et logs verbeux. /proc/sys/kernel/panic = 0 -> attend indefiniment.
+    if debug_enabled():
+        log("MODE DEBUG actif (cmdline) : logs verbeux, pas de reboot au panic")
+        try:
+            with open("/proc/sys/kernel/panic", "w") as f:
+                f.write("0")
+        except OSError:
+            pass
+    debug_log(f"cmdline = {cmdline()}")
+    debug_shell("pseudofs")
+
     # --- 1bis. STREAM CONSOLE DE BOOT (le plus tot possible) ----------------
     # On streame des maintenant : tout le reste du boot (ZFS, overlay...) sera
     # visible en direct sur YouTube. ffmpeg tourne en tache de fond.
@@ -528,6 +598,7 @@ def main():
         log("(pas de stream initramfs ; demarrage normal)")
 
     # --- 2. ZFS (famille de modules, dans l'ordre des dependances) ----------
+    debug_shell("zfs")
     extra = f"/lib/modules/{KVER}/extra"
     try:
         with open(f"{extra}/zfs_load_order") as f:
@@ -576,6 +647,7 @@ def main():
         + ("  [SECOURS]" if rescue else ""))
 
     # --- 4. overlay racine : lower=rootfs.sfs (ro) + upper -----------------
+    debug_shell("overlay")
     # Normal : upper = dataset persistant fast_pool/rootfs (systeme mutable).
     # CORRUPTION (UPPER_DS existe mais montage/ecriture impossible) : on NE
     # monte PAS le dataset corrompu -> bascule DEGRADE LECTURE SEULE (upper
@@ -756,6 +828,7 @@ def main():
             log(f"cle YouTube non propagee ({e})")
 
     # --- 8. switch_root en Python (PAS pivot_root : on est en rootfs) -------
+    debug_shell("switch")
     nxt = f"{NEWROOT}/sbin/session_launch.py"
     if not os.path.exists(nxt):
         die(f"{nxt} absent")

@@ -167,59 +167,95 @@ def copy_with_deps(binary, stage):
     return True
 
 
-def bundle_python(stage):
-    """Interpreteur REEL (pas le wrapper python-exec) + libpython + stdlib +
-    lib-dynload + libs dynamiques. Python Gentoo est en SHARED : le binaire est
-    petit, l'interpreteur vit dans libpython3.X.so.1.0 -> on l'embarque
-    imperativement (via ldd), sinon python ne demarre pas."""
-    real = resolve_real_python(PYBIN)
-    if not _is_real_interpreter(real):
-        msg(f"ATTENTION : '{real}' ne ressemble pas a un vrai interpreteur "
-            f"(taille {os.path.getsize(real) if os.path.isfile(real) else 0} o).")
-    else:
-        msg(f"interpreteur reel resolu : {real} "
-            f"({os.path.getsize(real) // 1024} Ko)")
-    # copie du vrai binaire + TOUTES ses .so (ldd) -> inclut libpython3.X.so
-    copy_with_deps(real, stage)
-    # /usr/bin/python3 = copie DIRECTE du vrai ELF (le shebang de init.py est
-    # #!/usr/bin/python3 ; pas de wrapper, pas de lien a resoudre au boot).
-    os.makedirs(f"{stage}/usr/bin", exist_ok=True)
-    link = f"{stage}/usr/bin/python3"
+def _copy_symlink(src, stage):
+    """Recree le lien symbolique src sous stage (en preservant sa cible relative)."""
+    dst = stage + src
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
     try:
-        if os.path.lexists(link):
-            os.remove(link)
-        shutil.copy2(real, link)
-        os.chmod(link, 0o755)
-        msg("/usr/bin/python3 = copie directe du vrai interpreteur (sans wrapper)")
+        target = os.readlink(src)
+        if os.path.lexists(dst):
+            os.remove(dst)
+        os.symlink(target, dst)
     except OSError as e:
-        msg(f"ATTENTION lien python3 : {e}")
-    # GARANTIE libpython : faire le ldd sur le BINAIRE COPIE et verifier que
-    # libpython est bien embarquee (Gentoo shared). Copie explicite si besoin.
+        msg(f"lien {src} non recree ({e})")
+
+
+def determine_epython():
+    """Valeur de EPYTHON attendue par python-exec (ex 'python3.14'). Determinee
+    depuis l'interpreteur de build."""
     try:
-        out = subprocess.run(["ldd", real], capture_output=True, text=True).stdout
+        v = subprocess.run([PYBIN, "-c",
+                            "import sys; print('python3.%d' % sys.version_info[1])"],
+                           capture_output=True, text=True).stdout.strip()
+        return v or "python3.14"
     except OSError:
-        out = ""
-    libpython_found = False
-    for m in re.finditer(r"(/[^\s]+/lib[^\s]*\.so[^\s]*)", out):
-        lib = m.group(1)
-        if os.path.exists(lib):
-            copy(lib, stage)
-            if "libpython" in os.path.basename(lib):
-                libpython_found = True
-    # repli : chercher libpython explicitement si ldd ne l'a pas listee
+        return "python3.14"
+
+
+def bundle_python(stage):
+    """EMBARQUE TOUT l'ecosysteme Python de Gentoo, sans chercher a distinguer le
+    wrapper du vrai interpreteur (source d'erreurs sans fin). On reproduit l'env
+    Gentoo tel quel :
+      - /usr/bin/python3 (wrapper python-exec2c) + tous les python3* de /usr/bin
+      - TOUT /usr/lib/python-exec/ (le wrapper y cherche les vrais binaires)
+      - les vrais binaires versionnes + leurs .so (dont libpython3.X.so.1.0)
+      - la stdlib + lib-dynload
+    Combinee a EPYTHON defini dans le lanceur /init (cf install), le wrapper
+    fonctionne exactement comme sur le systeme."""
+    import glob
+    os.makedirs(f"{stage}/usr/bin", exist_ok=True)
+
+    # 1. tous les binaires python de /usr/bin (wrapper python3 + versionnes) avec
+    #    leurs dependances (.so). copy_with_deps suit les liens et fait le ldd.
+    py_bins = sorted(set(glob.glob("/usr/bin/python3")
+                         + glob.glob("/usr/bin/python3.*")))
+    for b in py_bins:
+        if os.path.lexists(b):
+            # preserver le lien tel quel si c'en est un, sinon copier + deps
+            if os.path.islink(b):
+                _copy_symlink(b, stage)
+            copy_with_deps(os.path.realpath(b), stage)
+            # s'assurer que le NOM original existe aussi dans le stage
+            copy_with_deps(b, stage)
+    msg(f"binaires python embarques : {', '.join(os.path.basename(x) for x in py_bins)}")
+
+    # 2. TOUT /usr/lib/python-exec/ (wrapper + liens + vrais binaires dedans)
+    pexec = "/usr/lib/python-exec"
+    if os.path.isdir(pexec):
+        for root, _dirs, files in os.walk(pexec):
+            for name in files:
+                src = os.path.join(root, name)
+                if os.path.islink(src):
+                    _copy_symlink(src, stage)
+                    tgt = os.path.realpath(src)
+                    if os.path.isfile(tgt):
+                        copy_with_deps(tgt, stage)
+                elif os.path.isfile(src):
+                    copy_with_deps(src, stage)
+        msg("ecosysteme /usr/lib/python-exec/ embarque (wrapper fonctionnel)")
+    else:
+        msg("pas de /usr/lib/python-exec/ (pas de wrapper sur ce systeme, OK)")
+
+    # 3. python-exec2c lui-meme (le vrai wrapper binaire) + sa conf
+    for extra_bin in glob.glob("/usr/bin/python-exec*"):
+        if os.path.lexists(extra_bin):
+            copy_with_deps(os.path.realpath(extra_bin), stage)
+    for conf in ("/etc/python-exec/python-exec.conf",):
+        if os.path.exists(conf):
+            copy(conf, stage)
+
+    # 4. GARANTIE libpython (Gentoo shared) : repli glob si un ldd l'a ratee
+    libpython_found = bool(glob.glob(f"{stage}/usr/lib*/libpython3.*.so*")
+                           or glob.glob(f"{stage}/lib*/libpython3.*.so*"))
     if not libpython_found:
-        import glob
         for pat in ("/usr/lib*/libpython3.*.so*", "/lib*/libpython3.*.so*"):
             for lib in glob.glob(pat):
                 copy(lib, stage)
                 libpython_found = True
-        if libpython_found:
-            msg("libpython embarquee (repli glob)")
-    if libpython_found:
-        msg("libpython presente dans l'initramfs")
-    else:
-        msg("NOTE : pas de libpython detectee (python peut-etre statique, OK)")
-    # stdlib complete (inclut lib-dynload : _ctypes, fcntl, etc.)
+    msg("libpython embarquee" if libpython_found
+        else "NOTE : pas de libpython detectee (python statique ?)")
+
+    # 5. stdlib complete (inclut lib-dynload : _ctypes, fcntl, etc.)
     stdlib = sysconfig.get_path("stdlib")          # ex: /usr/lib/python3.14
     dst = stage + stdlib
     ignore = shutil.ignore_patterns("test", "tests", "idlelib", "tkinter",
@@ -234,7 +270,7 @@ def bundle_python(stage):
         for f in os.listdir(dynload):
             if f.endswith(".so"):
                 copy_with_deps(os.path.join(dynload, f), stage)
-    msg(f"python embarque (reel {real}, stdlib {stdlib})")
+    msg(f"python embarque (ecosysteme complet, stdlib {stdlib})")
 
 
 def bundle_busybox(stage):
@@ -363,46 +399,42 @@ def main():
                 copy(ld, stage)
 
         bundle_python(stage)
+        bundle_busybox(stage)        # AVANT l'auto-test : le lanceur /init = busybox sh
         # AUTO-TEST CRITIQUE : le python embarque s'execute-t-il REELLEMENT dans
         # l'environnement de l'initramfs ? (chroot = exactement ce que fait le
         # noyau au boot). Detecte le piege python-exec et les .so manquantes
         # AVANT de produire une image qui paniquerait en silence au boot.
+        # On teste VIA L'ENVIRONNEMENT DU LANCEUR (EPYTHON defini), exactement
+        # comme au boot : chroot + EPYTHON + /usr/bin/python3 (le wrapper).
         test_code = "import ctypes, fcntl, os, subprocess, sys; print('PYOK')"
+        epython = determine_epython()
+        env = dict(os.environ, EPYTHON=epython,
+                   PATH="/usr/sbin:/usr/bin:/sbin:/bin",
+                   LD_LIBRARY_PATH="/usr/lib64:/usr/lib:/lib64:/lib")
         try:
             r = subprocess.run(["chroot", stage, "/usr/bin/python3", "-c",
                                 test_code], capture_output=True, text=True,
-                               timeout=30)
+                               timeout=30, env=env)
             if "PYOK" not in r.stdout:
                 sys.exit("ECHEC AUTO-TEST PYTHON dans l'initramfs :\n"
+                         f"  EPYTHON={epython}\n"
                          f"  stdout: {r.stdout.strip()}\n"
                          f"  stderr: {r.stderr.strip()}\n"
-                         "  -> l'interpreteur ou une lib (.so) manque. Le boot "
-                         "paniquerait en silence. Build INTERROMPU.")
-            msg("auto-test python dans l'initramfs : OK (imports critiques passent)")
+                         "  -> wrapper/interpreteur/lib (.so) manquant malgre "
+                         "l'embarquage complet. Build INTERROMPU.")
+            msg(f"auto-test python (EPYTHON={epython}) : OK (imports critiques OK)")
         except FileNotFoundError:
-            msg("ATTENTION : chroot indisponible, auto-test complet SAUTE")
-            # verification de SECOURS sans chroot : python3 embarque ne doit pas
-            # etre le wrapper python-exec (petit + reference 'python-exec').
-            pyembed = f"{stage}/usr/bin/python3"
-            try:
-                size = os.path.getsize(pyembed)
-                with open(pyembed, "rb") as f:
-                    blob = f.read()
-                is_wrapper = (size < 100 * 1024 and b"python-exec" in blob)
-                # petit MAIS lie a libpython = OK (shared) ; petit ET python-exec = wrapper
-                if is_wrapper:
-                    sys.exit("ECHEC : /usr/bin/python3 embarque est le WRAPPER "
-                             "python-exec (cherche /usr/lib/python-exec au boot "
-                             "-> panic). resolve_real_python n'a pas trouve le "
-                             "vrai ELF. Force PYBIN=/usr/bin/python3.<ver>. "
-                             "Build INTERROMPU.")
-                msg(f"verif secours : python3 embarque OK (taille {size // 1024} Ko, "
-                    "pas le wrapper)")
-            except OSError as e:
-                msg(f"verif secours impossible ({e})")
+            msg("ATTENTION : chroot indisponible, auto-test complet SAUTE.")
+            # verif de secours : le wrapper a-t-il son ecosysteme ? (on l'assume
+            # desormais : /usr/lib/python-exec doit etre present dans le stage)
+            if os.path.isdir(f"{stage}/usr/lib/python-exec"):
+                msg("verif secours : /usr/lib/python-exec present (wrapper OK)")
+            elif os.path.exists(f"{stage}/usr/bin/python3"):
+                msg("verif secours : python3 present (verifie le boot manuellement)")
+            else:
+                sys.exit("ECHEC : aucun python3 embarque. Build INTERROMPU.")
         except subprocess.TimeoutExpired:
             sys.exit("AUTO-TEST PYTHON : timeout (python bloque au demarrage ?)")
-        bundle_busybox(stage)
         # binaires CRITIQUES : leur absence rend l'initramfs non-bootable.
         # On ARRETE le build plutot que de produire une image cassee.
         manquants = []
@@ -468,10 +500,32 @@ def main():
 
         if not os.path.exists(INIT_SRC):
             sys.exit(f"init introuvable: {INIT_SRC}")
+        # /init = LANCEUR SHELL (busybox sh), PAS directement init.py. Raison :
+        # le noyau lance /init avec un env MINIMAL (HOME=/ TERM=linux), donc
+        # EPYTHON n'est pas defini -> le wrapper python-exec echouerait
+        # ('no python-exec wrapper found'). Le lanceur exporte EPYTHON + PATH +
+        # LD_LIBRARY_PATH puis exec le wrapper sur /init.py. Bonus : si python
+        # echoue, le lanceur affiche l'erreur sur la console (plus de panic muet).
+        epython = determine_epython()
+        shutil.copy2(INIT_SRC, f"{stage}/init.py")     # le vrai code -> /init.py
+        os.chmod(f"{stage}/init.py", 0o755)
+        launcher = f"""#!/bin/busybox sh
+# lanceur PID1 : etablit l'environnement Gentoo pour python-exec puis lance
+# init.py. Genere par build_initramfs.py -- ne pas editer a la main.
+export EPYTHON={epython}
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:/lib64:/lib
+echo "[init-launcher] EPYTHON=$EPYTHON, lancement de python..." > /dev/kmsg 2>/dev/null
+exec /usr/bin/python3 /init.py "$@"
+# si exec echoue, on arrive ici :
+echo "[init-launcher] ECHEC du lancement de python /init.py" > /dev/kmsg 2>/dev/null
+exec /bin/busybox sh
+"""
         dst_init = f"{stage}/init"
-        shutil.copy2(INIT_SRC, dst_init)         # source init.py -> /init
+        with open(dst_init, "w") as f:
+            f.write(launcher)
         os.chmod(dst_init, 0o755)
-        msg("/init installe (init.py)")
+        msg(f"/init = lanceur shell (EPYTHON={epython}) -> /init.py")
 
         pack(stage, OUT)
         size = subprocess.run(["du", "-h", OUT], capture_output=True, text=True).stdout.split()[0]

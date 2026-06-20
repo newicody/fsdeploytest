@@ -701,17 +701,19 @@ export EPYTHON={epython}
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin
 export LD_LIBRARY_PATH=/usr/lib64:/usr/lib:/lib64:/lib
 
-# pseudo-FS minimaux d'abord (kmsg, cmdline, shell utilisable)
-busybox mkdir -p /proc /sys /dev 2>/dev/null
+# pseudo-FS minimaux + /tmp (sinon les redirections 2>/tmp/... echouent et
+# faussent les tests : un test 'python -c ...' paraitrait echouer alors que
+# c'est la redirection qui casse).
+busybox mkdir -p /proc /sys /dev /tmp /run 2>/dev/null
 busybox mount -t proc proc /proc 2>/dev/null
 busybox mount -t sysfs sys /sys 2>/dev/null
 busybox mount -t devtmpfs dev /dev 2>/dev/null
+busybox mount -t tmpfs tmp /tmp 2>/dev/null
 
 # NE JAMAIS rebooter sur panic : laisse l'ecran lisible (critique pour debugger)
 echo 0 > /proc/sys/kernel/panic 2>/dev/null
 
 say() {{ echo ""; echo "[init-launcher] $1"; echo "[init-launcher] $1" > /dev/kmsg 2>/dev/null; }}
-pause() {{ say "$1"; say "PAUSE 30s pour lecture (ou Entree)..."; busybox timeout -t 30 busybox sh -c 'read x' 2>/dev/null || busybox sleep 30; }}
 
 CMDLINE=$(busybox cat /proc/cmdline 2>/dev/null)
 say "lanceur demarre. EPYTHON=$EPYTHON"
@@ -722,26 +724,25 @@ case "$CMDLINE" in
   *break=launcher*) say "BREAK=launcher : shell (exit pour continuer)"; busybox sh ;;
 esac
 
-# diagnostic python AVANT de lancer init.py : message clair + pause si echec
-if ! /usr/bin/python3 -c "import sys" 2>/tmp/pyerr; then
-  say "ECHEC : /usr/bin/python3 ne demarre PAS. Detail :"
-  busybox cat /tmp/pyerr
-  busybox cat /tmp/pyerr > /dev/kmsg 2>/dev/null
-  say "Tentative avec python3.14 direct..."
-  if ! /usr/bin/python3.14 -c "import sys" 2>/tmp/pyerr2; then
-    busybox cat /tmp/pyerr2
-    pause "python INUTILISABLE. Shell de secours ensuite."
-    exec busybox sh
-  else
-    say "python3.14 OK ! on l'utilise directement (wrapper contourne)."
-    exec /usr/bin/python3.14 /init.py "$@"
-  fi
+# Test python SANS redirection fichier (la sortie va directement a la console).
+# On teste le wrapper python3 ; s'il echoue, on bascule sur python3.14 (vrai
+# ELF). NE PAS faire dependre la decision d'une redirection (cause du faux
+# echec precedent : /tmp absent).
+say "test de /usr/bin/python3..."
+if /usr/bin/python3 -c "import sys, threading; threading.Thread(target=lambda:None).start()"; then
+  say "python3 OK, lancement de init.py..."
+  exec /usr/bin/python3 /init.py "$@"
 fi
 
-say "python OK, lancement de init.py..."
-exec /usr/bin/python3 /init.py "$@"
+say "python3 (wrapper) KO -> essai /usr/bin/python3.14 (vrai ELF)..."
+if /usr/bin/python3.14 -c "import sys, threading; threading.Thread(target=lambda:None).start()"; then
+  say "python3.14 OK, lancement de init.py..."
+  exec /usr/bin/python3.14 /init.py "$@"
+fi
 
-say "ECHEC exec -- shell de secours."
+say "AUCUN python utilisable. Diagnostic :"
+/usr/bin/python3.14 -c "import sys" || true
+say "shell de secours (busybox) -- inspecte /usr/bin, /usr/lib64, ldd."
 exec busybox sh
 """
         dst_init = f"{stage}/init"

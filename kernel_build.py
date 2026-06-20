@@ -49,6 +49,33 @@ def efi_entry(label):
     return m[0] if m else None
 
 
+def purge_our_entries():
+    """Supprime TOUTES les entrees EFI dont le loader pointe vers notre dossier
+    (DEST_DIR, ex EFI/gentoo) : nos vmlinuz-*.efi et anciennes UKI. Repart propre
+    a chaque build -> pas d'accumulation, pas de melange d'anciennes entrees qui
+    pointent vers des fichiers absents ou de mauvaises versions. NE TOUCHE PAS
+    aux entrees tierces (Windows, Debian, firmware...)."""
+    # efibootmgr -v montre le chemin du loader : File(\EFI\gentoo\vmlinuz-...)
+    needle = DEST_DIR.replace("/", "\\").lower()       # ex 'efi\gentoo'
+    verbose = out(["efibootmgr", "-v"])
+    removed = []
+    for line in verbose.splitlines():
+        m = re.match(r"^Boot([0-9A-Fa-f]{4})\*?\s+(.*)", line)
+        if not m:
+            continue
+        bootnum, rest = m.group(1), m.group(2).lower()
+        # supprimer si le loader pointe vers notre dossier
+        if needle in rest:
+            run(["efibootmgr", "-b", bootnum, "-B"])
+            removed.append(bootnum)
+    if removed:
+        msg(f"purge entrees EFI obsoletes (notre dossier) : {', '.join(removed)}")
+    else:
+        msg("aucune ancienne entree EFI a purger")
+    return removed
+
+
+
 def ensure_efivarfs():
     """efibootmgr a besoin de /sys/firmware/efi/efivars monte (sinon exit 2
     'EFI variables are not supported'). On le monte si besoin (en chroot il ne
@@ -196,6 +223,9 @@ def main():
         sys.exit("efivarfs indisponible : impossible d'ecrire les variables EFI.\n"
                  "  En chroot, monte-le avant : "
                  "mount -t efivarfs efivarfs /sys/firmware/efi/efivars")
+    # NETTOYAGE : degager TOUTES nos anciennes entrees (pointant vers DEST_DIR)
+    # avant d'en recreer -> repart propre, pas de melange d'anciennes versions.
+    purge_our_entries()
     efi_dir = DEST_DIR.replace("/", "\\")
     label = f"Gentoo-{kver}"
     old = efi_entry(label)

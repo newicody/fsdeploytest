@@ -350,6 +350,47 @@ def bundle_python(stage):
     msg(f"python embarque (ecosysteme complet, stdlib {stdlib})")
 
 
+def bundle_critical_libs(stage):
+    """Embarque les bibliotheques chargees DYNAMIQUEMENT a l'execution (dlopen),
+    que ldd NE liste PAS et que copy_with_deps rate donc :
+      - libgcc_s.so.1 : requise par pthread_exit / gestion d'exceptions
+        ('libgcc_s.so.1 must be installed for pthread_exit to work' sinon).
+      - libnss_files / libnss_dns / libresolv : resolution noms/utilisateurs.
+    Ces libs sont indispensables des que Python utilise threads ou reseau."""
+    import glob
+    patterns = [
+        "/usr/lib*/libgcc_s.so*", "/lib*/libgcc_s.so*",
+        "/usr/lib/gcc/*/*/libgcc_s.so*",       # emplacement Gentoo (gcc-specific)
+        "/usr/lib*/libnss_files.so*", "/lib*/libnss_files.so*",
+        "/usr/lib*/libnss_dns.so*", "/lib*/libnss_dns.so*",
+        "/usr/lib*/libresolv.so*", "/lib*/libresolv.so*",
+    ]
+    found = []
+    for pat in patterns:
+        for lib in glob.glob(pat):
+            if os.path.isfile(lib) or os.path.islink(lib):
+                # copier la cible reelle + recreer le lien SONAME
+                real = os.path.realpath(lib)
+                copy(real, stage)
+                if os.path.islink(lib):
+                    _copy_symlink(lib, stage)
+                # recreer aussi le nom demande (ex libgcc_s.so.1) s'il differe
+                dst_named = stage + lib
+                if not os.path.lexists(dst_named):
+                    os.makedirs(os.path.dirname(dst_named), exist_ok=True)
+                    try:
+                        os.symlink(os.path.basename(real), dst_named)
+                    except OSError:
+                        copy(real, stage)
+                found.append(os.path.basename(lib))
+    if any("libgcc_s" in f for f in found):
+        msg(f"libs critiques (dlopen) embarquees : {', '.join(sorted(set(found)))}")
+    else:
+        msg("ATTENTION : libgcc_s.so.1 INTROUVABLE -> threads Python casses "
+            "('pthread_exit'). Installe gcc/libgcc sur la machine de build.")
+    return found
+
+
 def bundle_busybox(stage):
     bb = which("busybox")
     if not bb:
@@ -535,13 +576,19 @@ def main():
 
         bundle_python(stage)
         bundle_busybox(stage)        # AVANT l'auto-test : le lanceur /init = busybox sh
+        bundle_critical_libs(stage)  # libgcc_s.so.1 (dlopen, pthread_exit) + nss
         # AUTO-TEST CRITIQUE : le python embarque s'execute-t-il REELLEMENT dans
         # l'environnement de l'initramfs ? (chroot = exactement ce que fait le
         # noyau au boot). Detecte le piege python-exec et les .so manquantes
         # AVANT de produire une image qui paniquerait en silence au boot.
         # On teste VIA L'ENVIRONNEMENT DU LANCEUR (EPYTHON defini), exactement
         # comme au boot : chroot + EPYTHON + /usr/bin/python3 (le wrapper).
-        test_code = "import ctypes, fcntl, os, subprocess, sys; print('PYOK')"
+        # inclut threading : un thread qui demarre+joint force le chargement de
+        # libgcc_s.so.1 (pthread). Attrape le bug 'libgcc_s must be installed'
+        # au BUILD plutot qu'au boot.
+        test_code = ("import ctypes, fcntl, os, subprocess, sys, threading\n"
+                     "t = threading.Thread(target=lambda: None); t.start(); t.join()\n"
+                     "print('PYOK')")
         epython = determine_epython()
         env = dict(os.environ, EPYTHON=epython,
                    PATH="/usr/sbin:/usr/bin:/sbin:/bin",

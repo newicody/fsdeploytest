@@ -157,16 +157,42 @@ def main():
         start_wayland_stream(key)
         os._exit(0)
 
-    # compositeur kiosk (remplace l'image du PID 1)
-    if which("cage"):
-        log("demarrage cage")
-        os.execvp("cage", ["cage", "--", "foot"])
-    elif which("sway"):
-        log("demarrage sway")
-        os.execvp("sway", ["sway"])
-    else:
-        log("aucun compositeur (cage/sway) -> shell")
-        os.execvp("sh", ["sh"])
+    # Compositeur kiosk. CRITIQUE : on ne fait PLUS 'execvp' direct (qui
+    # remplacerait PID 1 par cage -> si cage echoue a creer son backend wlroots,
+    # PID 1 meurt -> KERNEL PANIC). On lance en SOUS-PROCESSUS, on surveille, et
+    # en cas d'echec on retombe sur un shell. PID 1 ne quitte JAMAIS.
+    def run_compositor():
+        if which("cage"):
+            log("demarrage cage (compositeur kiosk)")
+            return subprocess.run(["cage", "--", "foot"]).returncode
+        if which("sway"):
+            log("demarrage sway")
+            return subprocess.run(["sway"]).returncode
+        log("aucun compositeur (cage/sway) installe")
+        return 127
+
+    rc = run_compositor()
+    if rc != 0:
+        # Causes frequentes du 'unable to create the wlroots backend' :
+        #  - nomodeset (profil safe) : pas de KMS -> pas de /dev/dri -> wlroots KO
+        #  - /dev/dri/card0 absent ou droits manquants (seatd/groupe video)
+        #  - GPU non initialise (i915/xe force_probe)
+        log("=" * 56)
+        log(f"COMPOSITEUR ECHEC (rc={rc}). Causes probables :")
+        log("  - boote en 'nomodeset' (profil safe) ? -> pas de KMS, wlroots")
+        log("    ne peut pas creer de backend DRM. Boote un profil avec KMS.")
+        has_dri = os.path.exists("/dev/dri/card0")
+        log(f"  - /dev/dri/card0 present : {has_dri}")
+        if not has_dri:
+            log("    -> AUCUN device DRM : c'est la cause. Verifie i915/xe et")
+            log("       que tu n'es PAS en nomodeset.")
+        log("  Bascule sur un SHELL de maintenance (PID 1 reste vivant).")
+        log("=" * 56)
+        # PID 1 doit survivre : on relance un shell en boucle (exit -> re-shell).
+        while True:
+            subprocess.run(["sh"])
+            log("shell quitte ; relance (PID 1 doit rester vivant). "
+                "Eteins via 'poweroff -f' si besoin.")
 
 
 if __name__ == "__main__":

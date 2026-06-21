@@ -350,6 +350,43 @@ def bundle_python(stage):
     msg(f"python embarque (ecosysteme complet, stdlib {stdlib})")
 
 
+def _is_dynamic_elf(path):
+    """True si l'ELF a un segment PT_INTERP (interpreteur dynamique = binaire
+    DYNAMIQUE). False = statique. Methode fiable, langue-independante (lit les
+    octets de l'en-tete ELF, ne parse aucun texte localise de ldd).
+    Parse minimal de l'en-tete ELF + table des program headers."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(64)
+            if data[:4] != b"\x7fELF":
+                return False                      # pas un ELF
+            is64 = data[4] == 2                   # EI_CLASS: 2=64-bit
+            le = data[5] == 1                     # EI_DATA: 1=little-endian
+            order = "little" if le else "big"
+            if is64:
+                e_phoff = int.from_bytes(data[32:40], order)
+                e_phentsize = int.from_bytes(data[54:56], order)
+                e_phnum = int.from_bytes(data[56:58], order)
+            else:
+                e_phoff = int.from_bytes(data[28:32], order)
+                e_phentsize = int.from_bytes(data[42:44], order)
+                e_phnum = int.from_bytes(data[44:46], order)
+            if not e_phoff or not e_phnum:
+                return False
+            with open(path, "rb") as f2:
+                f2.seek(e_phoff)
+                for _ in range(e_phnum):
+                    ph = f2.read(e_phentsize)
+                    if len(ph) < 4:
+                        break
+                    p_type = int.from_bytes(ph[0:4], order)
+                    if p_type == 3:               # PT_INTERP = 3 -> dynamique
+                        return True
+            return False                          # aucun PT_INTERP -> statique
+    except OSError:
+        return False
+
+
 def bundle_critical_libs(stage):
     """Embarque les bibliotheques chargees DYNAMIQUEMENT a l'execution (dlopen),
     que ldd NE liste PAS et que copy_with_deps rate donc :
@@ -692,16 +729,19 @@ def main():
             os.makedirs(f"{stage}/usr/bin", exist_ok=True)
             shutil.copy2(FFMPEG_STATIC, f"{stage}/usr/bin/ffmpeg")
             os.chmod(f"{stage}/usr/bin/ffmpeg", 0o755)
-            # verif rapide : binaire statique (sinon il faudrait ses libs)
-            try:
-                ld = subprocess.run(["ldd", FFMPEG_STATIC],
-                                    capture_output=True, text=True)
-                if "not a dynamic executable" not in (ld.stdout + ld.stderr):
-                    msg("ATTENTION: ffmpeg fourni semble DYNAMIQUE -- privilegie "
-                        "un build statique (ffmpeg-git static), sinon libs manquantes")
-            except Exception:
-                pass
-            msg("ffmpeg statique inclus (stream console de boot des l'init)")
+            # DETECTION STATIQUE FIABLE (langue-independante) : on lit l'en-tete
+            # ELF et on cherche un segment PT_INTERP (interpreteur dynamique).
+            # Absent => binaire STATIQUE. (L'ancien test parsait le texte de ldd
+            # 'not a dynamic executable', qui est traduit en FR -> faux positif.)
+            if _is_dynamic_elf(FFMPEG_STATIC):
+                msg("ATTENTION: ffmpeg fourni est DYNAMIQUE (a un interpreteur "
+                    "ELF) -- ses .so manqueront dans l'initramfs. Fournis un "
+                    "build STATIQUE (ffmpeg-git static) pour le stream de boot.")
+                # embarquer ses libs malgre tout (best effort)
+                copy_with_deps(os.path.realpath(FFMPEG_STATIC), stage)
+            else:
+                msg("ffmpeg statique inclus (verifie ELF: pas d'interpreteur) "
+                    "-- stream console de boot OK")
         else:
             msg("ATTENTION: ffmpeg NON inclus -> PAS de stream pendant l'initramfs. "
                 "Fournis FFMPEG_STATIC=/chemin/ffmpeg (build statique) pour "

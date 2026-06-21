@@ -27,12 +27,14 @@ ROOTFS_SFS  = "rootfs.sfs"
 MODULES_SFS = f"modules-{KVER}.sfs"
 NEWROOT     = "/mnt/root"
 
+# Import RAPIDE : -d cible sur les seuls devices des pools (evite de scanner tout
+# /dev y compris l'ISO live -> import qui passe de ~37s a <1s). Les chemins sont
+# ceux des partitions ZFS reelles (cf. blkid). On limite le scan a /dev/disk/by-id
+# si dispo (stable), sinon aux partitions listees. NB: -d peut etre repete.
+IMPORT_SCAN_DIRS = ["/dev"]          # rempli plus finement par _scan_dirs()
+DATA_POOL   = "data_pool"            # importe aussi (donnees : home, log, archives)
+
 # --- mode secours (degrade niveau 1) -----------------------------------------
-# fast_pool est un STRIPE (zero redondance) : si un NVMe lache, le pool est
-# perdu. On bascule alors sur le master durable de boot_pool (mirror). Les
-# overlays (upper) de fast_pool sont definitivement perdus -> tmpfs neuf, et on
-# l'affiche clairement. Ce n'est pas une continuite, c'est un systeme pour
-# diagnostiquer/restaurer.
 RESCUE_POOL    = "boot_pool"
 RESCUE_SFS_DS  = f"{RESCUE_POOL}/images"
 RESCUE_ROOTFS  = "rootfs.sfs"
@@ -338,6 +340,90 @@ def remount_to(dataset, target, allow_nonempty=False):
     return False
 
 
+def _scan_dirs():
+    """Repertoires/devices a passer en -d a zpool import : on CIBLE les devices
+    des pools au lieu de scanner tout /dev (qui inclut l'ISO live -> ~37s/pool).
+    Prefere /dev/disk/by-id (stable). Retourne une liste d'arguments -d."""
+    candidates = ["/dev/disk/by-id", "/dev/disk/by-partuuid"]
+    dirs = [d for d in candidates if os.path.isdir(d) and os.listdir(d)]
+    if dirs:
+        args = []
+        for d in dirs:
+            args += ["-d", d]
+        return args
+    return ["-d", "/dev"]              # repli : au moins /dev (mieux que rien)
+
+
+def import_pool(pool, mount=False):
+    """Importe `pool` RAPIDEMENT. Strategie :
+      1. cachefile /etc/zfs/zpool.cache s'il existe (instantane, pas de scan) ;
+      2. sinon -d cible (by-id/by-partuuid) au lieu de tout /dev.
+    -N = ne pas monter (on monte ensuite dans l'ordre). Retourne 0 si OK."""
+    if os.path.exists("/etc/zfs/zpool.cache"):
+        rc = run(["zpool", "import", "-c", "/etc/zfs/zpool.cache",
+                  "-N", "-f", pool])
+        if rc == 0:
+            return 0
+        log(f"  cachefile inutilisable pour {pool}, scan cible...")
+    flag = [] if mount else ["-N"]
+    return run(["zpool", "import"] + _scan_dirs() + flag + ["-f", pool])
+
+
+def mount_zfs_dataset(dataset, target):
+    """Monte un dataset a `target`, que son mountpoint soit 'legacy' OU un chemin.
+    mount.zfs gere les deux si on lui donne la cible explicite. Retourne True/False.
+    (Corrige le bug : 'mount.zfs fast_pool/sfs /mnt/sfs' echouait quand le
+    mountpoint != legacy ; on force via -o zfsutil pour les non-legacy.)"""
+    os.makedirs(target, exist_ok=True)
+    mp = zfs_mountpoint(dataset)
+    if mp == "legacy":
+        return run(["mount.zfs", dataset, target]) == 0
+    # non-legacy : mount.zfs accepte -o zfsutil pour monter a une cible arbitraire
+    if run(["mount.zfs", "-o", "zfsutil", dataset, target]) == 0:
+        return True
+    # repli : laisser zfs monter a son mountpoint naturel puis bind
+    return remount_to(dataset, target, allow_nonempty=True)
+
+
+def list_pool_datasets(pool):
+    """Datasets du pool TRIES par profondeur (parent avant enfant). Indispensable :
+    boot_pool doit etre monte avant boot_pool/images, etc."""
+    rc, out = capture(["zfs", "list", "-H", "-o", "name", "-r", pool])
+    if rc != 0:
+        return []
+    names = [n for n in out.splitlines() if n.strip()]
+    # tri par nombre de '/' (profondeur) puis alphabetique -> parent en premier
+    names.sort(key=lambda n: (n.count("/"), n))
+    return names
+
+
+def mount_pool_recursive(pool, under):
+    """Monte TOUS les datasets montables d'un pool SOUS `under`, dans l'ordre
+    parent->enfant. Un dataset dont le PARENT a echoue est saute (dependance).
+    mountpoint=none/legacy traites correctement. Retourne (ok:set, failed:set)."""
+    ok, failed = set(), set()
+    for ds in list_pool_datasets(pool):
+        parent = ds.rsplit("/", 1)[0] if "/" in ds else None
+        if parent and parent in failed:
+            log(f"  [skip] {ds} : parent {parent} non monte (dependance)")
+            failed.add(ds)
+            continue
+        mp = zfs_mountpoint(ds)
+        if mp == "none":
+            ok.add(ds)                # 'none' = conteneur, rien a monter, OK
+            continue
+        # cible sous `under` : on reproduit l'arborescence relative au pool
+        rel = ds[len(pool):].lstrip("/")
+        target = os.path.join(under, rel) if rel else under
+        if mount_zfs_dataset(ds, target):
+            ok.add(ds)
+            log(f"  monte {ds} -> {target}")
+        else:
+            failed.add(ds)
+            log(f"  [!] {ds} NON monte")
+    return ok, failed
+
+
 def disk_inventory():
     """Liste les disques physiques vus par le noyau (hors loop/ram/zram)."""
     disks = []
@@ -505,6 +591,12 @@ def ds_exists(dataset):
     return rc == 0
 
 
+def pool_imported(pool):
+    """Le pool est-il importe (visible par zpool list) ?"""
+    rc, _ = capture(["zpool", "list", "-H", "-o", "name", pool])
+    return rc == 0
+
+
 def writable_test(path):
     """Verifie qu'on peut reellement ecrire sous path (detecte un FS monte
     mais corrompu/lecture seule). Retourne True si OK."""
@@ -664,10 +756,10 @@ def main():
     # --- 3. import pool : fast_pool, sinon SECOURS sur boot_pool ------------
     rescue = False
     sfs_ds, rootfs_name = SFS_DS, ROOTFS_SFS
-    if run(["zpool", "import", "-N", "-f", POOL]) == 0:
+    if import_pool(POOL) == 0:
         health_check()
-        os.makedirs("/mnt/sfs", exist_ok=True)
-        if run(["mount.zfs", SFS_DS, "/mnt/sfs"]) != 0:
+        # mount_zfs_dataset gere mountpoint != legacy (fast_pool/sfs = /fast_pool/sfs)
+        if not mount_zfs_dataset(SFS_DS, "/mnt/sfs"):
             log(f"!! {SFS_DS} non montable malgre l'import -> SECOURS")
             rescue = True
     else:
@@ -681,14 +773,25 @@ def main():
         log("  -> les donnees de fast_pool (var/rootfs/tmp) sont perdues.")
         log("  -> remplace le NVMe et restaure depuis boot_pool/data_pool.")
         log("=" * 56)
-        if run(["zpool", "import", "-N", "-f", RESCUE_POOL]) != 0:
+        if import_pool(RESCUE_POOL) != 0:
             die(f"import {RESCUE_POOL} (secours) echoue : aucun rootfs disponible")
-        os.makedirs("/mnt/sfs", exist_ok=True)
-        if run(["mount.zfs", RESCUE_SFS_DS, "/mnt/sfs"]) != 0:
+        if not mount_zfs_dataset(RESCUE_SFS_DS, "/mnt/sfs"):
             die(f"mount {RESCUE_SFS_DS} (secours) echoue")
         sfs_ds, rootfs_name = RESCUE_SFS_DS, RESCUE_ROOTFS
     log(f"source rootfs : {sfs_ds}/{rootfs_name}"
         + ("  [SECOURS]" if rescue else ""))
+
+    # --- 3bis. import data_pool (donnees : home, log, archives) -------------
+    # Non bloquant : si data_pool manque, le systeme boote quand meme (mais sans
+    # /home etc.). Monte recursivement plus tard, apres switch_root, ou ici sous
+    # NEWROOT une fois l'overlay pret. On l'importe maintenant (rapide) pour que
+    # les datasets soient disponibles ; le montage ordonne se fait apres overlay.
+    if not rescue:
+        if import_pool(DATA_POOL) == 0:
+            log(f"{DATA_POOL} importe (datasets disponibles pour montage ordonne)")
+        else:
+            log(f"[!] import {DATA_POOL} echoue -> /home et donnees indisponibles "
+                f"(non bloquant pour le boot)")
 
     # --- 4. overlay racine : lower=rootfs.sfs (ro) + upper -----------------
     debug_shell("overlay")
@@ -743,6 +846,13 @@ def main():
     os.makedirs("/mnt/ovl/upper", exist_ok=True)
     os.makedirs("/mnt/ovl/work", exist_ok=True)
     sfs_path = f"/mnt/sfs/{rootfs_name}"
+    # GARDE DEPENDANCE : /mnt/sfs doit etre un VRAI point de montage (le dataset
+    # sfs monte), pas un repertoire vide. Sinon l'overlay s'appuierait sur un
+    # lower fantome -> systeme casse silencieusement.
+    if not os.path.ismount("/mnt/sfs"):
+        die("DEPENDANCE MANQUANTE : /mnt/sfs n'est pas monte (le dataset sfs "
+            "n'a pas ete monte). Impossible d'assembler l'overlay racine.\n"
+            "  Verifie l'import du pool et le mountpoint du dataset sfs.")
     if not os.path.exists(sfs_path):
         # CAUSE FREQUENTE : l'image n'a jamais ete creee (build incomplet, ou
         # mksquashfs jamais lance). Sans lower, pas de rootfs -> on l'explique
@@ -780,6 +890,24 @@ def main():
                     f"{ds} existe mais remontage vers {tgt} echoue (corruption ?)")
     elif not rescue:
         degraded_reasons.append("couches var/log + usr-src non montees (upper degrade)")
+
+    # --- 4bis-2. data_pool : montage recursif ORDONNE sous NEWROOT ----------
+    # home, log, archives... Parent monte avant enfant (dependance). Un dataset
+    # dont le parent a echoue est saute. Non bloquant : le systeme boote meme si
+    # data_pool est partiel (mais on le consigne en degrade pour les datasets
+    # critiques). data_pool/home -> NEWROOT/home, etc. selon mountpoint.
+    if not rescue and pool_imported(DATA_POOL):
+        log(f"montage recursif ordonne de {DATA_POOL} sous {NEWROOT}...")
+        # cible : on respecte le mountpoint du dataset s'il pointe deja vers un
+        # chemin systeme (ex /data_pool/home -> NEWROOT/data_pool/home), sinon
+        # on derive du nom. mount_pool_recursive gere l'ordre + les dependances.
+        ok_ds, failed_ds = mount_pool_recursive(DATA_POOL, f"{NEWROOT}/mnt/data")
+        if failed_ds:
+            log(f"[!] {len(failed_ds)} dataset(s) data_pool non monte(s) : "
+                f"{', '.join(sorted(failed_ds))}")
+            # les datasets data_pool sont non-critiques (cf. infra.conf) -> warning
+        else:
+            log(f"data_pool monte ({len(ok_ds)} datasets, ordre parent->enfant OK)")
 
     # --- 4ter. mode degrade : rapport + temoin (session de reparation) ------
     degraded = rescue or bool(degraded_reasons)

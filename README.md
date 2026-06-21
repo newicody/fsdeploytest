@@ -766,13 +766,65 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > for pthread_exit to work »), **`libresolv.so.2`** + `libnss_*` (résolution
 > réseau pour busybox et python). `build_initramfs` les embarque **explicitement**
 > (`bundle_critical_libs`), **avec toute la chaîne de liens SONAME** (ex
-> `libresolv.so → libresolv.so.2 → libresolv-2.XX.so`), sinon le loader cherche
-> le SONAME et échoue. Deux auto-tests au build : `busybox true` (charge ses
+> `libresolv.so → libresolv.so.2`), **et les copie dans `/usr/lib64`** (un chemin
+> du `LD_LIBRARY_PATH`). Crucial : sur Gentoo, `libgcc_s.so.1` vit dans
+> `/usr/lib/gcc/<triplet>/<ver>/`, **hors** du chemin de recherche du loader —
+> sans recopie dans `/usr/lib64`, la lib est dans l'initramfs mais **introuvable**
+> au runtime. Deux auto-tests au build : `busybox true` (charge ses
 > `.so`) et python+thread — le build s'arrête si une lib manque.
 >
 > **`break=launcher`** : un shell s'ouvre dans le lanceur **avant** python — un
 > filet de debug qui marche même si python est cassé (contrairement à
 > `break=<etape>` qui est dans init.py donc nécessite que python démarre).
+>
+> **Import des pools** : `init.py` fait `zpool import -N -f <pool>` (comme un
+> import manuel qui marche), **sans** `-d /dev`. Le `-d /dev` restreignait le
+> scan aux devices de `/dev` uniquement ; le laisser par défaut permet à ZFS de
+> scanner tous les chemins (partitions, by-id…), comme `zpool import -f -N` en
+> ligne de commande. `-N` = importer sans monter (init.py monte ensuite via
+> `mount.zfs` explicite, canonique pour `mountpoint=legacy`).
+>
+> **Import RAPIDE (`-d` ciblé)** : scanner tout `/dev` au boot prenait ~37 s/pool
+> (il inclut l'ISO live, toutes les partitions…). `import_pool` cible
+> `/dev/disk/by-id` puis `/dev/disk/by-partuuid` (ne contiennent que les
+> partitions réelles) → import quasi instantané. Repli sur `/dev` si ces dossiers
+> manquent.
+>
+> **Montage gérant `mountpoint != legacy`** : `fast_pool/sfs` a
+> `mountpoint=/fast_pool/sfs` (pas `legacy`), donc `mount.zfs sfs /mnt/sfs`
+> échouait (« non montable »). `mount_zfs_dataset` ajoute `-o zfsutil` pour les
+> datasets non-legacy → monte à la cible quel que soit le mountpoint.
+>
+> **`data_pool` importé + montage récursif ORDONNÉ** : `data_pool` (home, log,
+> archives) est désormais importé et monté sous `NEWROOT` via
+> `mount_pool_recursive`, qui trie les datasets par profondeur (**parent monté
+> avant enfant** : `boot_pool` avant `boot_pool/images`) et **saute** un dataset
+> dont le parent a échoué. `mountpoint=none` = conteneur, rien à monter.
+>
+> **Garde overlay** : avant d'assembler l'overlay racine, init.py vérifie que
+> `/mnt/sfs` est un **vrai point de montage** (`os.path.ismount`), pas un
+> répertoire vide — sinon l'overlay s'appuierait sur un lower fantôme. Si une
+> dépendance manque, on s'arrête proprement avec un message au lieu d'un système
+> cassé en silence.
+>
+> **Détection ffmpeg statique FIABLE** : l'ancien test parsait le texte de `ldd`
+> (« not a dynamic executable »), **traduit en français** → faux positif.
+> `_is_dynamic_elf` lit désormais l'**en-tête ELF** et cherche un segment
+> `PT_INTERP` (interpréteur dynamique). Absent = statique. Langue-indépendant.
+>
+> **`zpool upgrade` (warning bénin)** : `zpool status` signale que des features
+> ne sont pas activées sur les pools (créés avec une version ZFS antérieure). Le
+> pool **fonctionne normalement** ; c'est un avertissement, pas une erreur. Lance
+> `zpool upgrade <pool>` si tu veux activer les features récentes (attention :
+> le pool ne sera plus accessible par une version ZFS plus ancienne).
+>
+> **Stream console optionnel** : le stream de boot (ffmpeg vers YouTube) est une
+> commodité, pas une nécessité. Il ne démarre **que si `stream` est dans la
+> cmdline**. Par défaut il est désactivé — un point de crash en moins pendant le
+> debug (ffmpeg avait fait un *general protection fault* tôt au boot, qui se
+> trouvait dans la même séquence que l'échec d'import ZFS mais en était
+> **indépendant** : deux problèmes séparés). Ajoute `stream` à la cmdline pour
+> l'activer une fois le système stable.
 >
 > **Robustesse du lanceur** (leçons de debug réel) :
 > - **busybox** est copié à `/bin/busybox` **ET** `/sbin/busybox` (Gentoo le met

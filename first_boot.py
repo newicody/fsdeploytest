@@ -603,6 +603,14 @@ def main():
     ap.add_argument("--force-live", action="store_true",
                     help="autorise rootfs.sfs depuis une racine non nettoyee "
                          "(sans marqueur clean_rootfs)")
+    ap.add_argument("--appliance-ref", default=None,
+                    help="repertoire des scripts appliance a jour "
+                         "(session_launch.py, boot_confirm.py) a deployer dans le "
+                         "rootfs avant de figer le sfs. Defaut : dossier de first_boot.")
+    ap.add_argument("--no-force-sfs", dest="force_sfs", action="store_false",
+                    help="ne PAS recreer rootfs.sfs s'il existe deja "
+                         "(par defaut on le recree pour deployer les scripts a jour)")
+    ap.set_defaults(force_sfs=True)
     ap.add_argument("--repo", default=None, help="owner/name (surcharge [git].repo)")
     ap.add_argument("--owner", default=None,
                     help="proprietaire du Project (surcharge [git].project_owner)")
@@ -694,9 +702,15 @@ def main():
     # rootfs.sfs : le creer s'il est absent (sinon init.py ne peut pas monter /)
     if a.rootfs_src:
         import sfs_build
+        # ref_dir : ou trouver session_launch.py/boot_confirm.py A JOUR a deployer
+        # dans le rootfs avant de figer. Defaut = repertoire de first_boot.py.
+        ref = getattr(a, "appliance_ref", None) or os.path.dirname(
+            os.path.abspath(__file__))
         rs = sfs_build.build_rootfs_sfs(a.rootfs_src, "fast_pool/sfs",
                                         log=lambda m: print("   " + m, flush=True),
-                                        force_live=getattr(a, "force_live", False))
+                                        force=getattr(a, "force_sfs", True),
+                                        force_live=getattr(a, "force_live", False),
+                                        ref_dir=ref)
         if not rs.ok:
             print(f"!! creation rootfs.sfs echouee : {rs.reason}", flush=True)
             _push_failure(rep, repo, f"rootfs.sfs : {rs.reason}")
@@ -704,8 +718,20 @@ def main():
             sys.exit(3)
         rep.ok(f"rootfs.sfs : {rs.path} ({rs.size_mb} Mo)")
     else:
-        rep.warn("--rootfs-src non fourni : rootfs.sfs suppose deja present "
-                 "(verifie qu'il existe dans fast_pool/sfs !)")
+        rep.warn("--rootfs-src NON fourni : rootfs.sfs PAS regenere.")
+        rep.warn("  => session_launch.py / boot_confirm.py NE SONT PAS mis a jour "
+                 "dans le sfs : le boot utilisera l'ANCIENNE version figee.")
+        rep.warn("  => Si tu viens de modifier ces scripts, relance AVEC "
+                 "--rootfs-src <racine> pour qu'ils soient redeployes + refiges.")
+        # detecter un piege frequent : scripts modifies recemment mais sfs pas refait
+        here = os.path.dirname(os.path.abspath(__file__))
+        for s in ("session_launch.py", "boot_confirm.py"):
+            p = os.path.join(here, s)
+            if os.path.isfile(p):
+                age_h = (time.time() - os.path.getmtime(p)) / 3600.0
+                if age_h < 24:
+                    rep.warn(f"  [!] {s} modifie il y a {age_h:.1f} h mais sfs NON "
+                             f"regenere -> ta modif N'IRA PAS au boot sans --rootfs-src.")
     built = run_build(a.config, rep, src=a.src, infra_conf=a.infra)
     write_report(rep)
     if not built:

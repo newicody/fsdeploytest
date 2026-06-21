@@ -191,6 +191,70 @@ def setup_dev():
     log(f"/dev/dri/card0 present apres setup : {os.path.exists('/dev/dri/card0')}")
 
 
+def locale_available(loc):
+    """La locale est-elle GENEREE dans le rootfs ? (sinon LANG=... -> warnings
+    'cannot set LC_*'). On interroge 'locale -a'."""
+    try:
+        out = subprocess.run(["locale", "-a"], capture_output=True, text=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    norm = loc.lower().replace("-", "").replace("_", "")
+    for line in out.splitlines():
+        if line.lower().replace("-", "").replace("_", "") == norm:
+            return True
+    return False
+
+
+def setup_environment():
+    """Initialise l'environnement systeme + Wayland pour PID 1 et ses enfants
+    (seatd, cage, et XWayland plus tard). On NE source PAS /etc/profile en bloc
+    (concu pour un shell de login, inadapte/risque pour PID 1) : on definit
+    EXPLICITEMENT ce dont le compositeur a besoin. Les shells interactifs
+    (maintenance, foot) sourceront /etc/profile via 'sh -l'."""
+    # 1. base systeme (ce que /etc/profile fournit). root, pas de home perso ici.
+    base = {
+        "HOME": "/root",
+        "USER": "root",
+        "LOGNAME": "root",
+        "SHELL": "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh",
+        "TERM": os.environ.get("TERM", "linux"),
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "XDG_CACHE_HOME": "/root/.cache",   # cache shader Mesa, etc.
+        "XDG_CONFIG_HOME": "/root/.config",
+        "XDG_DATA_HOME": "/root/.local/share",
+    }
+    for k, v in base.items():
+        os.environ.setdefault(k, v)
+    os.makedirs("/root/.cache", exist_ok=True)
+
+    # 2. locale fr_FR.UTF-8 SI generee, sinon repli C.UTF-8 (evite les warnings
+    #    'cannot set LC_*' quand la locale n'est pas compilee dans le rootfs).
+    want = "fr_FR.UTF-8"
+    if locale_available(want):
+        loc = want
+    elif locale_available("C.UTF-8"):
+        loc = "C.UTF-8"
+        log(f"[!] {want} non generee dans le rootfs -> repli C.UTF-8. "
+            f"(genere-la : echo 'fr_FR.UTF-8 UTF-8' >> /etc/locale.gen ; locale-gen)")
+    else:
+        loc = "C"
+        log("[!] ni fr_FR.UTF-8 ni C.UTF-8 generees -> LANG=C (ASCII).")
+    os.environ["LANG"] = loc
+    os.environ["LC_ALL"] = loc
+
+    # 3. Wayland : type de session + bureau (utile a cage, XWayland, portails).
+    #    XDG_RUNTIME_DIR est defini juste apres (depend de RUNTIME_DIR).
+    os.environ.setdefault("XDG_SESSION_TYPE", "wayland")
+    os.environ.setdefault("XDG_CURRENT_DESKTOP", "cage")
+    os.environ.setdefault("MOZ_ENABLE_WAYLAND", "1")   # si firefox un jour
+    os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
+    os.environ.setdefault("GDK_BACKEND", "wayland,x11")
+    os.environ.setdefault("SDL_VIDEODRIVER", "wayland")
+    # XWayland (a venir) : Xwayland exporte DISPLAY=:0 ; on ne le force pas ici.
+
+    log(f"environnement initialise (LANG={loc}, XDG_SESSION_TYPE=wayland)")
+
+
 def main():
     os.environ.setdefault("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
     for src, tgt, fs in (("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs"),
@@ -202,6 +266,9 @@ def main():
     # COMPLETER /dev : liens standards + eudev (cree /dev/dri, /dev/fd...).
     # Sans ca : emerge 'sane /dev' KO, bash process-substitution KO, cage KO.
     setup_dev()
+    # ENVIRONNEMENT : base systeme (HOME/USER/PATH/LANG) + variables Wayland,
+    # pour PID 1 et tous ses enfants (seatd, cage, XWayland a venir).
+    setup_environment()
 
     # MODE DEGRADE : rapport + shell de reparation, pas de session normale
     if os.path.exists("/etc/rescue-mode"):
@@ -260,7 +327,9 @@ def main():
         log("=" * 56)
         # PID 1 doit survivre : on relance un shell en boucle (exit -> re-shell).
         while True:
-            subprocess.run(["sh"])
+            # login shell (-l) -> source /etc/profile (PATH, aliases, profile.d).
+            subprocess.run(["bash", "-l"] if os.path.exists("/bin/bash")
+                           else ["sh", "-l"])
             log("shell quitte ; relance (PID 1 doit rester vivant). "
                 "Eteins via 'poweroff -f' si besoin.")
 

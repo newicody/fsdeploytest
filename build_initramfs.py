@@ -353,41 +353,68 @@ def bundle_python(stage):
 def bundle_critical_libs(stage):
     """Embarque les bibliotheques chargees DYNAMIQUEMENT a l'execution (dlopen),
     que ldd NE liste PAS et que copy_with_deps rate donc :
-      - libgcc_s.so.1 : requise par pthread_exit / gestion d'exceptions
-        ('libgcc_s.so.1 must be installed for pthread_exit to work' sinon).
-      - libnss_files / libnss_dns / libresolv : resolution noms/utilisateurs.
-    Ces libs sont indispensables des que Python utilise threads ou reseau."""
+      - libgcc_s.so.1 : requise par pthread_exit / gestion d'exceptions.
+      - libnss_files / libnss_dns / libresolv : resolution noms/utilisateurs
+        (busybox et python en ont besoin pour le reseau ; chargees via NSS donc
+        invisibles a ldd).
+    Pour CHAQUE lib, on copie le fichier reel ET on recree TOUTE la chaine de
+    liens SONAME (ex libresolv.so -> libresolv.so.2 -> libresolv-2.XX.so), sinon
+    le loader cherche le SONAME (.so.2) et ne le trouve pas."""
     import glob
     patterns = [
         "/usr/lib*/libgcc_s.so*", "/lib*/libgcc_s.so*",
         "/usr/lib/gcc/*/*/libgcc_s.so*",       # emplacement Gentoo (gcc-specific)
         "/usr/lib*/libnss_files.so*", "/lib*/libnss_files.so*",
         "/usr/lib*/libnss_dns.so*", "/lib*/libnss_dns.so*",
+        "/usr/lib*/libnss_compat.so*", "/lib*/libnss_compat.so*",
         "/usr/lib*/libresolv.so*", "/lib*/libresolv.so*",
     ]
     found = []
     for pat in patterns:
         for lib in glob.glob(pat):
-            if os.path.isfile(lib) or os.path.islink(lib):
-                # copier la cible reelle + recreer le lien SONAME
-                real = os.path.realpath(lib)
-                copy(real, stage)
-                if os.path.islink(lib):
-                    _copy_symlink(lib, stage)
-                # recreer aussi le nom demande (ex libgcc_s.so.1) s'il differe
-                dst_named = stage + lib
-                if not os.path.lexists(dst_named):
-                    os.makedirs(os.path.dirname(dst_named), exist_ok=True)
+            if not (os.path.isfile(lib) or os.path.islink(lib)):
+                continue
+            real = os.path.realpath(lib)
+            copy(real, stage)                  # le fichier reel (contenu)
+            # recreer le lien du nom rencontre (ex libresolv.so.2) -> reel
+            ldir = os.path.dirname(lib)
+            for linkname in {os.path.basename(lib),
+                             # deriver le SONAME probable : libX.so.N
+                             re.sub(r"(\.so\.\d+).*$", r"\1", os.path.basename(real))}:
+                if not linkname or linkname == os.path.basename(real):
+                    continue
+                dst_link = stage + os.path.join(ldir, linkname)
+                os.makedirs(os.path.dirname(dst_link), exist_ok=True)
+                if not os.path.lexists(dst_link):
                     try:
-                        os.symlink(os.path.basename(real), dst_named)
+                        os.symlink(os.path.basename(real), dst_link)
                     except OSError:
-                        copy(real, stage)
-                found.append(os.path.basename(lib))
+                        pass
+            found.append(os.path.basename(lib))
+
+    # GARANTIE supplementaire : faire le ldd de busybox ET python pour capturer
+    # toute .so liee (avec recreation SONAME via copy_with_deps deja patchee).
+    for binbase in ("/bin/busybox", "/sbin/busybox", "/usr/bin/python3"):
+        if os.path.exists(stage + binbase):
+            try:
+                out = subprocess.run(["ldd", os.path.realpath(binbase)]
+                                     if os.path.exists(os.path.realpath(binbase))
+                                     else ["true"],
+                                     capture_output=True, text=True).stdout
+                for m in re.finditer(r"(/[^\s]+\.so[^\s]*)", out):
+                    if os.path.exists(m.group(1)):
+                        copy(os.path.realpath(m.group(1)), stage)
+            except OSError:
+                pass
+
     if any("libgcc_s" in f for f in found):
         msg(f"libs critiques (dlopen) embarquees : {', '.join(sorted(set(found)))}")
     else:
-        msg("ATTENTION : libgcc_s.so.1 INTROUVABLE -> threads Python casses "
-            "('pthread_exit'). Installe gcc/libgcc sur la machine de build.")
+        msg("ATTENTION : libgcc_s.so.1 INTROUVABLE -> threads Python casses.")
+    if any("libresolv" in f for f in found):
+        msg(f"libresolv embarquee (+ liens SONAME)")
+    else:
+        msg("ATTENTION : libresolv INTROUVABLE -> reseau busybox/python casse.")
     return found
 
 
@@ -593,6 +620,22 @@ def main():
         env = dict(os.environ, EPYTHON=epython,
                    PATH="/usr/sbin:/usr/bin:/sbin:/bin",
                    LD_LIBRARY_PATH="/usr/lib64:/usr/lib:/lib64:/lib")
+        # TEST BUSYBOX d'abord : 'busybox true' charge ses .so (dont libresolv).
+        # Si une lib manque, busybox echoue avec 'error loading shared libraries'
+        # -> on l'attrape ICI au lieu du panic au boot.
+        try:
+            rb = subprocess.run(["chroot", stage, "/bin/busybox", "true"],
+                                capture_output=True, text=True, timeout=15, env=env)
+            if rb.returncode != 0:
+                sys.exit("ECHEC AUTO-TEST BUSYBOX dans l'initramfs :\n"
+                         f"  stderr: {rb.stderr.strip()}\n"
+                         "  -> une lib (.so) de busybox manque (ex libresolv.so.2). "
+                         "Build INTERROMPU.")
+            msg("auto-test busybox : OK (libs chargees)")
+        except FileNotFoundError:
+            pass                               # chroot indispo : on verra plus bas
+        except subprocess.TimeoutExpired:
+            sys.exit("AUTO-TEST BUSYBOX : timeout.")
         try:
             r = subprocess.run(["chroot", stage, "/usr/bin/python3", "-c",
                                 test_code], capture_output=True, text=True,

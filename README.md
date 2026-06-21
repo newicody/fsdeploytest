@@ -1262,7 +1262,10 @@ toujours de `GITHUB_TOKEN` (jamais dans le fichier).
 > Note : tous les profils pointent vers le **même** `vmlinuz-<ver>` +
 > `initramfs-<ver>` (accordés). Changer de profil change la **cmdline**, pas le
 > couple noyau/initramfs — donc pas de risque de désaccord modules/noyau entre
-> profils.
+> profils. `efibootmgr` (v18) crée chaque entrée même vers le même loader car les
+> cmdlines diffèrent ; les anciens doublons de même label sont supprimés avant
+> recréation, et la création de chaque profil est isolée (un échec n'empêche pas
+> les autres, et son erreur est affichée).
 
 > **Recovery si les entrées ont disparu** : recrée-en une à la main depuis un
 > chroot/USB (adapte disque/partition/version) :

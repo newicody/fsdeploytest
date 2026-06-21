@@ -50,9 +50,9 @@ def efi_entry(label):
 
 
 def efi_entries_all(label):
-    """TOUTES les entrees portant exactement ce label (avec --duplicate, il peut
-    y en avoir plusieurs d'anciens builds). Sert a toutes les supprimer avant de
-    recreer proprement."""
+    """TOUTES les entrees portant exactement ce label (il peut y en avoir
+    plusieurs d'anciens builds). Sert a toutes les supprimer avant de recreer
+    proprement."""
     return re.findall(
         rf"^Boot([0-9A-Fa-f]{{4}})\*?\s+{re.escape(label)}(?:\s|$)",
         out(["efibootmgr"]), re.M)
@@ -292,11 +292,9 @@ def main():
     label = f"Gentoo-{kver}"
     for old in efi_entries_all(label):
         run(["efibootmgr", "-b", old, "-B"])
-    # --duplicate (-D) : FORCER la creation meme si une entree vers le meme
-    # loader existe deja. Sans ca, efibootmgr DEDUPLIQUE sur le path du noyau et
-    # REFUSE les profils (qui pointent tous vers le meme vmlinuz, seule la
-    # cmdline differe) -> une seule entree creee au lieu de toutes.
-    run(["efibootmgr", "--create", "--duplicate", "--disk", DISK, "--part", PART,
+    # efibootmgr 18 cree l'entree meme vers un loader deja reference des lors que
+    # les donnees (cmdline --unicode) different : pas besoin de flag special.
+    run(["efibootmgr", "--create", "--disk", DISK, "--part", PART,
          "--label", label,
          "--loader", f"\\{efi_dir}\\vmlinuz-{kver}.efi",
          "--unicode", f"initrd=\\{efi_dir}\\initramfs-{kver}.zst {CMDLINE}"])
@@ -374,7 +372,7 @@ def main():
                     # creation : capturer l'erreur PAR PROFIL (un echec n'arrete
                     # pas les autres) et MONTRER la vraie sortie efibootmgr.
                     create_cmd = [
-                        "efibootmgr", "--create", "--duplicate",
+                        "efibootmgr", "--create",
                         "--disk", disk, "--part", part,
                         "--label", lbl,
                         "--loader", f"\\{efi_dir_bs}\\vmlinuz-{kver}.efi",

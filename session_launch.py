@@ -124,6 +124,73 @@ def degraded_repair():
     os.execv(sh, [sh])
 
 
+def setup_dev():
+    """Complete /dev apres le montage devtmpfs (minimal). Le devtmpfs herite de
+    l'initramfs n'a NI /dev/fd NI /dev/dri (GPU) NI les liens standards. Sans ca :
+      - bash process substitution casse ('broken /dev/fd')
+      - emerge refuse ('failed to validate a sane /dev')
+      - cage/wlroots ne trouve pas /dev/dri/card0 -> 'unable to create backend'
+    On cree les liens standards PUIS on lance eudev (udevd) qui peuple
+    dynamiquement /dev (cree /dev/dri/cardN quand le module GPU est charge,
+    applique permissions/groupes video/render)."""
+    # 1. liens standards vers /proc (indispensables : /dev/fd, stdin/out/err)
+    links = {"/dev/fd": "/proc/self/fd",
+             "/dev/stdin": "/proc/self/fd/0",
+             "/dev/stdout": "/proc/self/fd/1",
+             "/dev/stderr": "/proc/self/fd/2",
+             "/dev/core": "/proc/kcore"}
+    for dst, src in links.items():
+        try:
+            if not os.path.lexists(dst):
+                os.symlink(src, dst)
+        except OSError as e:
+            log(f"  [!] lien {dst} -> {src} : {e}")
+    # 2. /dev/shm (memoire partagee : requis par beaucoup d'apps, dont Mesa)
+    os.makedirs("/dev/shm", exist_ok=True)
+    subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev",
+                    "shm", "/dev/shm"], stderr=subprocess.DEVNULL)
+
+    # 3. eudev : peuple /dev dynamiquement (cree /dev/dri/card0 etc.).
+    #    Sur Gentoo/OpenRC le daemon est udevd (fourni par sys-fs/eudev).
+    udevd = which("udevd") or "/sbin/udevd" if os.path.exists("/sbin/udevd") \
+        else (which("systemd-udevd") or "")
+    if not udevd:
+        # chemins usuels eudev/udev
+        for cand in ("/lib/systemd/systemd-udevd", "/usr/lib/systemd/systemd-udevd",
+                     "/sbin/udevd", "/usr/sbin/udevd", "/lib/udev/udevd"):
+            if os.path.exists(cand):
+                udevd = cand
+                break
+    if udevd:
+        log(f"demarrage eudev ({udevd}) pour peupler /dev (GPU, etc.)")
+        subprocess.Popen([udevd, "--daemon"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        ua = which("udevadm") or "/bin/udevadm"
+        if os.path.exists(ua) or which("udevadm"):
+            # declenche la creation des devices pour le materiel deja present
+            subprocess.run([ua, "trigger", "--type=devices", "--action=add"],
+                           stderr=subprocess.DEVNULL)
+            subprocess.run([ua, "settle", "--timeout=10"],
+                           stderr=subprocess.DEVNULL)
+        log("eudev : /dev peuple (settle termine)")
+    else:
+        log("[!] udevd/eudev INTROUVABLE : /dev restera minimal "
+            "(/dev/dri absent -> pas d'affichage GPU). "
+            "Installe sys-fs/eudev dans le rootfs.")
+    # 4. filet : si le GPU n'a toujours pas de device, tenter de charger le module
+    if not os.path.exists("/dev/dri/card0"):
+        for mod in ("i915", "xe"):
+            subprocess.run(["modprobe", mod], stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        if which("udevadm"):
+            subprocess.run(["udevadm", "trigger", "--subsystem-match=drm",
+                            "--action=add"], stderr=subprocess.DEVNULL)
+            subprocess.run(["udevadm", "settle", "--timeout=5"],
+                           stderr=subprocess.DEVNULL)
+    log(f"/dev/dri/card0 present apres setup : {os.path.exists('/dev/dri/card0')}")
+
+
 def main():
     os.environ.setdefault("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
     for src, tgt, fs in (("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs"),
@@ -132,6 +199,9 @@ def main():
     os.makedirs("/dev/pts", exist_ok=True)
     subprocess.run(["mount", "-t", "devpts", "devpts", "/dev/pts"],
                    stderr=subprocess.DEVNULL)
+    # COMPLETER /dev : liens standards + eudev (cree /dev/dri, /dev/fd...).
+    # Sans ca : emerge 'sane /dev' KO, bash process-substitution KO, cage KO.
+    setup_dev()
 
     # MODE DEGRADE : rapport + shell de reparation, pas de session normale
     if os.path.exists("/etc/rescue-mode"):

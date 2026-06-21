@@ -205,10 +205,24 @@ def main():
     # 4. initramfs-<ver>.zst
     msg("initramfs")
     env = dict(os.environ, KVER=kver)
-    run([sys.executable, BUILD_INITRAMFS], env=env)
     initrd = f"initramfs-{kver}.zst"
+    # CRITIQUE : supprimer l'ancien AVANT de rebuild. Sinon, si build_initramfs
+    # echoue (auto-test/verify_bootable -> sys.exit), l'ancien fichier reste et
+    # serait copie tel quel sur l'ESP -> on booterait un VIEUX initramfs (bug
+    # observe : /tmp/pyerr persiste alors que le code est a jour).
+    if os.path.exists(initrd):
+        os.remove(initrd)
+    r = subprocess.run([sys.executable, BUILD_INITRAMFS], env=env)
+    if r.returncode != 0:
+        sys.exit(f"build_initramfs a ECHOUE (code {r.returncode}). "
+                 "L'ESP n'est PAS mise a jour (pas de copie d'un vieux initramfs).")
     if not os.path.isfile(initrd):
-        sys.exit(f"initramfs non produit : {initrd}")
+        sys.exit(f"initramfs non produit : {initrd} (build_initramfs n'a rien ecrit)")
+    # tracer l'horodatage pour confirmer la fraicheur
+    import time as _t
+    age = _t.time() - os.path.getmtime(initrd)
+    msg(f"initramfs produit : {initrd} (il y a {age:.0f}s, "
+        f"{os.path.getsize(initrd)//1024} Ko)")
 
     # 5. staging ESP (anciens conserves)
     dest = os.path.join(ESP, DEST_DIR)
@@ -216,7 +230,19 @@ def main():
     shutil.copy2(os.path.join(SRC, "arch/x86/boot/bzImage"),
                  os.path.join(dest, f"vmlinuz-{kver}.efi"))
     shutil.copy2(initrd, os.path.join(dest, f"initramfs-{kver}.zst"))
-    msg(f"stage ESP : vmlinuz-{kver}.efi + initramfs-{kver}.zst")
+    # VERIFICATION : l'initramfs copie sur l'ESP est-il identique a celui produit ?
+    import hashlib
+    def _md5(p):
+        h = hashlib.md5()
+        with open(p, "rb") as f:
+            for blk in iter(lambda: f.read(65536), b""):
+                h.update(blk)
+        return h.hexdigest()
+    src_sum = _md5(initrd)
+    esp_sum = _md5(os.path.join(dest, f"initramfs-{kver}.zst"))
+    if src_sum != esp_sum:
+        sys.exit(f"copie ESP corrompue : md5 different ({src_sum[:8]} != {esp_sum[:8]})")
+    msg(f"stage ESP : vmlinuz-{kver}.efi + initramfs-{kver}.zst (md5 {src_sum[:8]} OK)")
 
     # 6. entree EFI versionnee + BootNext
     if not ensure_efivarfs():
@@ -252,35 +278,38 @@ def main():
         infra = os.environ.get("INFRA_CONF", "infra.conf")
         enabled, profiles = uki_build.load_profiles(infra)
         if enabled and profiles:
-            # ESP(s) : staging deja fait pour la 1ere ; stager aussi sur la 2e.
-            esps = [(ESP, DISK, PART)]
+            # ESP(s) : (mount, disk, part, tag, register). La 1ere = celle deja
+            # stagee (ESP primaire env). tag = suffixe de label pour distinguer
+            # les entrees des 2 disques (ex Gentoo-safe-nvme0 vs -nvme1).
+            esps = [(ESP, DISK, PART, os.environ.get("ESP_TAG", "nvme0"), True)]
             try:
                 import boot_layout
                 for e in boot_layout.load_esps(infra):
                     mp = e.mount_for_install(log=msg)
                     d, p = e.disk_and_part()
                     if mp and os.path.abspath(mp) != os.path.abspath(ESP):
-                        esps.append((mp, d, p))
+                        esps.append((mp, d, p, e.tag, e.register_uefi))
             except Exception as e:
                 msg(f"boot_layout indisponible ({e}) -> 1 seule ESP")
 
             efi_dir_bs = DEST_DIR.replace("/", "\\")
-            for esp_mnt, disk, part in esps:
-                # s'assurer que noyau+initrd sont sur CETTE ESP
+            for esp_mnt, disk, part, tag, register in esps:
+                # s'assurer que noyau+initrd sont sur CETTE ESP. TOUJOURS ecraser
+                # (un ancien fichier de meme nom = on booterait du vieux code).
                 dst_dir = os.path.join(esp_mnt, DEST_DIR)
                 os.makedirs(dst_dir, exist_ok=True)
                 vm = os.path.join(dst_dir, f"vmlinuz-{kver}.efi")
                 it = os.path.join(dst_dir, f"initramfs-{kver}.zst")
-                if not os.path.exists(vm):
-                    shutil.copy2(os.path.join(dest, f"vmlinuz-{kver}.efi"), vm)
-                if not os.path.exists(it):
-                    shutil.copy2(os.path.join(dest, f"initramfs-{kver}.zst"), it)
-                if not disk:
-                    msg(f"  {esp_mnt} : pas de disk/part -> pas d'entree NVRAM "
-                        f"(fichiers stages quand meme)")
+                shutil.copy2(os.path.join(dest, f"vmlinuz-{kver}.efi"), vm)
+                shutil.copy2(os.path.join(dest, f"initramfs-{kver}.zst"), it)
+                msg(f"  {esp_mnt} : vmlinuz + initramfs ecrases (a jour)")
+                if not disk or not register:
+                    msg(f"  {esp_mnt} (tag {tag}) : register_uefi=off ou pas de "
+                        f"disk -> fichiers stages, PAS d'entree NVRAM")
                     continue
                 for prof in profiles:
-                    lbl = prof.get("label", prof["name"])
+                    base = prof.get("label", prof["name"])
+                    lbl = f"{base}-{tag}"        # ex Gentoo-safe-nvme0
                     cmd = prof.get("cmdline", CMDLINE)
                     old = efi_entry(lbl)
                     if old:

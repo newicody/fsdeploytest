@@ -42,16 +42,17 @@ FORBIDDEN_INSTALL = ("/boot", "/boot/efi", "/", "/usr", "/etc", "/var")
 class Esp:
     """Une ESP resolue : identite finale + echafaudage d'installation."""
     __slots__ = ("name", "partuuid", "partition", "install_mount", "primary",
-                 "register_uefi", "_dev", "reason")
+                 "register_uefi", "tag", "_dev", "reason")
 
     def __init__(self, name, partuuid="", partition="", install_mount="",
-                 primary=False, register_uefi=False):
+                 primary=False, register_uefi=False, tag=""):
         self.name = name
         self.partuuid = partuuid
         self.partition = partition
         self.install_mount = install_mount
         self.primary = primary
         self.register_uefi = register_uefi
+        self.tag = tag or name        # suffixe de label (ex 'nvme0') ; defaut = nom
         self._dev = ""             # device reel resolu (cache)
         self.reason = ""
 
@@ -190,6 +191,7 @@ def load_esps(infra_conf="infra.conf"):
             install_mount=decl.get("install_mount", f"/mnt/{name}"),
             primary=is_true(decl.get("primary", "false")),
             register_uefi=is_true(decl.get("register_uefi", "false")),
+            tag=decl.get("tag", "").strip(),
         ))
     esps.sort(key=lambda e: not e.primary)     # primary d'abord
     return esps

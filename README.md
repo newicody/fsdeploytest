@@ -733,22 +733,69 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > surchargeables via `FW_GLOBS`.
 
 > **Piège Gentoo `python-exec`** : sur Gentoo, `/usr/bin/python3` est un
-> **wrapper** (`dev-lang/python-exec`), pas le vrai interpréteur. Embarquer ce
-> wrapper sans `/usr/lib/python-exec/` provoque au boot « no python-exec wrapper
-> found » → `/init` ne démarre pas → **panic VFS muet**. `build_initramfs.py`
-> **résout le vrai ELF** (`/usr/bin/python3.X` versionné) et l'embarque
-> directement comme `/usr/bin/python3` (sans wrapper).
+> **wrapper** (`python-exec2c`) qui délègue au vrai interpréteur, dont il a
+> besoin de trouver l'écosystème (`/usr/lib/python-exec/`) ET la variable
+> **`EPYTHON`**. Distinguer wrapper et vrai binaire à travers les liens Gentoo
+> s'est révélé peu fiable. **Solution retenue : embarquer TOUT l'écosystème** —
+> le wrapper, tous les `python3*` de `/usr/bin`, l'intégralité de
+> `/usr/lib/python-exec/`, `python-exec2c`, les vrais binaires versionnés et
+> leurs `.so` (dont **`libpython3.X.so.1.0`** car Gentoo compile en SHARED). On
+> reproduit l'environnement Gentoo tel quel.
 >
-> **Python en SHARED** : sur Gentoo, l'interpréteur est compilé en partagé — le
-> binaire `python3.X` est petit, le cœur est dans **`libpython3.X.so.1.0`**.
-> `build_initramfs` embarque impérativement cette lib (via `ldd` + repli glob),
-> sinon python ne démarre pas. Pour lever toute ambiguïté, on peut forcer
-> l'interpréteur exact au build : `PYBIN=/usr/bin/python3.14 python3 build_initramfs.py`.
+> **`/init` est un lanceur shell** (`#!/bin/busybox sh`), pas directement
+> `init.py`. Raison : le noyau lance `/init` avec un environnement **minimal**
+> (`HOME=/ TERM=linux`) — donc `EPYTHON` n'est pas défini et le wrapper
+> échouerait (« no python-exec wrapper found »). Le lanceur **exporte `EPYTHON`,
+> `PATH`, `LD_LIBRARY_PATH`** puis `exec /usr/bin/python3 /init.py`. Bonus : si
+> python échoue, le lanceur l'affiche sur `/dev/kmsg` et tombe sur un shell —
+> plus de panic muet.
 >
-> **Auto-test** : `chroot <stage> /usr/bin/python3 -c "import ctypes,fcntl,..."`
-> à la fin du build ; si chroot indispo, une vérif de secours refuse un python3
-> qui serait le wrapper. Le build s'arrête plutôt que de produire une image qui
-> paniquerait silencieusement.
+> **Auto-test** : `chroot <stage> /usr/bin/python3 -c "import ctypes,..."` avec
+> `EPYTHON` défini (exactement comme au boot) ; le build s'arrête si python ne
+> démarre pas.
+>
+> **Liens SONAME** : `ldd` donne `libpython3.14.so.0 => /usr/lib64/libpython3.14.so.1.0`.
+> Le binaire cherche le **SONAME** (`.so.0`), le fichier réel a un autre nom
+> (`.so.1.0`). `build_initramfs` copie le fichier réel **et recrée le lien
+> SONAME** ; sans ça le loader ne trouve pas la lib au boot et python ne démarre
+> pas. (Les libs Gentoo sont dans `/usr/lib64`.)
+>
+> **Libs chargées dynamiquement (`libgcc_s.so.1`)** : certaines libs ne sont PAS
+> listées par `ldd` car chargées à l'exécution via `dlopen` —
+> **`libgcc_s.so.1`** (requise par `pthread_exit` / threads Python : sans elle,
+> « libgcc_s.so.1 must be installed for pthread_exit to work » dès qu'init.py
+> lance un thread), ainsi que `libnss_*`/`libresolv` (résolution). `build_initramfs`
+> les embarque **explicitement** (`bundle_critical_libs`), et l'auto-test lance
+> un thread pour attraper ce bug au build.
+>
+> **`break=launcher`** : un shell s'ouvre dans le lanceur **avant** python — un
+> filet de debug qui marche même si python est cassé (contrairement à
+> `break=<etape>` qui est dans init.py donc nécessite que python démarre).
+>
+> **Robustesse du lanceur** (leçons de debug réel) :
+> - **busybox** est copié à `/bin/busybox` **ET** `/sbin/busybox` (Gentoo le met
+>   parfois dans `/sbin` ; le shebang `#!/bin/busybox` doit toujours résoudre).
+>   Les applets (`sh`, `cat`, `mount`...) sont des liens **absolus** vers
+>   `/bin/busybox` dans `/bin` ET `/sbin` — jamais de lien cassé.
+> - **`pcie_aspm=off`** est dans toutes les cmdlines (corrige les « PCIe Bus
+>   Error: correctable » sur le lien NVMe, variables selon le noyau/firmware).
+> - **`panic=0`** est écrit dans `/proc/sys/kernel/panic` dès le début → le noyau
+>   **ne reboote jamais** sur panic, l'écran reste lisible.
+> - **fallback `python3.14`** : si le wrapper `/usr/bin/python3` échoue (« no
+>   python-exec wrapper found »), le lanceur exec directement `/usr/bin/python3.14`
+>   (le vrai ELF, garanti présent) — le wrapper est contourné au runtime.
+> - **pause 30 s** en cas d'échec python, pour laisser lire l'erreur.
+>
+> **`verify_bootable` (garde anti-brique)** : juste avant de packager, le build
+> vérifie que `/init` est exécutable, que **l'interpréteur de son shebang existe**
+> (`/bin/busybox`), que python et `/init.py` sont présents. Sinon le **build
+> s'arrête** en listant ce qui manque. Évite le « Failed to execute /init
+> (error -2) » au boot (ENOENT = interpréteur du shebang introuvable).
+>
+> **Chargement libc dans init.py** : `ctypes.util.find_library` dépend de
+> `gcc`/`ldconfig` (absents de l'initramfs) ; `init.py` essaie donc plusieurs
+> chemins explicites (`/usr/lib64/libc.so.6`, etc.) et écrit un message sur
+> `/dev/kmsg` avant de mourir si tout échoue — plus de crash muet à l'import.
 
 ### Stream de la console de boot dès l'init
 
@@ -1173,6 +1220,30 @@ toujours de `GITHUB_TOKEN` (jamais dans le fichier).
 > cmdlines de `[uki]` deviennent les cmdlines des entrées), sur les 2 ESP. Pas
 > de section PE à bricoler, méthode éprouvée. Les profils gardent leur rôle :
 > `safe` (nomodeset) pour diagnostiquer, etc.
+>
+> **Purge des anciennes entrées** : avant de (re)créer les entrées,
+> `purge_our_entries()` supprime **toutes** les entrées EFI dont le loader pointe
+> vers notre dossier (`EFI/gentoo` : nos `vmlinuz-*`, anciennes UKI…). Repart
+> propre à chaque build — fini l'accumulation et le mélange d'entrées pointant
+> vers des fichiers absents ou de mauvaises versions. Les entrées tierces
+> (Windows, Debian, firmware) sont **préservées**.
+
+> **Garde anti-vieil-initramfs** (leçon de debug réel) : trois protections pour
+> ne jamais booter un ancien initramfs alors que le code est à jour :
+> 1. `kernel_build` **supprime l'ancien `initramfs-<ver>.zst`** avant de relancer
+>    `build_initramfs` — sinon, si le build échoue (auto-test/`verify_bootable`),
+>    l'ancien fichier resterait et serait copié sur l'ESP.
+> 2. il **vérifie le code retour** de `build_initramfs` et **l'horodatage** du
+>    fichier produit (fraîcheur), et **compare le md5** copié sur l'ESP.
+> 3. les fichiers sont **toujours écrasés** sur **chaque** ESP (avant : un ancien
+>    fichier de même nom n'était pas remplacé → on bootait du vieux code).
+
+> **Deux ESP avec entrées distinctes** : `esp2` a `register_uefi = true` (les
+> entrées EFI sont créées sur **les deux** disques → chaque NVMe boote seul).
+> Pour les distinguer dans le menu UEFI, chaque ESP a un `tag` (`nvme0`/`nvme1`)
+> suffixé au label : `Gentoo-safe-nvme0`, `Gentoo-safe-nvme1`, `Gentoo-debug-nvme0`…
+> Tu vois ainsi clairement depuis quel disque tu bootes. La purge se base sur le
+> chemin du loader, donc elle nettoie tous ces labels quel que soit le suffixe.
 
 La section `[uki]` sert toujours à déclarer les **profils** (label + cmdline),
 mais ils sont déployés en entrées EFI classiques, pas en binaires UKI uniques.

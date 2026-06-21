@@ -808,7 +808,10 @@ def main():
     if rescue:
         degraded_reasons.append("fast_pool absent (disque ?) : rootfs depuis boot_pool")
     elif ds_exists(UPPER_DS):
-        if run(["mount.zfs", UPPER_DS, "/mnt/ovl"]) != 0:
+        # mount_zfs_dataset gere mountpoint != legacy (fast_pool/rootfs =
+        # /fast_pool/rootfs). L'ancien 'mount.zfs UPPER_DS /mnt/ovl' direct
+        # echouait sur un dataset non-legacy -> faux 'ne se monte pas'.
+        if not mount_zfs_dataset(UPPER_DS, "/mnt/ovl"):
             degraded_reasons.append(
                 f"{UPPER_DS} existe mais NE SE MONTE PAS (corruption ?) "
                 f"-> non monte, upper volatile")

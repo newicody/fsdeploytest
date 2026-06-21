@@ -627,12 +627,19 @@ def main():
     debug_log(f"cmdline = {cmdline()}")
     debug_shell("pseudofs")
 
-    # --- 1bis. STREAM CONSOLE DE BOOT (le plus tot possible) ----------------
-    # On streame des maintenant : tout le reste du boot (ZFS, overlay...) sera
-    # visible en direct sur YouTube. ffmpeg tourne en tache de fond.
-    boot_stream = start_boot_stream(read_yt_key())
-    if boot_stream is None:
-        log("(pas de stream initramfs ; demarrage normal)")
+    # --- 1bis. STREAM CONSOLE DE BOOT (OPTIONNEL) --------------------------
+    # Le stream (ffmpeg) est une commodite, PAS une necessite. Il a crashe tot
+    # (general protection fault) et masquait les vrais problemes de montage. Il
+    # ne se lance donc QUE si 'stream' est present dans la cmdline. Par defaut
+    # (debug), pas de ffmpeg -> un point de crash en moins, logs a l'ecran.
+    boot_stream = None
+    if "stream" in cmdline().split():
+        log("stream demande (cmdline) : demarrage ffmpeg...")
+        boot_stream = start_boot_stream(read_yt_key())
+        if boot_stream is None:
+            log("(stream demande mais non demarre : cle/ffmpeg manquant)")
+    else:
+        log("stream console desactive (ajoute 'stream' a la cmdline pour l'activer)")
 
     # --- 2. ZFS (famille de modules, dans l'ordre des dependances) ----------
     debug_shell("zfs")
@@ -657,7 +664,7 @@ def main():
     # --- 3. import pool : fast_pool, sinon SECOURS sur boot_pool ------------
     rescue = False
     sfs_ds, rootfs_name = SFS_DS, ROOTFS_SFS
-    if run(["zpool", "import", "-N", "-f", "-d", "/dev", POOL]) == 0:
+    if run(["zpool", "import", "-N", "-f", POOL]) == 0:
         health_check()
         os.makedirs("/mnt/sfs", exist_ok=True)
         if run(["mount.zfs", SFS_DS, "/mnt/sfs"]) != 0:
@@ -674,7 +681,7 @@ def main():
         log("  -> les donnees de fast_pool (var/rootfs/tmp) sont perdues.")
         log("  -> remplace le NVMe et restaure depuis boot_pool/data_pool.")
         log("=" * 56)
-        if run(["zpool", "import", "-N", "-f", "-d", "/dev", RESCUE_POOL]) != 0:
+        if run(["zpool", "import", "-N", "-f", RESCUE_POOL]) != 0:
             die(f"import {RESCUE_POOL} (secours) echoue : aucun rootfs disponible")
         os.makedirs("/mnt/sfs", exist_ok=True)
         if run(["mount.zfs", RESCUE_SFS_DS, "/mnt/sfs"]) != 0:

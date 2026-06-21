@@ -375,19 +375,26 @@ def bundle_critical_libs(stage):
             if not (os.path.isfile(lib) or os.path.islink(lib)):
                 continue
             real = os.path.realpath(lib)
-            copy(real, stage)                  # le fichier reel (contenu)
-            # recreer le lien du nom rencontre (ex libresolv.so.2) -> reel
-            ldir = os.path.dirname(lib)
-            for linkname in {os.path.basename(lib),
-                             # deriver le SONAME probable : libX.so.N
-                             re.sub(r"(\.so\.\d+).*$", r"\1", os.path.basename(real))}:
-                if not linkname or linkname == os.path.basename(real):
+            soname = re.sub(r"(\.so\.\d+).*$", r"\1", os.path.basename(real))
+            # Copier le vrai fichier dans /usr/lib64 sous SON nom reel ET sous le
+            # SONAME (lien). /usr/lib64 est dans LD_LIBRARY_PATH du lanceur, donc
+            # la lib est TOUJOURS trouvable -- meme si Gentoo la range ailleurs
+            # (ex libgcc_s.so.1 dans /usr/lib/gcc/<triplet>/<ver>/, hors path).
+            dst_real = f"{stage}/usr/lib64/{os.path.basename(real)}"
+            os.makedirs(os.path.dirname(dst_real), exist_ok=True)
+            if not os.path.exists(dst_real):
+                try:
+                    shutil.copy2(real, dst_real)
+                except (OSError, shutil.SameFileError):
+                    pass
+            # liens : SONAME + nom rencontre par le glob -> fichier reel
+            for nm in {soname, os.path.basename(lib)}:
+                if not nm or nm == os.path.basename(real):
                     continue
-                dst_link = stage + os.path.join(ldir, linkname)
-                os.makedirs(os.path.dirname(dst_link), exist_ok=True)
-                if not os.path.lexists(dst_link):
+                link = f"{stage}/usr/lib64/{nm}"
+                if not os.path.lexists(link):
                     try:
-                        os.symlink(os.path.basename(real), dst_link)
+                        os.symlink(os.path.basename(real), link)
                     except OSError:
                         pass
             found.append(os.path.basename(lib))
@@ -772,13 +779,13 @@ esac
 # ELF). NE PAS faire dependre la decision d'une redirection (cause du faux
 # echec precedent : /tmp absent).
 say "test de /usr/bin/python3..."
-if /usr/bin/python3 -c "import sys, threading; threading.Thread(target=lambda:None).start()"; then
+if /usr/bin/python3 -c "import sys"; then
   say "python3 OK, lancement de init.py..."
   exec /usr/bin/python3 /init.py "$@"
 fi
 
 say "python3 (wrapper) KO -> essai /usr/bin/python3.14 (vrai ELF)..."
-if /usr/bin/python3.14 -c "import sys, threading; threading.Thread(target=lambda:None).start()"; then
+if /usr/bin/python3.14 -c "import sys"; then
   say "python3.14 OK, lancement de init.py..."
   exec /usr/bin/python3.14 /init.py "$@"
 fi

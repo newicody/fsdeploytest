@@ -790,10 +790,14 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > partitions réelles) → import quasi instantané. Repli sur `/dev` si ces dossiers
 > manquent.
 >
-> **Montage gérant `mountpoint != legacy`** : `fast_pool/sfs` a
-> `mountpoint=/fast_pool/sfs` (pas `legacy`), donc `mount.zfs sfs /mnt/sfs`
-> échouait (« non montable »). `mount_zfs_dataset` ajoute `-o zfsutil` pour les
-> datasets non-legacy → monte à la cible quel que soit le mountpoint.
+> **Montage gérant `mountpoint != legacy`** : `fast_pool/sfs`
+> (`mountpoint=/fast_pool/sfs`) **et** `fast_pool/rootfs`
+> (`mountpoint=/fast_pool/rootfs`) ne sont **pas** `legacy`, donc un
+> `mount.zfs <ds> <cible>` direct échouait (« existe mais ne se monte pas »,
+> faussement attribué à une corruption). `mount_zfs_dataset` ajoute `-o zfsutil`
+> pour les datasets non-legacy → monte à la cible quel que soit le mountpoint.
+> **Tous** les montages d'init.py (sfs, upper de l'overlay, secours, récursif)
+> passent par cette fonction.
 >
 > **`data_pool` importé + montage récursif ORDONNÉ** : `data_pool` (home, log,
 > archives) est désormais importé et monté sous `NEWROOT` via
@@ -841,6 +845,67 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > file or directory ») → PID 1 meurt → **kernel panic**. C'est ce que fait le
 > vrai `switch_root` en interne. Filet supplémentaire : `/dev/null` est recréé
 > via `mknod` si devtmpfs est incomplet.
+
+> **Déploiement des scripts appliance dans le rootfs** (cause racine des
+> confusions de version) : `session_launch.py` et `boot_confirm.py` vivent
+> **dans le rootfs Gentoo**, figé dans `rootfs.sfs`. Les livrer ailleurs ne les
+> met PAS dans le rootfs → le sfs figerait une **ancienne** version (ex : le
+> panic cage avec `execvp` alors que le fix était corrigé). `sfs_build`
+> **déploie** maintenant ces scripts (`deploy_appliance_scripts`) depuis un
+> répertoire de référence (`--appliance-ref`, défaut = dossier de first_boot)
+> vers le rootfs **avant** `mksquashfs`. Et `first_boot` recrée le sfs par défaut
+> (`--no-force-sfs` pour l'éviter) afin que le déploiement prenne effet. Sans ça,
+> on débugge éternellement du vieux code figé.
+>
+> **PID 1 résilient (compositeur)** : `session_launch.py` ne fait **plus**
+> `execvp("cage")` direct — si cage échoue à créer son backend wlroots, cela
+> tuerait PID 1 → **panic**. Il lance le compositeur en **sous-processus**,
+> surveille le code retour, et en cas d'échec **bascule sur un shell de
+> maintenance en boucle** (PID 1 ne quitte jamais). Cause typique du « unable to
+> create the wlroots backend » : avoir booté en **`nomodeset`** (profil `safe`)
+> → pas de KMS → pas de `/dev/dri/card0` → wlroots ne peut pas créer de backend
+> DRM. Pour l'affichage graphique, boote un profil **avec** KMS (normal/i915),
+> pas `safe`. Le diagnostic affiche si `/dev/dri/card0` est présent.
+>
+> **PIÈGE `--rootfs-src` (scripts du rootfs)** : `session_launch.py` et
+> `boot_confirm.py` **vivent dans le rootfs Gentoo**, donc figés dans
+> `rootfs.sfs`. Les modifier dans le dépôt ne suffit PAS : il faut **régénérer
+> le sfs** pour qu'ils soient redéployés (`sfs_build.deploy_appliance_scripts`
+> les copie depuis le dépôt avant `mksquashfs`). Or `first_boot` ne régénère le
+> sfs **que si `--rootfs-src` est fourni**. Sans lui, `kernel_build` ne refait
+> que l'initramfs → le boot utilise l'**ancien** `session_launch.py` (cause du
+> panic cage « execvp » alors que le fix était livré). `first_boot` avertit
+> désormais explicitement quand le sfs n'est pas régénéré et que ces scripts ont
+> été modifiés récemment.
+
+> **`evm: overlay not supported` (bénin)** : EVM (vérification d'intégrité du
+> noyau) ne gère pas overlayfs et se désactive pour l'overlay. Purement
+> informatif, sans impact sur le boot.
+
+> **Initialisation de l'environnement (`setup_environment`)** : `session_launch`
+> ne **source pas** `/etc/profile` en bloc pour PID 1 (conçu pour un shell de
+> login, inadapté). Il définit **explicitement** ce dont le compositeur a besoin :
+> base système (`HOME`, `USER`, `SHELL`, `PATH`, `XDG_CACHE/CONFIG/DATA_HOME`),
+> locale **`fr_FR.UTF-8` si générée, sinon repli `C.UTF-8`** (évite les warnings
+> « cannot set LC_* » si la locale n'est pas compilée — génère-la via
+> `/etc/locale.gen` + `locale-gen`), et les variables Wayland
+> (`XDG_SESSION_TYPE=wayland`, `XDG_CURRENT_DESKTOP`, `QT_QPA_PLATFORM`,
+> `GDK_BACKEND`, `SDL_VIDEODRIVER`) utiles à cage et à **XWayland** à venir. Les
+> shells interactifs (maintenance, foot) sont lancés en **login shell** (`bash -l`)
+> et sourcent donc `/etc/profile` normalement.
+>
+> **Peuplement de `/dev` après switch_root (eudev)** : le `devtmpfs` hérité de
+> l'initramfs est **minimal** — il a `/dev/null`, `/dev/console`, les disques,
+> mais **pas** `/dev/dri/` (GPU), `/dev/fd`, `/dev/shm`, ni les
+> permissions/groupes. Conséquences observées : `emerge` refuse (« failed to
+> validate a sane /dev »), bash process-substitution casse (« broken /dev/fd »),
+> et cage/wlroots ne trouve pas `/dev/dri/card0` (« unable to create the wlroots
+> backend »). `session_launch.setup_dev()` corrige : crée les liens standards
+> (`/dev/fd → /proc/self/fd`, stdin/out/err…), monte `/dev/shm`, puis lance
+> **eudev** (`udevd --daemon` + `udevadm trigger` + `settle`) qui peuple `/dev`
+> dynamiquement (crée `/dev/dri/cardN` au chargement du module GPU, applique les
+> groupes `video`/`render`). Filet : si le GPU n'a toujours pas de device,
+> `modprobe i915/xe` + re-trigger DRM. **Requiert `sys-fs/eudev` dans le rootfs.**
 
 > **Staging simplifié (une seule écriture du .sfs)** : `sfs_build` écrit le
 > squashfs temporaire **directement dans le dossier de destination** (même FS que

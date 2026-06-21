@@ -760,13 +760,15 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > SONAME** ; sans ça le loader ne trouve pas la lib au boot et python ne démarre
 > pas. (Les libs Gentoo sont dans `/usr/lib64`.)
 >
-> **Libs chargées dynamiquement (`libgcc_s.so.1`)** : certaines libs ne sont PAS
-> listées par `ldd` car chargées à l'exécution via `dlopen` —
-> **`libgcc_s.so.1`** (requise par `pthread_exit` / threads Python : sans elle,
-> « libgcc_s.so.1 must be installed for pthread_exit to work » dès qu'init.py
-> lance un thread), ainsi que `libnss_*`/`libresolv` (résolution). `build_initramfs`
-> les embarque **explicitement** (`bundle_critical_libs`), et l'auto-test lance
-> un thread pour attraper ce bug au build.
+> **Libs chargées dynamiquement (`libgcc_s.so.1`, `libresolv.so.2`)** : certaines
+> libs ne sont PAS listées par `ldd` car chargées à l'exécution via `dlopen` ou
+> NSS — **`libgcc_s.so.1`** (threads Python : « libgcc_s.so.1 must be installed
+> for pthread_exit to work »), **`libresolv.so.2`** + `libnss_*` (résolution
+> réseau pour busybox et python). `build_initramfs` les embarque **explicitement**
+> (`bundle_critical_libs`), **avec toute la chaîne de liens SONAME** (ex
+> `libresolv.so → libresolv.so.2 → libresolv-2.XX.so`), sinon le loader cherche
+> le SONAME et échoue. Deux auto-tests au build : `busybox true` (charge ses
+> `.so`) et python+thread — le build s'arrête si une lib manque.
 >
 > **`break=launcher`** : un shell s'ouvre dans le lanceur **avant** python — un
 > filet de debug qui marche même si python est cassé (contrairement à

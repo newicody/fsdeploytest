@@ -702,6 +702,18 @@ def main():
     # rootfs.sfs : le creer s'il est absent (sinon init.py ne peut pas monter /)
     if a.rootfs_src:
         import sfs_build
+        import inspect
+        # GARDE SYNCHRO : si le sfs_build de la machine est une version anterieure
+        # (sans ref_dir), on le DIT clairement au lieu d'un TypeError cryptique.
+        params = inspect.signature(sfs_build.build_rootfs_sfs).parameters
+        if "ref_dir" not in params:
+            print("!! sfs_build.py est une ANCIENNE version (build_rootfs_sfs sans "
+                  "ref_dir).", flush=True)
+            print("   Mets a jour sfs_build.py EN MEME TEMPS que first_boot.py "
+                  "(ils ont ete modifies ensemble).", flush=True)
+            print("   first_boot.py et sfs_build.py doivent toujours etre "
+                  "synchronises.", flush=True)
+            sys.exit(4)
         # ref_dir : ou trouver session_launch.py/boot_confirm.py A JOUR a deployer
         # dans le rootfs avant de figer. Defaut = repertoire de first_boot.py.
         ref = getattr(a, "appliance_ref", None) or os.path.dirname(

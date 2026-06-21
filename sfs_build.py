@@ -202,8 +202,45 @@ def _in_proc_mounts(dataset):
 # --------------------------------------------------------------------------- #
 # API publique
 # --------------------------------------------------------------------------- #
+APPLIANCE_SCRIPTS = {
+    # source (repertoire de reference) -> destination DANS le rootfs
+    "session_launch.py": "sbin/session_launch.py",
+    "boot_confirm.py":   "usr/local/sbin/boot_confirm.py",
+}
+
+
+def deploy_appliance_scripts(rootfs_src, ref_dir, log=print):
+    """Copie les scripts 'appliance' (session_launch.py, boot_confirm.py) depuis
+    ref_dir vers le rootfs AVANT de figer le sfs. SANS ca, le sfs figerait la
+    version DEJA presente dans le rootfs -> on debugge avec du vieux code (cause
+    du panic cage 'execvp' alors que le fix etait livre ailleurs).
+    ref_dir = repertoire ou se trouvent les .py a jour (defaut : a cote de
+    sfs_build.py, ou via APPLIANCE_REF env)."""
+    if not ref_dir:
+        ref_dir = os.environ.get("APPLIANCE_REF") or os.path.dirname(
+            os.path.abspath(__file__))
+    deployed, missing = [], []
+    for srcname, relpath in APPLIANCE_SCRIPTS.items():
+        src = os.path.join(ref_dir, srcname)
+        if not os.path.isfile(src):
+            missing.append(srcname)
+            continue
+        dst = os.path.join(rootfs_src, relpath)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o755)
+        deployed.append(relpath)
+        log(f"  deploye {srcname} -> rootfs:/{relpath}")
+    if deployed:
+        log(f"scripts appliance a jour dans le rootfs ({len(deployed)}) avant sfs")
+    if missing:
+        log(f"  [!] scripts introuvables dans {ref_dir} : {', '.join(missing)} "
+            f"-> le sfs gardera la version deja dans le rootfs (peut etre vieille)")
+    return deployed, missing
+
+
 def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
-                     log=print, force=False, force_live=False):
+                     log=print, force=False, force_live=False, ref_dir=None):
     """Cree rootfs.sfs depuis l'arborescence rootfs_src. rootfs_src DOIT etre une
     copie nettoyee par clean_rootfs (marqueur .cleaned-for-sfs) ; sinon on REFUSE
     de figer (risque : figer le systeme vivant, etat incoherent). --force-live
@@ -234,6 +271,9 @@ def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
         size_mb = os.path.getsize(dst) / (1024 * 1024)
         log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree (force=False)")
         return SfsResult(True, dst, "deja present", int(size_mb))
+    # DEPLOIEMENT : copier les scripts appliance A JOUR dans le rootfs AVANT de
+    # figer. Sinon le sfs garderait la version deja presente -> vieux code fige.
+    deploy_appliance_scripts(rootfs_src, ref_dir, log=log)
     # exclusions pseudo-FS/volatils : -e doit etre le DERNIER flag mksquashfs
     # (tout ce qui suit est traite comme motif d'exclusion).
     extra = ["-e"] + ROOTFS_EXCLUDES

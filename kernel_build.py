@@ -49,6 +49,15 @@ def efi_entry(label):
     return m[0] if m else None
 
 
+def efi_entries_all(label):
+    """TOUTES les entrees portant exactement ce label (avec --duplicate, il peut
+    y en avoir plusieurs d'anciens builds). Sert a toutes les supprimer avant de
+    recreer proprement."""
+    return re.findall(
+        rf"^Boot([0-9A-Fa-f]{{4}})\*?\s+{re.escape(label)}(?:\s|$)",
+        out(["efibootmgr"]), re.M)
+
+
 def _load_boot_opts():
     """Lit [uki] arm_bootnext + default_profile de infra.conf. Retourne
     (arm_bootnext: bool, default_profile: str)."""
@@ -281,10 +290,13 @@ def main():
     created = set()
     efi_dir = DEST_DIR.replace("/", "\\")
     label = f"Gentoo-{kver}"
-    old = efi_entry(label)
-    if old:
+    for old in efi_entries_all(label):
         run(["efibootmgr", "-b", old, "-B"])
-    run(["efibootmgr", "--create", "--disk", DISK, "--part", PART,
+    # --duplicate (-D) : FORCER la creation meme si une entree vers le meme
+    # loader existe deja. Sans ca, efibootmgr DEDUPLIQUE sur le path du noyau et
+    # REFUSE les profils (qui pointent tous vers le meme vmlinuz, seule la
+    # cmdline differe) -> une seule entree creee au lieu de toutes.
+    run(["efibootmgr", "--create", "--duplicate", "--disk", DISK, "--part", PART,
          "--label", label,
          "--loader", f"\\{efi_dir}\\vmlinuz-{kver}.efi",
          "--unicode", f"initrd=\\{efi_dir}\\initramfs-{kver}.zst {CMDLINE}"])
@@ -353,22 +365,40 @@ def main():
                     base = prof.get("label", prof["name"])
                     lbl = f"{base}-{tag}"        # ex Gentoo-safe-nvme0
                     cmd = prof.get("cmdline", CMDLINE)
-                    old = efi_entry(lbl)
-                    if old:
-                        run(["efibootmgr", "-b", old, "-B"])
-                    run(["efibootmgr", "--create", "--disk", disk, "--part", part,
-                         "--label", lbl,
-                         "--loader", f"\\{efi_dir_bs}\\vmlinuz-{kver}.efi",
-                         "--unicode",
-                         f"initrd=\\{efi_dir_bs}\\initramfs-{kver}.zst {cmd}"])
+                    old = efi_entries_all(lbl)
+                    for o in old:
+                        try:
+                            run(["efibootmgr", "-b", o, "-B"])
+                        except Exception as e:
+                            msg(f"  [!] suppression ancienne '{lbl}' : {e}")
+                    # creation : capturer l'erreur PAR PROFIL (un echec n'arrete
+                    # pas les autres) et MONTRER la vraie sortie efibootmgr.
+                    create_cmd = [
+                        "efibootmgr", "--create", "--duplicate",
+                        "--disk", disk, "--part", part,
+                        "--label", lbl,
+                        "--loader", f"\\{efi_dir_bs}\\vmlinuz-{kver}.efi",
+                        "--unicode",
+                        f"initrd=\\{efi_dir_bs}\\initramfs-{kver}.zst {cmd}"]
+                    msg("$ " + " ".join(create_cmd[:8]) + " ...")
+                    cr = subprocess.run(create_cmd, capture_output=True, text=True)
+                    if cr.returncode != 0:
+                        msg(f"  [!] ECHEC creation '{lbl}' (code {cr.returncode}) :")
+                        msg(f"      stderr: {cr.stderr.strip()[:200]}")
+                        msg(f"      stdout: {cr.stdout.strip()[:200]}")
+                        continue                  # passer au profil suivant
                     bn = efi_entry(lbl)
                     if bn:
-                        created.add(bn)         # ne pas purger celle-ci
-                        # memoriser le bootnum du profil par defaut (1ere ESP)
+                        created.add(bn)
                         if prof["name"] == _default_prof and _default_bootnum[0] is None:
                             _default_bootnum[0] = bn
-                    msg(f"  entree '{lbl}' -> {disk}p{part} "
-                        f"(initrd separe + cmdline profil)")
+                        msg(f"  OK entree '{lbl}' = Boot{bn} -> {disk}p{part}")
+                    else:
+                        msg(f"  [!] '{lbl}' creee mais introuvable apres "
+                            f"(parsing efi_entry ?) -- sortie efibootmgr -v :")
+                        for ln in out(["efibootmgr"]).splitlines():
+                            if lbl in ln:
+                                msg(f"      {ln}")
             msg(f"entrees EFI par profil creees ({len(profiles)} profils "
                 f"x {len([e for e in esps if e[1]])} ESP avec NVRAM)")
     except Exception as e:

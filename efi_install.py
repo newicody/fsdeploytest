@@ -13,7 +13,7 @@ import subprocess
 import sys
 
 KVER = os.environ.get("KVER", os.uname().release)
-ESP = os.environ.get("ESP", "/boot/efi")
+ESP = os.environ.get("ESP", "/mnt/esp1")     # jamais /boot/efi (cf. boot_layout)
 DISK = os.environ.get("DISK", "/dev/nvme0n1")
 PART = os.environ.get("PART", "1")
 KERNEL_SRC = os.environ.get("KERNEL_SRC", f"/mnt/boot/vmlinux-{KVER}")

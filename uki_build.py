@@ -224,7 +224,7 @@ if __name__ == "__main__":
     enabled, profiles = load_profiles(a.infra)
     if not enabled:
         raise SystemExit("[uki] enabled=false ou section absente")
-    esps = [(mnt, "", "") for mnt in a.esp] or [("/boot/efi", "", "")]
+    esps = [(mnt, "", "") for mnt in a.esp] or [("/mnt/esp1", "", "")]
     res = deploy_profiles(profiles, a.vmlinuz, a.initramfs, esps,
                           build_dir=a.build_dir)
     ok = sum(1 for r in res if r.ok)

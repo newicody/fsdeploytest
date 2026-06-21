@@ -100,14 +100,63 @@ RSYNC_EXCLUDES = [
 ]
 
 
+def submounts_under(source):
+    """Liste les points de montage situes SOUS `source` (datasets ZFS ou autres
+    FS reels), pour les copier explicitement : --one-file-system les sauterait
+    sinon. On EXCLUT les pseudo-FS (proc/sys/dev/run/tmp) et les montages
+    externes (/mnt, /media) -- ceux-la doivent rester vides dans l'image.
+    Retourne une liste de (mountpoint_absolu, fstype)."""
+    src = os.path.realpath(source).rstrip("/")
+    pseudo = ("proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "ramfs",
+              "cgroup", "cgroup2", "mqueue", "debugfs", "securityfs",
+              "efivarfs", "bpf", "tracefs", "fusectl", "configfs", "pstore",
+              "autofs", "binfmt_misc", "hugetlbfs", "nsfs")
+    skip_prefixes = (src + "/mnt", src + "/media", src + "/proc",
+                     src + "/sys", src + "/dev", src + "/run", src + "/tmp")
+    out = []
+    try:
+        # findmnt : liste tous les montages (TARGET + FSTYPE), un par ligne
+        res = subprocess.run(
+            ["findmnt", "-rn", "-o", "TARGET,FSTYPE"],
+            capture_output=True, text=True)
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            target, fstype = parts[0], parts[1]
+            rt = os.path.realpath(target).rstrip("/")
+            if rt == src:
+                continue                        # la racine elle-meme, deja copiee
+            if not rt.startswith(src + "/"):
+                continue                        # hors de la source
+            if fstype in pseudo:
+                continue                        # pseudo-FS : ne pas copier
+            if any(rt == p or rt.startswith(p + "/") for p in skip_prefixes):
+                continue                        # /mnt, /media... : rester vides
+            out.append((rt, fstype))
+    except FileNotFoundError:
+        log("[!] findmnt absent : impossible de detecter les sous-montages "
+            "(datasets dans le rootfs pourraient etre sautes par "
+            "--one-file-system). emerge util-linux.")
+    # trier par profondeur (parent avant enfant) pour une copie coherente
+    out.sort(key=lambda t: t[0].count("/"))
+    return out
+
+
 def rsync_copy(source, staging, dry=False):
     """Copie source -> staging avec preservation totale (xattr/ACL/hardlinks),
     en EXCLUANT les pseudo-FS (proc/sys/dev/run) et les volatils. Les dossiers
     eux-memes sont conserves (vides) car on exclut '/proc/*' et non '/proc'.
-    Le slash final sur source copie le CONTENU dans staging."""
+    Le slash final sur source copie le CONTENU dans staging.
+
+    --one-file-system protege contre la traversee de /mnt, /proc... MAIS
+    sauterait aussi les DATASETS ZFS montes dans le rootfs (ex /var/db/pkg,
+    /etc/portage sur Gentoo). On les detecte (submounts_under) et on les copie
+    EXPLICITEMENT, un par un, apres la copie principale."""
     os.makedirs(staging, exist_ok=True)
-    cmd = ["rsync", "-aHAX", "--numeric-ids", "--info=progress2",
-           "--one-file-system"]              # ne traverse pas les points de montage
+    base = ["rsync", "-aHAX", "--numeric-ids", "--info=progress2",
+            "--one-file-system"]              # ne traverse pas les points de montage
+    cmd = list(base)
     for ex in RSYNC_EXCLUDES:
         cmd += ["--exclude", ex]
     cmd += [source.rstrip("/") + "/", staging.rstrip("/") + "/"]
@@ -121,6 +170,29 @@ def rsync_copy(source, staging, dry=False):
         _abort("rsync introuvable (emerge net-misc/rsync).")
     if rc != 0:
         _abort(f"rsync a echoue (rc={rc}).")
+
+    # DATASETS montes dans le rootfs : copies explicitement (sinon sautes).
+    subs = submounts_under(source)
+    if subs:
+        log(f"{len(subs)} sous-montage(s) detecte(s) dans le rootfs "
+            f"(datasets a inclure malgre --one-file-system) :")
+        for mp, fstype in subs:
+            rel = os.path.realpath(mp)[len(os.path.realpath(source).rstrip("/")):]
+            rel = rel.lstrip("/")
+            dst = os.path.join(staging.rstrip("/"), rel)
+            log(f"  - {mp} ({fstype}) -> {dst}")
+            if dry:
+                continue
+            os.makedirs(dst, exist_ok=True)
+            sub_cmd = list(base) + [mp.rstrip("/") + "/", dst.rstrip("/") + "/"]
+            try:
+                src2 = subprocess.run(sub_cmd).returncode
+                if src2 != 0:
+                    log(f"    [!] rsync du sous-montage {mp} a echoue (rc={src2})")
+            except FileNotFoundError:
+                _abort("rsync introuvable.")
+    else:
+        log("aucun dataset monte dans le rootfs (ou findmnt absent).")
 
 
 def _rm_path(p, dry):
@@ -203,12 +275,31 @@ def clean_copy(staging, dry=False):
     return n
 
 
-def verify_essentials(staging):
+def verify_essentials(staging, dry=False, source=None):
     """Verifie que la copie nettoyee contient toujours l'essentiel (sinon le
-    boot echouera). Avertit, ne bloque pas."""
-    staging = _norm(staging)
+    boot echouera). Avertit, ne bloque pas.
+
+    En DRY-RUN, le staging est VIDE (rsync n'a rien copie), donc verifier dedans
+    donnerait un FAUX 'absent'. On verifie alors dans la SOURCE : ces elements
+    y existent-ils ET echappent-ils a la purge ? (ils sont dans PROTECTED, donc
+    jamais supprimes -> presents dans la source = presents apres copie reelle)."""
     must = ["sbin/session_launch.py", "usr/local/sbin/boot_confirm.py",
             "lib/modules", "etc/portage", "var/db/pkg"]
+    if dry:
+        base = _norm(source) if source else None
+        if not base:
+            log("[dry] verification des essentiels sautee (pas de copie reelle).")
+            return
+        missing = [m for m in must if not os.path.lexists(os.path.join(base, m))]
+        if missing:
+            log("[dry] ATTENTION : essentiels absents DE LA SOURCE (pas de la "
+                "copie !) : " + ", ".join(missing)
+                + " -- verifie ta racine source.")
+        else:
+            log("[dry] essentiels presents dans la source ET protges de la purge "
+                "(seront copies). OK.")
+        return
+    staging = _norm(staging)
     missing = [m for m in must if not os.path.lexists(os.path.join(staging, m))]
     if missing:
         log("ATTENTION : elements essentiels absents de la copie : "
@@ -250,7 +341,7 @@ def main():
 
     n = clean_copy(staging, dry=a.dry_run)
     log(f"{'(dry) ' if a.dry_run else ''}{n} element(s) nettoye(s).")
-    verify_essentials(staging)
+    verify_essentials(staging, dry=a.dry_run, source=source)
 
     if not a.dry_run:
         write_marker(staging, source)

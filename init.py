@@ -67,6 +67,7 @@ def read_yt_key():
 
 # --- constantes noyau (x86_64) ----------------------------------------------
 MS_RDONLY = 1
+MS_BIND   = 4096
 MS_MOVE   = 8192
 LOOP_CTL_GET_FREE = 0x4C82
 LOOP_SET_FD       = 0x4C00
@@ -1005,6 +1006,36 @@ def main():
     if not os.path.exists(nxt):
         die(f"{nxt} absent")
     log("switch_root -> /sbin/session_launch.py")
+
+    # CRITIQUE : deplacer les pseudo-FS dans le nouveau root AVANT de basculer.
+    # Sinon le nouveau / a un /dev VIDE -> pas de /dev/null -> python/session_launch
+    # echoue ('/dev/null no such file or directory') -> PID1 mort -> kernel panic.
+    # C'est ce que fait le vrai 'switch_root' (busybox) en interne.
+    for pf in ("dev", "proc", "sys", "run"):
+        src = f"/{pf}"
+        dst = f"{NEWROOT}/{pf}"
+        if os.path.ismount(src):
+            os.makedirs(dst, exist_ok=True)
+            try:
+                mount(src, dst, "", MS_MOVE)
+                log(f"  {src} --move-> {dst}")
+            except OSError as e:
+                # repli : si MS_MOVE echoue, tenter un bind (mieux que rien)
+                log(f"  [!] move {src} echoue ({e}) -> bind")
+                try:
+                    mount(src, dst, "", MS_BIND)
+                except OSError as e2:
+                    log(f"  [!] bind {src} echoue aussi: {e2}")
+
+    # garantir /dev/null et /dev/console meme si devtmpfs incomplet (filet)
+    devnull = f"{NEWROOT}/dev/null"
+    if not os.path.exists(devnull):
+        try:
+            os.mknod(devnull, 0o20666, os.makedev(1, 3))
+            log("  /dev/null cree (filet, devtmpfs incomplet)")
+        except OSError:
+            pass
+
     os.chdir(NEWROOT)
     mount(".", "/", "", MS_MOVE)            # deplace l'overlay sur /
     os.chroot(".")

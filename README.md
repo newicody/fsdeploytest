@@ -818,6 +818,39 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > `zpool upgrade <pool>` si tu veux activer les features récentes (attention :
 > le pool ne sera plus accessible par une version ZFS plus ancienne).
 >
+> **`clean_rootfs.py` ne supprime PAS les essentiels** : `etc/portage`,
+> `var/db/pkg`, `lib/modules`, `sbin/session_launch.py`,
+> `usr/local/sbin/boot_confirm.py` sont dans `PROTECTED` (jamais touchés). Seuls
+> des résidus de build sont purgés (`var/tmp/portage`, caches distfiles/binpkgs,
+> `usr/portage` legacy, logs, machine-id…). En **dry-run**, la copie n'a pas
+> lieu donc le staging est vide ; la vérification des essentiels se fait alors
+> dans la **source** (plus de faux « absent de la copie »).
+>
+> **Datasets montés dans le rootfs (`--one-file-system`)** : `rsync` utilise
+> `--one-file-system` pour ne pas traverser `/mnt`, `/proc`… mais cela
+> **sauterait** aussi les datasets ZFS montés dans le rootfs (ex `/var/db/pkg`,
+> `/etc/portage` sur Gentoo). `clean_rootfs` les **détecte** (`findmnt`, via
+> `submounts_under`) en filtrant les pseudo-FS et montages externes, puis les
+> **copie explicitement** un par un. Sans ça, ces données manqueraient
+> silencieusement du `rootfs.sfs`.
+
+> **switch_root : déplacer les pseudo-FS** (leçon de debug réel) : avant de
+> basculer sur le nouveau root, init.py **déplace** (`MS_MOVE`) `/dev`, `/proc`,
+> `/sys`, `/run` vers `NEWROOT`. Sans ça, le nouveau `/` a un `/dev` **vide** →
+> pas de `/dev/null` → `python`/`session_launch.py` échoue (« /dev/null: no such
+> file or directory ») → PID 1 meurt → **kernel panic**. C'est ce que fait le
+> vrai `switch_root` en interne. Filet supplémentaire : `/dev/null` est recréé
+> via `mknod` si devtmpfs est incomplet.
+
+> **Staging simplifié (une seule écriture du .sfs)** : `sfs_build` écrit le
+> squashfs temporaire **directement dans le dossier de destination** (même FS que
+> `rootfs.sfs`), puis publie par `os.replace` atomique. Avant, un staging séparé
+> (tmpfs/dataset) sur un autre FS forçait une **copie** du `.sfs` (plusieurs Go)
+> à la publication. Désormais : `clean_rootfs` produit la copie nettoyée, puis
+> `mksquashfs` compresse **directement** vers `rootfs.sfs` — plus de
+> staging-de-staging. (`_pick_staging`, `_same_fs` et les estimateurs de taille
+> ont été supprimés : ~70 lignes en moins.)
+>
 > **Stream console optionnel** : le stream de boot (ffmpeg vers YouTube) est une
 > commodité, pas une nécessité. Il ne démarre **que si `stream` est dans la
 > cmdline**. Par défaut il est désactivé — un point de crash en moins pendant le

@@ -513,7 +513,7 @@ def _efivars_ok():
         return False
 
 
-def run_build(config_path, rep, src="/usr/src/linux"):
+def run_build(config_path, rep, src="/usr/src/linux", infra_conf="infra.conf"):
     """Stage le .config fourni puis delegue a kernel_build.py (compile,
     zfs-kmod, sfs, initramfs, EFI, registre). Pas de reecriture : on appelle
     la chaine existante."""
@@ -529,8 +529,11 @@ def run_build(config_path, rep, src="/usr/src/linux"):
     rep.info("delegation a kernel_build.py (compile + zfs-kmod + sfs + "
              "initramfs + EFI + registre)")
     # kernel_build.py est concu comme un script ; on l'execute (il lit l'env
-    # SRC/ESP/DISK/PART/CMDLINE). On capture pour le rapport/stream.
-    env = dict(os.environ, SRC=src)
+    # SRC/ESP/DISK/PART/CMDLINE/INFRA_CONF). On capture pour le rapport/stream.
+    # INFRA_CONF est CRUCIAL : sans lui, kernel_build ne trouve pas [uki] et ne
+    # cree QUE l'entree classique (pas les profils safe/debug/i915).
+    env = dict(os.environ, SRC=src,
+               INFRA_CONF=os.path.abspath(infra_conf))
     p = subprocess.run([sys.executable, "kernel_build.py"], env=env)
     return p.returncode == 0
 
@@ -703,7 +706,7 @@ def main():
     else:
         rep.warn("--rootfs-src non fourni : rootfs.sfs suppose deja present "
                  "(verifie qu'il existe dans fast_pool/sfs !)")
-    built = run_build(a.config, rep, src=a.src)
+    built = run_build(a.config, rep, src=a.src, infra_conf=a.infra)
     write_report(rep)
     if not built:
         print("!! build echoue (cf. sortie kernel_build). Rien arme.", flush=True)

@@ -78,76 +78,21 @@ class SfsResult:
                 f"{self.size_mb}MB {self.reason}>")
 
 
-def _free_mb(path):
-    try:
-        st = os.statvfs(path)
-        return st.f_bavail * st.f_frsize / (1024 * 1024)
-    except OSError:
-        return 0.0
-
-
-def _same_fs(a, b):
-    try:
-        return os.stat(a).st_dev == os.stat(b).st_dev
-    except OSError:
-        return False
-
-
-def _staging_dataset_mp(log):
-    """Point de montage de fast_pool/staging (le monte au besoin). '' si absent."""
-    ds = os.environ.get("STAGING_DS", "fast_pool/staging")
-    subprocess.run(["zfs", "mount", ds], stderr=subprocess.DEVNULL)
-    try:
-        mp = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint", ds],
-                            capture_output=True, text=True).stdout.strip()
-    except OSError:
-        return ""
-    return mp if mp and mp != "legacy" and os.path.isdir(mp) else ""
-
-
-def _pick_staging(estimate_mb, dest_dir, log):
-    """Choisit OU ecrire le .sfs temporaire, par ordre de preference :
-      1. dest_dir lui-meme (meme FS que la destination -> os.replace ATOMIQUE,
-         zero cross-device). C'est le cas ideal.
-      2. fast_pool/staging (dataset dedie, meme pool que sfs).
-      3. /var/tmp en dernier recours (avec alerte).
-    estimate_mb = taille presumee du .sfs final."""
-    need = max(estimate_mb * 1.3, 512)             # marge 30 %, plancher 512 Mo
-    # 1. destination elle-meme (le meilleur : meme FS -> rename atomique)
-    if _free_mb(dest_dir) >= need:
-        log(f"staging = destination {dest_dir} (meme FS, rename atomique)")
-        return dest_dir
-    # 2. dataset dedie fast_pool/staging
-    sds = _staging_dataset_mp(log)
-    if sds and _free_mb(sds) >= need:
-        log(f"staging = {sds} (dataset dedie)")
-        return sds
-    # 3. repli
-    log(f"destination et fast_pool/staging insuffisants (~{need:.0f} Mo requis) "
-        f"-> repli /var/tmp")
-    return "/var/tmp"
-
-
-def _dir_size_mb(path):
-    """Taille approximative d'une arborescence (pour estimer le .sfs)."""
-    total = 0
-    for root, _, files in os.walk(path):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                pass
-    return total / (1024 * 1024)
-
-
 def _mksquashfs(src, dst, staging, log, extra=None):
-    """Compresse src -> dst via mksquashfs, en passant par un fichier temporaire
-    dans staging (tmpfs), puis deplace vers dst. Nettoie le temporaire.
-    Retourne SfsResult."""
+    """Compresse src -> dst via mksquashfs, en ecrivant le fichier temporaire
+    DIRECTEMENT dans le dossier de destination (meme FS que dst). Ainsi la
+    publication est TOUJOURS un os.replace atomique et instantane -- JAMAIS de
+    copie du .sfs (qui peut faire des Go). Plus de staging intermediaire :
+    mksquashfs ecrit a cote de la cible finale, c'est tout.
+
+    `staging` est ignore pour l'ecriture du .sfs (conserve dans la signature pour
+    compat) ; mksquashfs gere lui-meme sa memoire de travail."""
     if not os.path.isdir(src):
         return SfsResult(False, dst, f"source absente : {src}")
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    tmp = os.path.join(staging, os.path.basename(dst) + ".new")
+    dst_dir = os.path.dirname(dst) or "."
+    os.makedirs(dst_dir, exist_ok=True)
+    # .new dans le MEME dossier que dst -> meme FS -> os.replace atomique garanti.
+    tmp = dst + ".new"
     if os.path.exists(tmp):
         try:
             os.remove(tmp)
@@ -157,7 +102,7 @@ def _mksquashfs(src, dst, staging, log, extra=None):
            "-xattrs", "-noappend", "-quiet", "-processors", str(os.cpu_count() or 1)]
     if extra:
         cmd += extra
-    log(f"mksquashfs {src} -> {dst} (staging {staging})")
+    log(f"mksquashfs {src} -> {dst} (ecriture directe, sans re-staging)")
     try:
         p = subprocess.run(cmd)
     except FileNotFoundError:
@@ -166,7 +111,6 @@ def _mksquashfs(src, dst, staging, log, extra=None):
     if p.returncode != 0:
         _safe_rm(tmp)
         return SfsResult(False, dst, f"mksquashfs a echoue (rc={p.returncode})")
-    # controle : le .sfs temporaire existe et n'est pas vide
     try:
         size = os.path.getsize(tmp)
     except OSError:
@@ -174,23 +118,12 @@ def _mksquashfs(src, dst, staging, log, extra=None):
     if size < 4096:
         _safe_rm(tmp)
         return SfsResult(False, dst, f"squashfs anormalement petit ({size} o)")
-    # publication vers la destination finale, SANS cross-device :
-    #  - meme FS  -> os.replace (atomique, instantane)
-    #  - FS differents -> copie vers un .new DANS le dossier de destination
-    #    (meme FS que dst), puis os.replace local atomique. Jamais de
-    #    shutil.move cross-device fragile.
+    # publication : os.replace LOCAL (tmp et dst dans le meme dossier) -> atomique,
+    # instantane, jamais cross-device.
     moved = False
     try:
-        if _same_fs(staging, os.path.dirname(dst)):
-            os.replace(tmp, dst)               # tmp et dst sur le meme FS
-            moved = True
-        else:
-            local_tmp = dst + ".new"
-            _safe_rm(local_tmp)
-            shutil.copyfile(tmp, local_tmp)
-            os.replace(local_tmp, dst)         # rename local atomique
-            _safe_rm(tmp)                      # nettoie le tmp distant
-            moved = True
+        os.replace(tmp, dst)
+        moved = True
     except OSError as e:
         _safe_rm(tmp)
         _safe_rm(dst + ".new")
@@ -301,12 +234,12 @@ def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
         size_mb = os.path.getsize(dst) / (1024 * 1024)
         log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree (force=False)")
         return SfsResult(True, dst, "deja present", int(size_mb))
-    est = _dir_size_mb(rootfs_src) * 0.5       # zstd ~50 % sur un rootfs
-    staging = _pick_staging(est, mp, log)
     # exclusions pseudo-FS/volatils : -e doit etre le DERNIER flag mksquashfs
     # (tout ce qui suit est traite comme motif d'exclusion).
     extra = ["-e"] + ROOTFS_EXCLUDES
-    return _mksquashfs(rootfs_src, dst, staging, log, extra=extra)
+    # plus de staging : _mksquashfs ecrit le .new a cote de dst (meme FS) puis
+    # os.replace atomique. Une seule ecriture du .sfs, zero copie.
+    return _mksquashfs(rootfs_src, dst, mp, log, extra=extra)
 
 
 def build_modules_sfs(kver, sfs_dataset="fast_pool/sfs", log=print, force=False):
@@ -320,9 +253,8 @@ def build_modules_sfs(kver, sfs_dataset="fast_pool/sfs", log=print, force=False)
         size_mb = os.path.getsize(dst) / (1024 * 1024)
         log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree")
         return SfsResult(True, dst, "deja present", int(size_mb))
-    est = _dir_size_mb(src) * 0.5
-    staging = _pick_staging(est, mp, log)
-    return _mksquashfs(src, dst, staging, log)
+    # ecriture directe (pas de staging) : .new a cote de dst + os.replace atomique
+    return _mksquashfs(src, dst, mp, log)
 
 
 if __name__ == "__main__":

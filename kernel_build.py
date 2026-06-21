@@ -352,9 +352,16 @@ def main():
                 os.makedirs(dst_dir, exist_ok=True)
                 vm = os.path.join(dst_dir, f"vmlinuz-{kver}.efi")
                 it = os.path.join(dst_dir, f"initramfs-{kver}.zst")
-                shutil.copy2(os.path.join(dest, f"vmlinuz-{kver}.efi"), vm)
-                shutil.copy2(os.path.join(dest, f"initramfs-{kver}.zst"), it)
-                msg(f"  {esp_mnt} : vmlinuz + initramfs ecrases (a jour)")
+                src_vm = os.path.join(dest, f"vmlinuz-{kver}.efi")
+                src_it = os.path.join(dest, f"initramfs-{kver}.zst")
+                # 1ere ESP = deja stagee (dst_dir == dest) -> NE PAS copier sur
+                # soi-meme (SameFileError casserait tout le bloc profils).
+                if os.path.abspath(vm) != os.path.abspath(src_vm):
+                    shutil.copy2(src_vm, vm)
+                    shutil.copy2(src_it, it)
+                    msg(f"  {esp_mnt} : vmlinuz + initramfs ecrases (a jour)")
+                else:
+                    msg(f"  {esp_mnt} : deja stage (ESP primaire)")
                 if not disk or not register:
                     msg(f"  {esp_mnt} (tag {tag}) : register_uefi=off ou pas de "
                         f"disk -> fichiers stages, PAS d'entree NVRAM")
@@ -400,7 +407,11 @@ def main():
             msg(f"entrees EFI par profil creees ({len(profiles)} profils "
                 f"x {len([e for e in esps if e[1]])} ESP avec NVRAM)")
     except Exception as e:
-        msg(f"entrees profils non creees ({e}) -- non bloquant, entree classique OK")
+        import traceback
+        msg(f"  [!] entrees profils INTERROMPUES par une exception : {e}")
+        for ln in traceback.format_exc().splitlines():
+            msg(f"      {ln}")
+        msg("  -> entree classique OK, mais profils incomplets (voir trace ci-dessus)")
 
     # PURGE FINALE : maintenant que TOUTES les nouvelles entrees existent, on
     # supprime les ANCIENNES orphelines (en preservant celles qu'on vient de

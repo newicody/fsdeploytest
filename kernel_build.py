@@ -49,13 +49,37 @@ def efi_entry(label):
     return m[0] if m else None
 
 
-def purge_our_entries():
-    """Supprime TOUTES les entrees EFI dont le loader pointe vers notre dossier
-    (DEST_DIR, ex EFI/gentoo) : nos vmlinuz-*.efi et anciennes UKI. Repart propre
-    a chaque build -> pas d'accumulation, pas de melange d'anciennes entrees qui
-    pointent vers des fichiers absents ou de mauvaises versions. NE TOUCHE PAS
-    aux entrees tierces (Windows, Debian, firmware...)."""
-    # efibootmgr -v montre le chemin du loader : File(\EFI\gentoo\vmlinuz-...)
+def _load_boot_opts():
+    """Lit [uki] arm_bootnext + default_profile de infra.conf. Retourne
+    (arm_bootnext: bool, default_profile: str)."""
+    try:
+        from configobj import ConfigObj
+        cfg = ConfigObj(os.environ.get("INFRA_CONF", "infra.conf"))
+        uki = cfg.get("uki", {})
+        arm = str(uki.get("arm_bootnext", "false")).lower() in ("true", "1", "yes")
+        default = str(uki.get("default_profile", "")).strip()
+        return arm, default
+    except Exception:
+        return False, ""
+
+
+def set_boot_order_first(bootnum):
+    """Place bootnum en TETE du BootOrder (sans supprimer les autres). Le boot
+    par defaut devient cette entree."""
+    m = re.search(r"^BootOrder:\s*(.+)$", out(["efibootmgr"]), re.M)
+    order = [x.strip() for x in m.group(1).split(",")] if m else []
+    order = [b for b in order if b.upper() != bootnum.upper()]
+    new_order = ",".join([bootnum] + order)
+    run(["efibootmgr", "-o", new_order])
+    return new_order
+
+
+def purge_our_entries(keep=None):
+    """Supprime les entrees EFI dont le loader pointe vers notre dossier
+    (DEST_DIR), SAUF celles fraichement creees (keep = set de Boot####). Appelee
+    APRES creation des nouvelles -> supprime uniquement les ANCIENNES orphelines,
+    jamais de fenetre sans entrees. NE TOUCHE PAS aux entrees tierces."""
+    keep = keep or set()
     needle = DEST_DIR.replace("/", "\\").lower()       # ex 'efi\gentoo'
     verbose = out(["efibootmgr", "-v"])
     removed = []
@@ -64,12 +88,13 @@ def purge_our_entries():
         if not m:
             continue
         bootnum, rest = m.group(1), m.group(2).lower()
-        # supprimer si le loader pointe vers notre dossier
+        if bootnum in keep:
+            continue                          # entree qu'on vient de creer : garder
         if needle in rest:
             run(["efibootmgr", "-b", bootnum, "-B"])
             removed.append(bootnum)
     if removed:
-        msg(f"purge entrees EFI obsoletes (notre dossier) : {', '.join(removed)}")
+        msg(f"purge anciennes entrees EFI (orphelines) : {', '.join(removed)}")
     else:
         msg("aucune ancienne entree EFI a purger")
     return removed
@@ -249,9 +274,11 @@ def main():
         sys.exit("efivarfs indisponible : impossible d'ecrire les variables EFI.\n"
                  "  En chroot, monte-le avant : "
                  "mount -t efivarfs efivarfs /sys/firmware/efi/efivars")
-    # NETTOYAGE : degager TOUTES nos anciennes entrees (pointant vers DEST_DIR)
-    # avant d'en recreer -> repart propre, pas de melange d'anciennes versions.
-    purge_our_entries()
+    # ORDRE SUR : on CREE d'abord les nouvelles entrees, on purge les vieilles
+    # APRES. Ainsi il n'y a JAMAIS de fenetre ou la machine se retrouve sans
+    # aucune entree (ce qui arriverait si une purge precoce etait suivie d'un
+    # echec de creation). On note les Boot#### qu'on cree pour ne pas les purger.
+    created = set()
     efi_dir = DEST_DIR.replace("/", "\\")
     label = f"Gentoo-{kver}"
     old = efi_entry(label)
@@ -266,8 +293,18 @@ def main():
         # diagnostic : montrer ce que efibootmgr voit reellement
         sys.exit("entree EFI introuvable apres creation. Sortie efibootmgr :\n"
                  + out(["efibootmgr"]))
-    run(["efibootmgr", "--bootnext", new])
-    msg(f"entree {label} = Boot{new} — BootNext arme (essai unique)")
+    created.add(new)
+    # BootNext conditionnel : seulement si [uki] arm_bootnext = true (validation
+    # auto d'un nouveau noyau). En phase debug (false), on n'arme RIEN -> le menu
+    # BIOS / BootOrder decide, tu choisis librement le profil a tester.
+    _arm, _default_prof = _load_boot_opts()
+    _default_bootnum = [None]              # mutable pour la boucle profils
+    if _arm:
+        run(["efibootmgr", "--bootnext", new])
+        msg(f"entree {label} = Boot{new} — BootNext arme (essai unique)")
+    else:
+        msg(f"entree {label} = Boot{new} — BootNext NON arme "
+            f"(arm_bootnext=false : choisis le profil dans le menu BIOS)")
 
     # 6bis. Une entree EFI CLASSIQUE par profil (normal/safe/i915), noyau+initrd
     # SEPARES (initrd=\EFI\... passe par le firmware). Methode fiable : pas de
@@ -276,7 +313,12 @@ def main():
     try:
         import uki_build                       # reutilise load_profiles ([uki])
         infra = os.environ.get("INFRA_CONF", "infra.conf")
+        if not os.path.exists(infra):
+            msg(f"  [!] infra.conf INTROUVABLE ({infra}) -> profils NON crees, "
+                f"seule l'entree classique existe. Definis INFRA_CONF ou lance "
+                f"depuis le bon repertoire.")
         enabled, profiles = uki_build.load_profiles(infra)
+        msg(f"  [uki] enabled={enabled}, {len(profiles)} profil(s) lus depuis {infra}")
         if enabled and profiles:
             # ESP(s) : (mount, disk, part, tag, register). La 1ere = celle deja
             # stagee (ESP primaire env). tag = suffixe de label pour distinguer
@@ -319,12 +361,34 @@ def main():
                          "--loader", f"\\{efi_dir_bs}\\vmlinuz-{kver}.efi",
                          "--unicode",
                          f"initrd=\\{efi_dir_bs}\\initramfs-{kver}.zst {cmd}"])
+                    bn = efi_entry(lbl)
+                    if bn:
+                        created.add(bn)         # ne pas purger celle-ci
+                        # memoriser le bootnum du profil par defaut (1ere ESP)
+                        if prof["name"] == _default_prof and _default_bootnum[0] is None:
+                            _default_bootnum[0] = bn
                     msg(f"  entree '{lbl}' -> {disk}p{part} "
                         f"(initrd separe + cmdline profil)")
             msg(f"entrees EFI par profil creees ({len(profiles)} profils "
                 f"x {len([e for e in esps if e[1]])} ESP avec NVRAM)")
     except Exception as e:
         msg(f"entrees profils non creees ({e}) -- non bloquant, entree classique OK")
+
+    # PURGE FINALE : maintenant que TOUTES les nouvelles entrees existent, on
+    # supprime les ANCIENNES orphelines (en preservant celles qu'on vient de
+    # creer). Jamais de fenetre sans entrees -> en cas d'echec plus haut, les
+    # vieilles entrees restent (la machine garde de quoi booter).
+    purge_our_entries(keep=created)
+
+    # BOOTORDER : placer le profil par defaut (ex 'safe') en tete -> boot par
+    # defaut sur le profil le plus sur si tu ne touches a rien dans le BIOS.
+    if _default_bootnum[0]:
+        order = set_boot_order_first(_default_bootnum[0])
+        msg(f"BootOrder : profil '{_default_prof}' (Boot{_default_bootnum[0]}) "
+            f"en tete -> {order}")
+    elif _default_prof:
+        msg(f"default_profile='{_default_prof}' non trouve parmi les entrees "
+            f"creees -> BootOrder inchange")
 
     # indexer la version dans le registre (statut candidate jusqu'au boot valide)
     try:

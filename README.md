@@ -1238,12 +1238,40 @@ toujours de `GITHUB_TOKEN` (jamais dans le fichier).
 > 3. les fichiers sont **toujours écrasés** sur **chaque** ESP (avant : un ancien
 >    fichier de même nom n'était pas remplacé → on bootait du vieux code).
 
-> **Deux ESP avec entrées distinctes** : `esp2` a `register_uefi = true` (les
-> entrées EFI sont créées sur **les deux** disques → chaque NVMe boote seul).
-> Pour les distinguer dans le menu UEFI, chaque ESP a un `tag` (`nvme0`/`nvme1`)
-> suffixé au label : `Gentoo-safe-nvme0`, `Gentoo-safe-nvme1`, `Gentoo-debug-nvme0`…
-> Tu vois ainsi clairement depuis quel disque tu bootes. La purge se base sur le
-> chemin du loader, donc elle nettoie tous ces labels quel que soit le suffixe.
+> **Sécurité des entrées EFI** : `kernel_build` **crée d'abord** les nouvelles
+> entrées, puis **purge les anciennes** orphelines (en préservant les neuves).
+> Les entrées sont entièrement pilotées par l'`.ini` (profils `[uki]`) et
+> recréées à chaque compilation réussie. La purge ne touche jamais aux entrées
+> tierces (Windows, Debian, firmware).
+
+> **`INFRA_CONF` doit être transmis** : `first_boot` passe `INFRA_CONF` (le
+> `--infra`) à `kernel_build`. **Sans ça**, `kernel_build` ne trouve pas la
+> section `[uki]` et ne crée **que l'entrée classique** (pas les profils
+> safe/debug/i915) — symptôme : une seule entrée dans le BIOS. Le build affiche
+> désormais `[uki] enabled=… N profil(s) lus` pour confirmer.
+
+> **BootNext et BootOrder pilotés par l'`.ini`** (`[uki]`) :
+> - **`arm_bootnext`** : `false` en phase debug → **aucun** automatisme, tu
+>   choisis librement le profil dans le menu BIOS (évite qu'un profil force un
+>   boot alors que tu veux en tester un autre). `true` plus tard → validation
+>   auto d'un nouveau noyau (essai unique, retombe sur l'ancien si plantage).
+> - **`default_profile`** (ex `safe`) : ce profil est placé **en tête du
+>   BootOrder** → boot par défaut sur le plus sûr si tu ne touches à rien. Vide
+>   = BootOrder inchangé.
+>
+> Note : tous les profils pointent vers le **même** `vmlinuz-<ver>` +
+> `initramfs-<ver>` (accordés). Changer de profil change la **cmdline**, pas le
+> couple noyau/initramfs — donc pas de risque de désaccord modules/noyau entre
+> profils.
+
+> **Recovery si les entrées ont disparu** : recrée-en une à la main depuis un
+> chroot/USB (adapte disque/partition/version) :
+> ```sh
+> efibootmgr --create --disk /dev/nvme0n1 --part 1 --label "Gentoo-rescue" \
+>   --loader '\EFI\gentoo\vmlinuz-7.0.12.efi' \
+>   --unicode 'initrd=\EFI\gentoo\initramfs-7.0.12.zst pcie_aspm=off nomodeset console=tty0 loglevel=7'
+> efibootmgr   # noter le Boot#### puis : efibootmgr --bootnext ####
+> ```
 
 La section `[uki]` sert toujours à déclarer les **profils** (label + cmdline),
 mais ils sont déployés en entrées EFI classiques, pas en binaires UKI uniques.

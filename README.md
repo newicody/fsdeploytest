@@ -858,25 +858,81 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > on débugge éternellement du vieux code figé.
 >
 > **PID 1 résilient (compositeur)** : `session_launch.py` ne fait **plus**
-> `execvp("cage")` direct — si cage échoue à créer son backend wlroots, cela
-> tuerait PID 1 → **panic**. Il lance le compositeur en **sous-processus**,
-> surveille le code retour, et en cas d'échec **bascule sur un shell de
-> maintenance en boucle** (PID 1 ne quitte jamais). Cause typique du « unable to
-> create the wlroots backend » : avoir booté en **`nomodeset`** (profil `safe`)
-> → pas de KMS → pas de `/dev/dri/card0` → wlroots ne peut pas créer de backend
-> DRM. Pour l'affichage graphique, boote un profil **avec** KMS (normal/i915),
-> pas `safe`. Le diagnostic affiche si `/dev/dri/card0` est présent.
+> `execvp("cage")` direct. Il **boucle** sur le compositeur : que cage se termine
+> **proprement** (tu fermes foot) ou **échoue**, PID 1 ne meurt jamais (sinon
+> kernel panic). Sortie propre → relance ; échec → nouvelle tentative, et après 3
+> échecs consécutifs → shell de maintenance (puis re-tentative). Cause typique du
+> « unable to create the wlroots backend » : `nomodeset` (profil `safe`) → pas de
+> KMS → pas de `/dev/dri/card0`. Pour l'affichage, boote un profil **avec** KMS
+> (i915/normal).
 >
-> **PIÈGE `--rootfs-src` (scripts du rootfs)** : `session_launch.py` et
-> `boot_confirm.py` **vivent dans le rootfs Gentoo**, donc figés dans
-> `rootfs.sfs`. Les modifier dans le dépôt ne suffit PAS : il faut **régénérer
-> le sfs** pour qu'ils soient redéployés (`sfs_build.deploy_appliance_scripts`
-> les copie depuis le dépôt avant `mksquashfs`). Or `first_boot` ne régénère le
-> sfs **que si `--rootfs-src` est fourni**. Sans lui, `kernel_build` ne refait
-> que l'initramfs → le boot utilise l'**ancien** `session_launch.py` (cause du
-> panic cage « execvp » alors que le fix était livré). `first_boot` avertit
-> désormais explicitement quand le sfs n'est pas régénéré et que ces scripts ont
-> été modifiés récemment.
+> **Orchestration des services (`[services]` dans infra.conf)** : après le
+> switch_root, `session_launch.start_services()` démarre les services OpenRC
+> listés dans la section `[services]`, **dans l'ordre de déclaration** (configobj
+> préserve l'ordre), via `rc-service <nom> start`. Modèle « Python orchestre,
+> OpenRC exécute » : un PID 1 Python minimal, mais le socle système (dbus,
+> syslog-ng, udev) est délégué à OpenRC plutôt que réimplémenté. Format :
+> `nom = enabled[, required]` ou `disabled`. Le socle (`syslog-ng`, `dbus`,
+> `udev`) démarre **avant** le stream, pour que les logs (`/var/log` restauré via
+> syslog-ng) et le bus soient prêts. Le **réseau** (IP statique en initramfs) et
+> **ZFS** ne sont **pas** dans `[services]` (déjà gérés en amont). Un service
+> `required` en échec est signalé fort mais ne bloque jamais le boot.
+>
+> **Streaming YouTube (diagnostiquable)** : `start_wayland_stream` capture l'écran
+> Wayland vers YouTube RTMP. Prérequis : `/etc/yt.key` (clé de diffusion),
+> `wl-screenrec` (HEVC VAAPI Intel, idéal) **ou** `wf-recorder`+ffmpeg (x264
+> logiciel) dans le rootfs, et `/dev/dri/renderD128` (VAAPI). Les erreurs vont
+> dans **`/var/log/stream.log`** (plus jetées) ; messages clairs si la clé ou
+> l'outil manque.
+>
+> **PIÈGE `--rootfs-src` (scripts du rootfs)** : `session_launch.py`,
+> `boot_confirm.py` **et `infra.conf`** **vivent dans le rootfs Gentoo**, donc
+> figés dans `rootfs.sfs`. Les modifier dans le dépôt ne suffit PAS : il faut
+> **régénérer le sfs** pour qu'ils soient redéployés
+> (`sfs_build.deploy_appliance_scripts` les copie depuis le dépôt avant
+> `mksquashfs` — `infra.conf` va dans `/etc/infra.conf`, lu par `start_services`
+> au boot). Or `first_boot` ne régénère le sfs **que si `--rootfs-src` est
+> fourni**. Sans lui, le boot utilise l'**ancienne** version figée. `first_boot`
+> avertit quand le sfs n'est pas régénéré et que ces fichiers ont changé.
+
+> **Régénérer rootfs.sfs depuis l'overlay (`freeze_overlay.py`)** : l'overlay
+> racine accumule tes modifications dans l'**upper** (`fast_pool/rootfs`). Pour
+> les pérenniser, `freeze_overlay.py` fige l'état courant en un **nouveau
+> `rootfs-vN.sfs` versionné**, **à chaud** depuis la station, **sans toucher au
+> système vivant** :
+> 1. **snapshot ZFS** de l'upper (`fast_pool/rootfs@freeze-<ts>`) — sécurité +
+>    état figé cohérent (conservé pour rollback).
+> 2. **clone** du snapshot (upperdir inscriptible requis par overlayfs).
+> 3. **overlay offline** dans `/tmp/freeze-<ts>/merged` : lower = `rootfs.sfs`
+>    actuel (ro), upper = le clone. overlayfs applique les **whiteouts**
+>    (suppressions) → le merged est l'état EXACT du système, sans fusion manuelle.
+> 4. **`mksquashfs`** du merged → `rootfs-vN.sfs` (versionné, n'écrase pas
+>    l'actuel ; réutilise `sfs_build._mksquashfs`).
+> 5. démontage propre (le snapshot reste).
+>
+> Cycle d'évolution : modifier (dans l'overlay live) → `freeze_overlay.py` →
+> pointer le boot sur `rootfs-vN.sfs` → reboot (l'upper se réinitialise car le
+> CRC du sfs change, via `upper_stale` dans init.py). On ne `mksquashfs` JAMAIS
+> `/` directement (système vivant) : l'overlay offline depuis un snapshot donne
+> une image reproductible et sûre. Versionnement + snapshot = double rollback.
+
+> **Sélection de version (`select_rootfs.py`)** : `rootfs.sfs` est un **lien
+> symbolique** vers `rootfs-vN.sfs` dans le dataset sfs. init.py monte toujours
+> `rootfs.sfs` (le lien est suivi de façon transparente par `os.open`/`losetup`,
+> donc **init.py est inchangé**). Changer de version = recréer le lien
+> (atomique : symlink temporaire + `os.replace`).
+> - `select_rootfs.py list` — versions disponibles + active
+> - `select_rootfs.py use v4` (ou `4`, ou le nom) — active une version
+> - `select_rootfs.py rollback` — revient à la version précédente (mémorisée dans
+>   `.rootfs-previous`)
+>
+> Le changement prend effet au **prochain boot**, et l'upper se réinitialise
+> alors (CRC du sfs différent) : **fige l'overlay avec `freeze_overlay.py` AVANT
+> de changer de version** si tu veux garder tes modifs courantes. Transition :
+> le premier `rootfs.sfs` créé par `sfs_build` est un fichier réel ; pour passer
+> au modèle versionné, renomme-le en `rootfs-v1.sfs` puis
+> `select_rootfs.py use v1` (crée le lien). `freeze_overlay` produit ensuite
+> v2, v3…
 
 > **`evm: overlay not supported` (bénin)** : EVM (vérification d'intégrité du
 > noyau) ne gère pas overlayfs et se désactive pour l'overlay. Purement
@@ -1687,3 +1743,89 @@ eclean-kernel -n 2                     # ménage manuel des noyaux
 - Rapporteur **stream → chat YouTube** (Data API v3 : post compile/boot/promotion
   + lecture de commandes gatées owner/modérateurs).
 - Extension de l'auto-update au-delà du noyau (set Gentoo ciblé, OpenVINO).
+
+> **overlayfs : chemins « fantômes » après switch_root (normal)** : dans le
+> système booté, `/proc/mounts` montre `overlay on / ...
+> lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work` — ces
+> chemins **n'existent pas** dans Gentoo. C'est **normal** : ce sont les chemins
+> au moment du montage (dans l'initramfs, disparu au switch_root). overlayfs
+> garde les **références internes** (inodes du lower squashfs et de l'upper)
+> ouvertes ; le montage reste valide même si les chemins d'origine n'existent
+> plus. Le dataset upper (`fast_pool/rootfs`) n'est donc **pas** monté dans
+> Gentoo, mais il est bien utilisé par l'overlay via ces références.
+
+> **`canmount=noauto` sur l'upper** : `fast_pool/rootfs` (l'upper de l'overlay
+> racine) ne doit **jamais** être monté automatiquement à son mountpoint naturel
+> (`/fast_pool/rootfs`) — il est réservé à l'overlay. Un double montage créerait
+> un accès concurrent au même dataset (incohérences si écriture). init.py pose
+> `canmount=noauto` à chaque boot (idempotent) et démonte l'emplacement naturel
+> s'il était monté, avant de monter l'upper sur `/mnt/ovl`. `freeze_overlay`
+> travaille sur un **clone** (jamais l'original) et force `canmount=noauto` sur
+> l'upper. Si tu montes le dataset manuellement pour inspecter
+> (`zfs mount fast_pool/rootfs`), **démonte-le** ensuite (`zfs umount
+> fast_pool/rootfs`) pour éviter le double-accès.
+
+> **Politique de stockage (`[storage]` + `storage_manager.py`)** : placement des
+> datasets selon leur nature physique = redondance x volume x vitesse.
+> - **fast_pool** (NVMe stripe, rapide, zero redondance) -> ephemere /
+>   reconstructible : images actives (`sfs`), upper (`rootfs`), `staging` de
+>   build, sources noyau (`usr-src`), `var`/`tmp`/`log` volatils, `reserve`
+>   (200G, empeche le pool d'atteindre 100%).
+> - **data_pool** (raidz2, gros, lent, tres redondant) -> precieux / volumineux :
+>   `home`, `log` persistant, `archives/gentoo` (copies lentes des snapshots),
+>   `archives/failsafe` (rootfs de secours).
+> - **boot_pool** (mirror, petit, redondant) -> critique de boot + gestionnaire :
+>   `images` (RESCUE_SFS), `efi-backup`, `manager` (infra.conf de reference,
+>   **sauvegardes des `.config` noyau**, etat des deploiements).
+>
+> La politique est declaree dans `[storage]` d'infra.conf (par dataset : pool,
+> role, proprietes attendues : compression/canmount/reservation...).
+> `storage_manager.py` LIT cette politique, interroge l'etat reel ZFS et RAPPORTE
+> les ecarts (existence, proprietes) **sans corriger** : il affiche les commandes
+> `zfs create`/`zfs set` a lancer a la main. Tension resolue pour le noyau :
+> compiler vite sur `fast_pool/usr-src` (NVMe), mais sauvegarder la `.config`
+> precieuse sur `boot_pool/manager` (redondant). Les snapshots vivent sur
+> fast_pool (rapide) avec copie lente `zfs send/recv` vers `data_pool/archives`
+> (filet de securite du stripe).
+
+> **Sauvegarde de la `.config` noyau (`kernel_build`)** : apres une compilation
+> reussie (confirmee par la presence de `zfs.ko`), `backup_kernel_config` copie
+> la `.config` vers `boot_pool/manager/configs/` (mirror redondant), nommee
+> `config-<kver>-<timestamp>` + liens `config-<kver>-latest` et `config-current`.
+> Ainsi la compilation reste rapide sur `fast_pool/usr-src` (NVMe stripe) mais la
+> config precieuse survit a une panne NVMe. Best effort : un echec de sauvegarde
+> ne casse pas le build.
+
+> **Session utilisateur dediee + verrou (`[session]`)** : `session_launch` lance
+> le compositeur en **utilisateur non-root** dedie (plus sur que cage en root).
+> `[session]` definit : `user` (cree s'il manque via `useradd`), `groups`
+> (`video`/`input`/`seat`/`render` : acces DRM + entrees via seatd), `app`
+> (lancee dans cage, ex foot/firefox) et `app_fallback`. `ensure_user` cree
+> l'utilisateur + groupes (idempotent) ; `run_session_app` lance
+> `cage -- <app>` avec `setuid/setgid` vers cet utilisateur et son propre
+> `XDG_RUNTIME_DIR=/run/user/<uid>`. **PID 1 (root) reste le parent** et survit a
+> la sortie de cage (boucle de relance). Verrou d'ecran optionnel
+> (`[session][[lock]]`) : `swaylock` (PAM natif, eprouve) declenche sur
+> inactivite par `swayidle` apres `idle_timeout` secondes ; une couche
+> `python-pam` peut etre ajoutee pour une logique d'auth personnalisee. Le verrou
+> d'ecran Wayland n'est PAS reimplemente en Python (composant de securite :
+> swaylock est le standard wlroots).
+
+> **Gestion des snapshots (`[snapshots]` + `snapshot_manager.py`)** : gestionnaire
+> central de tous les snapshots ZFS, classes par TYPE selon leur prefixe (apres
+> `@`) : `auto-` (cet outil), `freeze-` (`freeze_overlay.py`), `presfs-`
+> (`init.py`), `autre`. Commandes :
+> - `list [dataset]` -- tous les snapshots, groupes par dataset puis par type
+> - `create <dataset>` -- snapshot `auto-<timestamp>`
+> - `rotate [--apply]` -- applique la retention (dry-run par defaut)
+> - `purge <dataset@snap>` -- supprime un snapshot precis
+> - `rollback <dataset@snap>` -- DESTRUCTIF (confirmation 'ROLLBACK' requise)
+>
+> La retention est definie dans `[snapshots]` d'infra.conf **par dataset** (ex.
+> `fast_pool/sfs` keep=5, `fast_pool/rootfs` keep=10, `data_pool/home` keep=14).
+> La rotation garde les `keep` plus recents de **chaque (dataset, type)**
+> separement -- ainsi on ne melange pas les `freeze` et les `auto` d'un meme
+> dataset. `rollback` detecte les snapshots plus recents (qui seraient detruits
+> par `zfs rollback -r`) et exige une confirmation explicite. Complementaire de
+> `zfs_replicate.py` (replication incrementale vers data_pool, indiquee par
+> `replicate = data_pool/...` dans la politique).

@@ -39,6 +39,49 @@ def out(cmd):
     return subprocess.run(cmd, capture_output=True, text=True).stdout
 
 
+def backup_kernel_config(src, kver):
+    """Sauvegarde la .config du noyau compile vers boot_pool/manager/configs/
+    (pool redondant). La compilation se fait vite sur fast_pool (stripe), mais la
+    .config est PRECIEUSE -> on la copie sur le mirror. Conserve un historique
+    (config-<kver>-<timestamp>) + un lien 'config-<kver>-latest' et 'config-current'.
+    Best effort : un echec de sauvegarde ne casse pas le build (on previent juste).
+    Le dataset est defini dans [storage] : boot_pool/manager (role manager)."""
+    import time
+    config = os.path.join(src, ".config")
+    if not os.path.isfile(config):
+        msg(f"[config-backup] .config absent ({config}) -> rien a sauvegarder")
+        return
+    # localiser le mountpoint de boot_pool/manager (monter au besoin)
+    mgr_ds = os.environ.get("MANAGER_DS", "boot_pool/manager")
+    subprocess.run(["zfs", "mount", mgr_ds], stderr=subprocess.DEVNULL)
+    mp = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint", mgr_ds],
+                        capture_output=True, text=True).stdout.strip()
+    if not mp or mp in ("legacy", "none") or not os.path.isdir(mp):
+        msg(f"[config-backup] {mgr_ds} non monte/introuvable -> .config NON "
+            f"sauvegardee (verifie boot_pool/manager dans [storage]).")
+        return
+    dest_dir = os.path.join(mp, "configs")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        named = os.path.join(dest_dir, f"config-{kver}-{ts}")
+        shutil.copy2(config, named)
+        os.chmod(named, 0o644)
+        # liens pratiques : derniere config de ce kver, et config courante
+        for link_name, target in ((f"config-{kver}-latest", named),
+                                  ("config-current", named)):
+            link = os.path.join(dest_dir, link_name)
+            tmp = link + ".new"
+            if os.path.lexists(tmp):
+                os.remove(tmp)
+            os.symlink(os.path.basename(target), tmp)
+            os.replace(tmp, link)
+        msg(f"[config-backup] .config sauvegardee -> {named}")
+        msg(f"[config-backup] (boot_pool mirror : survit a une panne NVMe)")
+    except OSError as e:
+        msg(f"[config-backup] echec sauvegarde .config : {e} (non bloquant)")
+
+
 def efi_entry(label):
     # NB: efibootmgr affiche 'Boot0002* Gentoo-x.y\tHD(...)/File(...)' : le label
     # est suivi du chemin du loader. On NE doit donc PAS ancrer sur $ (sinon
@@ -228,6 +271,10 @@ def main():
                  f"  -> reste sur le noyau actuel, ou essaie ~arch zfs-kmod.\n"
                  f"  (rien n'a ete stage sur l'ESP, BootNext non arme.)")
     msg(f"zfs.ko present : {zko}")
+
+    # 2bis. SAUVEGARDE de la .config (precieuse) vers boot_pool/manager (mirror
+    # redondant). La compilation reussie est confirmee ici (zfs.ko OK).
+    backup_kernel_config(SRC, kver)
 
     # 3. modules-<ver>.sfs sur fast_pool/sfs (via le module dedie)
     import sfs_build

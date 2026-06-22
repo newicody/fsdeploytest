@@ -58,24 +58,39 @@ def stop_initramfs_stream():
 
 
 def start_wayland_stream(key):
-    """Attend le socket wayland puis capture l'ecran vers RTMP."""
+    """Attend le socket wayland puis capture l'ecran vers RTMP YouTube.
+    Diagnostiquable : ecrit les erreurs ffmpeg/recorder dans /var/log/stream.log
+    (au lieu de les jeter), verifie les prerequis (cle, outil, VAAPI)."""
     if not key:
+        log("[stream] pas de cle YouTube (/etc/yt.key) -> stream desactive. "
+            "Pour activer : ecris ta cle de diffusion dans /etc/yt.key")
         return
     sock = os.path.join(RUNTIME_DIR, "wayland-0")
-    for _ in range(20):
+    for _ in range(40):                        # attendre cage (jusqu'a 20 s)
         if os.path.exists(sock):
             break
         time.sleep(0.5)
+    if not os.path.exists(sock):
+        log(f"[stream] socket wayland absent ({sock}) apres 20 s -> pas de capture")
+        return
     env = dict(os.environ, WAYLAND_DISPLAY="wayland-0", XDG_RUNTIME_DIR=RUNTIME_DIR)
     url = f"{RTMP}/{key}"
-    if which("wl-screenrec"):              # Intel VAAPI : le plus propre
+    # log dedie : on NE jette PLUS stderr (sinon impossible de diagnostiquer).
+    os.makedirs("/var/log", exist_ok=True)
+    logf = open("/var/log/stream.log", "ab", buffering=0)
+    vaapi = os.path.exists("/dev/dri/renderD128")
+    log(f"[stream] demarrage (VAAPI={'oui' if vaapi else 'non'}, "
+        f"log: /var/log/stream.log)")
+
+    if which("wl-screenrec") and vaapi:        # Intel VAAPI : encodage materiel
+        log("[stream] wl-screenrec (HEVC VAAPI) -> YouTube")
         subprocess.Popen(
             ["wl-screenrec", "--codec", "hevc", "--ffmpeg-muxer", "flv", "-f", url],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            env=env, stdout=logf, stderr=logf)
     elif which("wf-recorder"):
+        log("[stream] wf-recorder + ffmpeg (x264 logiciel) -> YouTube")
         rec = subprocess.Popen(["wf-recorder", "-c", "rawvideo", "-f", "-"],
-                               env=env, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL)
+                               env=env, stdout=subprocess.PIPE, stderr=logf)
         subprocess.Popen(
             ["ffmpeg", "-nostdin", "-f", "rawvideo", "-i", "-",
              "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
@@ -83,8 +98,14 @@ def start_wayland_stream(key):
              "-maxrate", VBR, "-bufsize", "9000k", "-pix_fmt", "yuv420p",
              "-g", "60", "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
              "-f", "flv", url],
-            stdin=rec.stdout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    log("capture wayland demarree")
+            stdin=rec.stdout, stdout=logf, stderr=logf)
+    else:
+        log("[stream] AUCUN outil de capture wayland installe "
+            "(emerge gui-apps/wl-screenrec ou gui-apps/wf-recorder). "
+            "Pas de stream.")
+        return
+    log("[stream] capture wayland demarree (verifie /var/log/stream.log si rien "
+        "n'apparait sur YouTube)")
 
 
 def which(name):
@@ -255,6 +276,210 @@ def setup_environment():
     log(f"environnement initialise (LANG={loc}, XDG_SESSION_TYPE=wayland)")
 
 
+def start_services(infra_path="/etc/infra.conf"):
+    """Demarre les services OpenRC listes dans [services] de infra.conf, DANS
+    L'ORDRE de declaration, via 'rc-service <nom> start'. Format valeur :
+    'enabled[,required]' ou 'disabled'. 'required' echoue -> signale fort (mais
+    ne bloque jamais : PID 1 doit vivre). Retourne (ok:list, failed:list)."""
+    if not os.path.exists(infra_path):
+        # repli : chemins usuels (le sfs embarque infra.conf pour les checkups)
+        for c in ("/etc/infra.conf", "/infra.conf", "/sbin/infra.conf"):
+            if os.path.exists(c):
+                infra_path = c
+                break
+    try:
+        from configobj import ConfigObj
+        cfg = ConfigObj(infra_path)
+        services = cfg.get("services", {})
+    except Exception as e:
+        log(f"[services] infra.conf illisible ({e}) -> aucun service demarre")
+        return [], []
+    if not which("rc-service"):
+        log("[services] rc-service introuvable (OpenRC absent ?) -> "
+            "aucun service demarre")
+        return [], []
+    ok, failed = [], []
+    for name, spec in services.items():
+        spec_s = spec if isinstance(spec, str) else ", ".join(spec)
+        opts = [o.strip() for o in spec_s.split(",")]
+        state = opts[0].lower() if opts else "disabled"
+        required = "required" in opts
+        if state != "enabled":
+            continue
+        log(f"[services] demarrage {name}" + (" (requis)" if required else ""))
+        try:
+            r = subprocess.run(["rc-service", name, "start"],
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            log(f"  [!] {name} : exception {e}")
+            failed.append(name)
+            continue
+        if r.returncode == 0:
+            ok.append(name)
+            log(f"  {name} demarre OK")
+        else:
+            failed.append(name)
+            tail = (r.stderr or r.stdout or "").strip()[:200]
+            sev = "ECHEC REQUIS" if required else "echec"
+            log(f"  [!] {name} {sev} (rc={r.returncode}) : {tail}")
+    log(f"[services] socle : {len(ok)} demarre(s), {len(failed)} en echec")
+    return ok, failed
+
+
+def _read_session_config(infra_path="/etc/infra.conf"):
+    """Lit [session] d'infra.conf. Retourne un dict avec defauts surs."""
+    defaults = {
+        "user": "appliance",
+        "groups": ["video", "input", "seat", "render"],
+        "app": "foot",
+        "app_fallback": "foot",
+        "lock_enabled": False,
+        "lock_idle": 300,
+        "lock_backend": "swaylock",
+        "lock_options": ["--daemonize"],
+    }
+    if not os.path.exists(infra_path):
+        for c in ("/etc/infra.conf", "/infra.conf", "/sbin/infra.conf"):
+            if os.path.exists(c):
+                infra_path = c
+                break
+    try:
+        from configobj import ConfigObj
+        cfg = ConfigObj(infra_path)
+        s = cfg.get("session", {})
+    except Exception as e:
+        log(f"[session] infra.conf illisible ({e}) -> session par defaut")
+        return defaults
+    if not s:
+        return defaults
+
+    def _list(v, d):
+        if v is None:
+            return d
+        return v if isinstance(v, list) else [x.strip() for x in v.split(",")]
+
+    lock = s.get("lock", {})
+    return {
+        "user": s.get("user", defaults["user"]),
+        "groups": _list(s.get("groups"), defaults["groups"]),
+        "app": s.get("app", defaults["app"]),
+        "app_fallback": s.get("app_fallback", defaults["app_fallback"]),
+        "lock_enabled": str(lock.get("enabled", "false")).lower() == "true",
+        "lock_idle": int(lock.get("idle_timeout", defaults["lock_idle"]) or 0),
+        "lock_backend": lock.get("backend", defaults["lock_backend"]),
+        "lock_options": _list(lock.get("options"), defaults["lock_options"]),
+    }
+
+
+def ensure_user(user, groups):
+    """Cree l'utilisateur dedie (non-root) s'il manque et l'ajoute aux groupes
+    requis (video/input/seat/render : acces GPU/entrees via seatd). Retourne
+    (uid, gid, home) ou None si echec. Idempotent."""
+    import pwd
+    import grp
+    try:
+        pw = pwd.getpwnam(user)
+        # s'assurer des groupes meme si l'utilisateur existe deja
+        for g in groups:
+            try:
+                grp.getgrnam(g)
+                subprocess.run(["gpasswd", "-a", user, g],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except KeyError:
+                pass                       # groupe absent : on ignore (pas bloquant)
+        return pw.pw_uid, pw.pw_gid, pw.pw_dir
+    except KeyError:
+        pass
+    # creation : home dans /home/<user>, shell bash, groupes
+    if not which("useradd"):
+        log(f"[session] useradd absent : impossible de creer l'utilisateur {user}")
+        return None
+    existing = []
+    for g in groups:
+        try:
+            grp.getgrnam(g)
+            existing.append(g)
+        except KeyError:
+            log(f"[session] groupe '{g}' absent (ignore)")
+    cmd = ["useradd", "--create-home", "--shell", "/bin/bash"]
+    if existing:
+        cmd += ["--groups", ",".join(existing)]
+    cmd.append(user)
+    if subprocess.run(cmd).returncode != 0:
+        log(f"[session] echec creation utilisateur {user}")
+        return None
+    try:
+        pw = pwd.getpwnam(user)
+        log(f"[session] utilisateur {user} cree (uid={pw.pw_uid}, "
+            f"groupes={','.join(existing)})")
+        return pw.pw_uid, pw.pw_gid, pw.pw_dir
+    except KeyError:
+        return None
+
+
+def _demote(uid, gid):
+    """Retourne une fonction preexec qui bascule le processus enfant vers
+    l'utilisateur non-root (setgid puis setuid, ordre important)."""
+    def preexec():
+        os.setgid(gid)
+        os.setuid(uid)
+    return preexec
+
+
+def run_session_app(scfg, uid, gid, home):
+    """Lance cage avec l'app principale, EN TANT QUE l'utilisateur dedie (non-root).
+    Retourne le code retour de cage. Le verrou swaylock (si active) est gere a
+    part. PID 1 (root) reste le parent : il survit a la sortie de cage."""
+    app = scfg["app"]
+    app_argv = app.split() if isinstance(app, str) else list(app)
+    # XDG_RUNTIME_DIR de l'utilisateur (pas /run/user/0)
+    user_runtime = f"/run/user/{uid}"
+    os.makedirs(user_runtime, exist_ok=True)
+    os.chown(user_runtime, uid, gid)
+    os.chmod(user_runtime, 0o700)
+    env = dict(os.environ,
+               HOME=home, USER=scfg["user"], LOGNAME=scfg["user"],
+               XDG_RUNTIME_DIR=user_runtime)
+    if not which("cage"):
+        log("[session] cage absent")
+        return 127
+    log(f"[session] cage -- {app} (utilisateur {scfg['user']}, uid={uid})")
+    try:
+        return subprocess.run(["cage", "--"] + app_argv,
+                              env=env, preexec_fn=_demote(uid, gid)).returncode
+    except OSError as e:
+        log(f"[session] echec lancement cage en non-root : {e}")
+        return 1
+
+
+def start_idle_lock(scfg, uid, gid, home):
+    """Verrou d'ecran sur inactivite via swayidle + swaylock (si lock.enabled).
+    swaylock valide le mot de passe du compte via PAM. Lance en tant que
+    l'utilisateur. Best effort (non bloquant). Une couche python-pam peut etre
+    ajoutee ici pour une logique d'auth personnalisee."""
+    if not scfg["lock_enabled"]:
+        return
+    if scfg["lock_backend"] != "swaylock" or not which("swaylock"):
+        log("[session] verrou demande mais swaylock absent -> pas de verrou. "
+            "(emerge gui-apps/swaylock)")
+        return
+    user_runtime = f"/run/user/{uid}"
+    env = dict(os.environ, HOME=home, USER=scfg["user"],
+               XDG_RUNTIME_DIR=user_runtime)
+    lock_cmd = ["swaylock"] + scfg["lock_options"]
+    idle = scfg["lock_idle"]
+    if idle > 0 and which("swayidle"):
+        # verrouille apres <idle> s d'inactivite
+        subprocess.Popen(
+            ["swayidle", "-w", "timeout", str(idle), " ".join(lock_cmd)],
+            env=env, preexec_fn=_demote(uid, gid),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log(f"[session] verrou auto apres {idle}s d'inactivite (swayidle+swaylock)")
+    else:
+        log("[session] verrou swaylock disponible (swayidle absent ou idle=0 : "
+            "pas de verrouillage automatique)")
+
+
 def main():
     os.environ.setdefault("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
     for src, tgt, fs in (("proc", "/proc", "proc"), ("sysfs", "/sys", "sysfs"),
@@ -286,52 +511,83 @@ def main():
         time.sleep(1)
         log("seatd demarre")
 
+    # SOCLE OpenRC (syslog-ng, dbus, udev...) dans l'ordre de [services] de
+    # infra.conf. Lance AVANT le stream pour que les logs (syslog-ng -> /var/log)
+    # et le bus (dbus) soient prets, et que le boot 'complet' soit streame ensuite.
+    start_services()
+
+    # SESSION utilisateur dediee (non-root) : lire [session], creer l'utilisateur
+    # + groupes (video/input/seat/render), preparer le verrou. cage tournera en
+    # tant que cet utilisateur ; PID 1 (root) reste le parent qui survit.
+    scfg = _read_session_config()
+    session_user = ensure_user(scfg["user"], scfg["groups"])
+
     key = read_key()
     stop_initramfs_stream()
 
-    # capture wayland en arriere-plan (attend le compositeur)
+    # capture wayland en arriere-plan (attend le compositeur). Demarre APRES le
+    # socle -> reseau (initramfs) + heure + logs prets quand le stream commence.
     if os.fork() == 0:
         start_wayland_stream(key)
         os._exit(0)
 
-    # Compositeur kiosk. CRITIQUE : on ne fait PLUS 'execvp' direct (qui
-    # remplacerait PID 1 par cage -> si cage echoue a creer son backend wlroots,
-    # PID 1 meurt -> KERNEL PANIC). On lance en SOUS-PROCESSUS, on surveille, et
-    # en cas d'echec on retombe sur un shell. PID 1 ne quitte JAMAIS.
+    # Compositeur kiosk EN UTILISATEUR DEDIE. CRITIQUE : jamais d'execvp direct
+    # (remplacerait PID 1 -> si cage meurt, kernel panic). On lance en
+    # SOUS-PROCESSUS demote (setuid/setgid vers l'utilisateur), on surveille,
+    # et en cas d'echec on retombe sur un shell. PID 1 (root) ne quitte JAMAIS.
     def run_compositor():
+        if session_user:
+            uid, gid, home = session_user
+            # verrou d'inactivite (swaylock) si active, lance avec la session
+            start_idle_lock(scfg, uid, gid, home)
+            rc = run_session_app(scfg, uid, gid, home)
+            if rc != 0 and scfg["app"] != scfg["app_fallback"]:
+                log(f"[session] app '{scfg['app']}' echouee -> repli "
+                    f"'{scfg['app_fallback']}'")
+                scfg2 = dict(scfg, app=scfg["app_fallback"])
+                rc = run_session_app(scfg2, uid, gid, home)
+            return rc
+        # repli : pas d'utilisateur dedie (creation echouee) -> cage en root
+        log("[session] pas d'utilisateur dedie -> cage en root (repli)")
         if which("cage"):
-            log("demarrage cage (compositeur kiosk)")
-            return subprocess.run(["cage", "--", "foot"]).returncode
+            return subprocess.run(["cage", "--", scfg["app_fallback"]]).returncode
         if which("sway"):
-            log("demarrage sway")
             return subprocess.run(["sway"]).returncode
         log("aucun compositeur (cage/sway) installe")
         return 127
 
-    rc = run_compositor()
-    if rc != 0:
-        # Causes frequentes du 'unable to create the wlroots backend' :
-        #  - nomodeset (profil safe) : pas de KMS -> pas de /dev/dri -> wlroots KO
-        #  - /dev/dri/card0 absent ou droits manquants (seatd/groupe video)
-        #  - GPU non initialise (i915/xe force_probe)
-        log("=" * 56)
-        log(f"COMPOSITEUR ECHEC (rc={rc}). Causes probables :")
-        log("  - boote en 'nomodeset' (profil safe) ? -> pas de KMS, wlroots")
-        log("    ne peut pas creer de backend DRM. Boote un profil avec KMS.")
+    # BOUCLE PID 1 : le compositeur peut se TERMINER (tu fermes foot) ou ECHOUER.
+    # Dans les DEUX cas, PID 1 ne doit pas mourir (sinon kernel panic). On
+    # relance le compositeur ; s'il echoue a repetition (backend KO), on bascule
+    # sur un shell de maintenance (puis on retente le compositeur apres le shell).
+    consecutive_fail = 0
+    while True:
+        rc = run_compositor()
+        if rc == 0:
+            consecutive_fail = 0
+            log("compositeur termine proprement -> relance "
+                "(PID 1 doit rester vivant). Ferme via 'poweroff' pour eteindre.")
+            time.sleep(1)
+            continue
+        # echec
+        consecutive_fail += 1
         has_dri = os.path.exists("/dev/dri/card0")
-        log(f"  - /dev/dri/card0 present : {has_dri}")
-        if not has_dri:
-            log("    -> AUCUN device DRM : c'est la cause. Verifie i915/xe et")
-            log("       que tu n'es PAS en nomodeset.")
-        log("  Bascule sur un SHELL de maintenance (PID 1 reste vivant).")
         log("=" * 56)
-        # PID 1 doit survivre : on relance un shell en boucle (exit -> re-shell).
-        while True:
-            # login shell (-l) -> source /etc/profile (PATH, aliases, profile.d).
+        log(f"COMPOSITEUR ECHEC (rc={rc}, echec #{consecutive_fail}).")
+        log(f"  /dev/dri/card0 present : {has_dri}")
+        if not has_dri:
+            log("  -> AUCUN device DRM (nomodeset ? eudev ? module i915/xe ?).")
+        if consecutive_fail >= 3:
+            log("  3 echecs consecutifs -> SHELL de maintenance "
+                "(PID 1 reste vivant). 'exit' pour retenter le compositeur.")
+            log("=" * 56)
             subprocess.run(["bash", "-l"] if os.path.exists("/bin/bash")
                            else ["sh", "-l"])
-            log("shell quitte ; relance (PID 1 doit rester vivant). "
-                "Eteins via 'poweroff -f' si besoin.")
+            consecutive_fail = 0           # apres le shell, on retente
+        else:
+            log("  -> nouvelle tentative dans 2 s...")
+            log("=" * 56)
+            time.sleep(2)
 
 
 if __name__ == "__main__":

@@ -808,6 +808,16 @@ def main():
     if rescue:
         degraded_reasons.append("fast_pool absent (disque ?) : rootfs depuis boot_pool")
     elif ds_exists(UPPER_DS):
+        # canmount=noauto : l'upper ne doit JAMAIS etre monte automatiquement a
+        # son mountpoint naturel (/fast_pool/rootfs) -- il est reserve a
+        # l'overlay (on le monte explicitement sur /mnt/ovl). Un double montage
+        # creerait un acces concurrent au meme dataset (incoherences si ecriture).
+        run(["zfs", "set", "canmount=noauto", UPPER_DS])
+        # s'il etait deja monte a son emplacement naturel (boot precedent, outil),
+        # le demonter pour eviter le double-acces avant de le monter sur /mnt/ovl.
+        nat = zfs_mountpoint(UPPER_DS)
+        if nat and nat not in ("legacy", "none") and os.path.ismount(nat):
+            run(["umount", nat])
         # mount_zfs_dataset gere mountpoint != legacy (fast_pool/rootfs =
         # /fast_pool/rootfs). L'ancien 'mount.zfs UPPER_DS /mnt/ovl' direct
         # echouait sur un dataset non-legacy -> faux 'ne se monte pas'.

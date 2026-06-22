@@ -206,6 +206,7 @@ APPLIANCE_SCRIPTS = {
     # source (repertoire de reference) -> destination DANS le rootfs
     "session_launch.py": "sbin/session_launch.py",
     "boot_confirm.py":   "usr/local/sbin/boot_confirm.py",
+    "infra.conf":        "etc/infra.conf",   # config lue par start_services au boot
 }
 
 
@@ -228,7 +229,8 @@ def deploy_appliance_scripts(rootfs_src, ref_dir, log=print):
         dst = os.path.join(rootfs_src, relpath)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
-        os.chmod(dst, 0o755)
+        # executable pour les scripts, lecture seule pour la config
+        os.chmod(dst, 0o644 if srcname.endswith((".conf", ".ini")) else 0o755)
         deployed.append(relpath)
         log(f"  deploye {srcname} -> rootfs:/{relpath}")
     if deployed:

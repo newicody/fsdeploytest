@@ -27,6 +27,8 @@ import urllib.error
 import urllib.request
 
 import brainstorm
+from github_api import (ProjectV2Transport as _ApiTransport,  # noqa: F401
+                        normalize_item as _api_normalize, BoardAsk)
 
 # nos statuts -> noms d'options de la colonne "Status" du Project (a creer cote
 # GitHub avec EXACTEMENT ces noms, ou ajuster ce mapping).
@@ -52,60 +54,10 @@ except Exception:
 
 
 # --------------------------------------------------------------------------- #
-# requetes GraphQL (constantes) -- a valider en reel
+# Les requetes/mutations GraphQL et le client reseau vivent desormais dans
+# github_api.py (stdlib, embarquable dans l'initramfs). On les reutilise ici via
+# la sous-classe ProjectV2Transport ci-dessous.
 # --------------------------------------------------------------------------- #
-Q_PROJECT_ID_USER = """
-query($owner:String!, $number:Int!){
-  user(login:$owner){ projectV2(number:$number){ id title } }
-}"""
-
-Q_PROJECT_ID_ORG = """
-query($owner:String!, $number:Int!){
-  organization(login:$owner){ projectV2(number:$number){ id title } }
-}"""
-
-Q_STATUS_FIELD = """
-query($projectId:ID!){
-  node(id:$projectId){ ... on ProjectV2 {
-    fields(first:30){ nodes{
-      ... on ProjectV2SingleSelectField { id name options { id name } }
-    } }
-  } }
-}"""
-
-Q_ITEMS = """
-query($projectId:ID!, $cursor:String){
-  node(id:$projectId){ ... on ProjectV2 {
-    items(first:50, after:$cursor){
-      pageInfo{ hasNextPage endCursor }
-      nodes{
-        id
-        fieldValueByName(name:"%s"){
-          ... on ProjectV2ItemFieldSingleSelectValue { name }
-        }
-        content{
-          ... on Issue   { number title labels(first:30){ nodes{ name } } }
-          ... on DraftIssue { title }
-        }
-      }
-    }
-  } }
-}""" % STATUS_FIELD_NAME
-
-M_ADD_DRAFT = """
-mutation($projectId:ID!, $title:String!, $body:String!){
-  addProjectV2DraftIssue(input:{projectId:$projectId, title:$title, body:$body}){
-    projectItem{ id }
-  }
-}"""
-
-M_SET_STATUS = """
-mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!){
-  updateProjectV2ItemFieldValue(input:{
-    projectId:$projectId, itemId:$itemId, fieldId:$fieldId,
-    value:{ singleSelectOptionId:$optionId }
-  }){ projectV2Item{ id } }
-}"""
 
 
 # --------------------------------------------------------------------------- #
@@ -122,92 +74,23 @@ class ProjectTransport:
         raise NotImplementedError
 
 
-class ProjectV2Transport(ProjectTransport):
-    """Reel : GraphQL via api.github.com/graphql. A VALIDER en reel."""
+class ProjectV2Transport(_ApiTransport):
+    """Transport projet adapte au vocabulaire brainstorm : le RESEAU est herite
+    de github_api.ProjectV2Transport (source unique) ; on n'ajoute ici que le
+    mapping colonne<->statut (champ 'Status')."""
     name = "graphql"
-    API = "https://api.github.com/graphql"
-
-    def __init__(self, token=None):
-        self.token = token or os.environ.get("GITHUB_TOKEN")
-        if not self.token:
-            raise RuntimeError("token absent (GITHUB_TOKEN, scope project)")
-
-    def _gql(self, query, variables):
-        payload = json.dumps({"query": query, "variables": variables}).encode()
-        req = urllib.request.Request(self.API, data=payload, method="POST",
-                                     headers={
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-            "User-Agent": "brainstorm-project"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read())
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"GraphQL {e.code} {e.reason}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"GitHub injoignable: {e.reason}") from e
-        if data.get("errors"):
-            raise RuntimeError("GraphQL errors: "
-                               + json.dumps(data["errors"])[:200])
-        return data.get("data", {})
-
-    def project_id(self, owner, number):
-        # 1. Tente de résoudre en tant que User
-        try:
-            d = self._gql(Q_PROJECT_ID_USER, {"owner": owner, "number": int(number)})
-            node = (d.get("user") or {}).get("projectV2")
-            if node and node.get("id"):
-                return node["id"]
-        except RuntimeError as e:
-            # Ne propage que les vraies erreurs (ex: token invalide), ignore "GraphQL errors" (introuvable)
-            if "GraphQL errors" not in str(e):
-                raise
-
-        # 2. Tente de résoudre en tant qu'Organisation
-        try:
-            d = self._gql(Q_PROJECT_ID_ORG, {"owner": owner, "number": int(number)})
-            node = (d.get("organization") or {}).get("projectV2")
-            if node and node.get("id"):
-                return node["id"]
-        except RuntimeError as e:
-            if "GraphQL errors" not in str(e):
-                raise
-        
-        # 3. Échec final
-        raise RuntimeError(f"Project #{number} introuvable pour {owner} (Ni User, Ni Organisation)")
 
     def status_field(self, project_id):
-        d = self._gql(Q_STATUS_FIELD, {"projectId": project_id})
-        nodes = (((d.get("node") or {}).get("fields") or {}).get("nodes") or [])
-        for f in nodes:
-            if f and f.get("name") == STATUS_FIELD_NAME and "options" in f:
-                opts = {o["name"].lower(): o["id"] for o in f["options"]}
-                return f["id"], opts
-        raise RuntimeError(f"champ '{STATUS_FIELD_NAME}' single-select absent "
-                           f"du Project (cree-le avec les options "
-                           f"{list(STATUS_OPTION.values())})")
+        return self.single_select_field(project_id, STATUS_FIELD_NAME)
 
     def iter_items(self, project_id):
-        cursor = None
-        while True:
-            d = self._gql(Q_ITEMS, {"projectId": project_id, "cursor": cursor})
-            items = ((d.get("node") or {}).get("items") or {})
-            for node in items.get("nodes", []):
-                yield _normalize_item(node)
-            page = items.get("pageInfo", {})
-            if not page.get("hasNextPage"):
-                break
-            cursor = page.get("endCursor")
-
-    def add_draft(self, project_id, title, body):
-        d = self._gql(M_ADD_DRAFT,
-                      {"projectId": project_id, "title": title, "body": body})
-        return d["addProjectV2DraftIssue"]["projectItem"]["id"]
+        # github_api rend les NODES bruts ; on applique NOTRE normalisation
+        # (colonne -> statut brainstorm), inchangee.
+        for node in self.raw_items(project_id, STATUS_FIELD_NAME):
+            yield _normalize_item(node)
 
     def set_status(self, project_id, item_id, field_id, option_id):
-        self._gql(M_SET_STATUS, {"projectId": project_id, "itemId": item_id,
-                                 "fieldId": field_id, "optionId": option_id})
-        return True
+        return self.set_field(project_id, item_id, field_id, option_id)
 
 
 class StubProjectV2(ProjectTransport):

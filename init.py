@@ -648,6 +648,24 @@ def write_sfs_marker(upper_mnt, sfs_crc):
         log(f"marqueur .sfs-crc non ecrit ({e})")
 
 
+def _strip_overlay_xattrs(path):
+    """Retire les xattr 'trusted.overlay.*' d'un repertoire (typiquement la
+    racine de l'upperdir). Ces xattr (origin/impure/opaque/redirect) referencent
+    l'ANCIEN lower ; les laisser sur un upper reutilise avec un NOUVEAU sfs ->
+    'failed to verify upper root origin' / Stale file handle (ESTALE). Best
+    effort, sans dependance externe (os.removexattr)."""
+    try:
+        names = os.listxattr(path)
+    except OSError:
+        return
+    for name in names:
+        if name.startswith("trusted.overlay."):
+            try:
+                os.removexattr(path, name)
+            except OSError:
+                pass
+
+
 def snapshot_and_reset_upper(old_crc, sfs_crc):
     """Le sfs a change : on SNAPSHOTE l'ancien upper (coherent), on l'ENVOIE
     vers data_pool/archives (durable), puis on VIDE le contenu de l'upper (PAS
@@ -665,24 +683,17 @@ def snapshot_and_reset_upper(old_crc, sfs_crc):
         notes.append(f"send -> {dest} ({'ok' if rc == 0 else 'ECHEC'})")
     else:
         notes.append(f"snapshot {snap} ECHEC (ancien upper NON sauvegarde)")
-    # vider le contenu de l'upper (upperdir + workdir), garder le dataset
+    # SUPPRIMER ENTIEREMENT upper/ et work/ (pas seulement leur contenu). Le
+    # repertoire upperdir LUI-MEME porte des xattr overlay du PRECEDENT lower
+    # (trusted.overlay.origin/impure) ; se contenter de vider le contenu les
+    # garde -> overlayfs 'failed to verify upper root origin' -> ESTALE (116) au
+    # montage avec le NOUVEAU sfs. On recree des repertoires NEUFS (inode
+    # vierge, aucun xattr overlay).
     for sub in ("upper", "work"):
-        d = f"/mnt/ovl/{sub}"
-        try:
-            if os.path.isdir(d):
-                for name in os.listdir(d):
-                    p = os.path.join(d, name)
-                    if os.path.isdir(p) and not os.path.islink(p):
-                        shutil.rmtree(p, ignore_errors=True)
-                    else:
-                        try:
-                            os.unlink(p)
-                        except OSError:
-                            pass
-        except OSError:
-            pass
+        shutil.rmtree(f"/mnt/ovl/{sub}", ignore_errors=True)
     os.makedirs("/mnt/ovl/upper", exist_ok=True)
     os.makedirs("/mnt/ovl/work", exist_ok=True)
+    _strip_overlay_xattrs("/mnt/ovl/upper")     # ceinture + bretelles
     write_sfs_marker("/mnt/ovl", sfs_crc)
     return " | ".join(notes)
 
@@ -879,8 +890,17 @@ def main():
     try:
         ld = losetup(sfs_path, readonly=True)
         mount(ld, "/mnt/lower", "squashfs", MS_RDONLY)
+        # index=off : DESACTIVE la verification d'origine de l'upper. Le DESIGN
+        # echange le lower (rootfs.sfs) sous un upper PERSISTANT, ce qui est
+        # incompatible avec 'index=on' (defaut effectif -> 'failed to verify
+        # upper root origin') : index=on stocke dans l'upper le handle du lower
+        # et le re-verifie au montage ; des que le sfs change, le handle est
+        # perime -> ESTALE (116). index=off rend l'upper portable d'un sfs a
+        # l'autre, et un upper peuple existant reste montable tel quel sur un
+        # reboot a sfs inchange (le reset CRC32 ne s'execute que si le sfs change).
         mount("overlay", NEWROOT, "overlay", 0,
-              "lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work")
+              "lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work,"
+              "index=off")
     except OSError as e:
         die(f"overlay echoue: {e}")
     log(f"overlay rootfs assemble sur {NEWROOT}")

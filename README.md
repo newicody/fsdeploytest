@@ -1829,3 +1829,127 @@ eclean-kernel -n 2                     # ménage manuel des noyaux
 > par `zfs rollback -r`) et exige une confirmation explicite. Complementaire de
 > `zfs_replicate.py` (replication incrementale vers data_pool, indiquee par
 > `replicate = data_pool/...` dans la politique).
+
+## Rebuild manuel (hors `first_boot.py`)
+
+`first_boot.py` orchestre tout d'un coup (verif conformite infra + noyau +
+rootfs + initramfs + EFI), pratique mais lourd quand on ne veut toucher QU'UNE
+brique. Voici les chemins independants. **A retenir d'abord :**
+
+- Le **noyau** (et ses `modules-<ver>.sfs` + l'**initramfs** + les entrees EFI)
+  vit sur l'**ESP** -> outil : `kernel_build.py`.
+- Le **rootfs.sfs** vit sur `fast_pool/sfs` -> outils : `clean_rootfs.py` +
+  `sfs_build.py`, ou `freeze_overlay.py`. **Aucun** rebuild d'initramfs/EFI pour
+  un changement de rootfs seul.
+- Ne pas confondre : `init.py` est dans l'**initramfs** (-> rebuild initramfs) ;
+  `session_launch.py`, `boot_confirm.py`, `infra.conf` sont dans le **rootfs**
+  (-> rebuild rootfs.sfs, qui les redeploie via `deploy_appliance_scripts`).
+
+> **Tout nouveau `rootfs.sfs` (CRC32 different) REINITIALISE l'upper persistant
+> au prochain boot** : `init.py` snapshote l'upper, l'envoie vers
+> `data_pool/archives/rootfs-presfs-<crc>` (durable, recuperable), puis repart
+> d'un upper NEUF. Pour GARDER tes modifs runtime : `freeze_overlay.py` AVANT
+> (il les fige dans un `rootfs-vN.sfs`), puis `select_rootfs.py use vN`. Sinon
+> elles sont archivees mais retirees de l'upper vivant.
+
+### A. Noyau seul (+ modules + initramfs + entrees EFI)
+
+Recompile le noyau pointe par `[kernel] src`, reconstruit `zfs-kmod` contre lui
+(garde-fou `zfs.ko`), fige `modules-<ver>.sfs`, reconstruit l'initramfs, stage
+les 2 ESP et (re)cree les entrees EFI. **Ne touche PAS a `rootfs.sfs`** -> pas
+de reset d'upper.
+
+```sh
+# .config deja en place dans /usr/src/linux (cf. kernel_watch.py)
+sudo INFRA_CONF=infra.conf /usr/bin/python3 kernel_build.py
+```
+Prerequis : ESP montee (a son `install_mount`), `.config` present dans `SRC`.
+`INFRA_CONF` est OBLIGATOIRE, sinon `kernel_build` ne lit pas `[uki]` et ne cree
+QUE l'entree classique (pas les profils safe/debug/i915).
+
+### B. Initramfs seul (ex : tu viens de modifier `init.py`)
+
+`kernel_build.py` reconstruit l'initramfs mais recompile AUSSI noyau + zfs-kmod
+(lourd). Pour un changement d'`init.py` SEUL : reconstruis juste l'initramfs et
+recopie-le sur les 2 ESP (meme nom = ecrasement, les entrees EFI ne bougent pas).
+
+```sh
+# python SYSTEME (hors venv). FFMPEG_STATIC / YT_KEY optionnels (stream console).
+sudo env KVER="$(uname -r)" FFMPEG_STATIC=/usr/local/bin/ffmpeg \
+     /usr/bin/python3 build_initramfs.py            # -> initramfs-<ver>.zst
+KVER="$(uname -r)"
+for esp in /mnt/esp1 /mnt/esp2; do
+  sudo cp "initramfs-$KVER.zst" "$esp/EFI/gentoo/initramfs-$KVER.zst"
+done
+```
+Les entrees EFI pointent deja vers `EFI\gentoo\initramfs-<ver>.zst` : recopier
+le fichier de meme nom suffit, rien a re-declarer. (Verifie l'initramfs sans
+booter : `python3 initramfs_verify.py initramfs-$KVER.zst`.)
+
+### C. `rootfs.sfs` seul (pas de noyau, pas d'initramfs)
+
+```sh
+# 1. copie NETTOYEE (jamais le systeme vivant ; depose le marqueur .cleaned-for-sfs)
+sudo /usr/bin/python3 clean_rootfs.py --source <racine_gentoo> --staging /data_pool/staging
+# 2. figer + redeployer session_launch.py / boot_confirm.py / infra.conf dans le sfs
+sudo /usr/bin/python3 sfs_build.py --rootfs-src /data_pool/staging
+```
+Cree `fast_pool/sfs/rootfs.sfs`. Reset d'upper au prochain boot (cf. encadre).
+`sfs_build` valide automatiquement le sfs (montage RO + contenu).
+
+> **Perenniser plutot que repartir d'une base** : si le but n'est PAS de revenir
+> a une base propre mais de figer l'etat COURANT, n'utilise pas `--rootfs-src` :
+> `freeze_overlay.py` (fige l'overlay vivant en `rootfs-vN.sfs`) puis
+> `select_rootfs.py use vN`. Non destructif, versionne, double rollback.
+
+### D. Les deux (noyau + rootfs)
+
+Lance **C puis A** (figer le rootfs d'abord garantit que `session_launch.py` /
+`infra.conf` a jour sont dans le sfs avant le staging initramfs/EFI). Equivaut a
+`first_boot.py --rootfs-src <racine>` mais sans la verif de conformite
+`infra.conf` (que tu peux relancer seule : `first_boot.py --dry-run`).
+
+### E. Revenir a une version SANS rebuild (modele versionne)
+
+Si plusieurs `rootfs-vN.sfs` existent, revenir en arriere ne demande **aucun
+rebuild** : `select_rootfs.py use <vN>` (ou `rollback`). Le lien
+`rootfs.sfs -> rootfs-vN.sfs` bascule (atomique), effet au prochain boot. C'est
+la facon RECOMMANDEE de "revenir a l'ancien rootfs".
+
+### Activer le modele versionne par liens (migration unique)
+
+`select_rootfs.py` + `freeze_overlay.py` sont integres : `rootfs.sfs` est cense
+etre un **lien** vers `rootfs-vN.sfs`. Au depart, le `rootfs.sfs` cree par
+`sfs_build` est un **fichier reel** -> une migration unique (depuis le systeme
+boote ou un chroot ou `fast_pool/sfs` est monte sur `/fast_pool/sfs`) :
+
+```sh
+cd /fast_pool/sfs
+mv rootfs.sfs rootfs-v1.sfs
+sudo /usr/bin/python3 select_rootfs.py use v1     # cree rootfs.sfs -> rootfs-v1.sfs
+sudo /usr/bin/python3 select_rootfs.py list       # verifie l'actif + les versions
+```
+Ensuite `freeze_overlay.py` produit v2, v3... et `select_rootfs.py use vN`
+bascule. `init.py` est INCHANGE : il monte `rootfs.sfs`, le lien est suivi de
+facon transparente (`os.open`/`losetup`), et le CRC32 calcule est celui de la
+cible -> le reset d'upper se declenche bien a chaque changement de version.
+
+### Synchro durable des sfs vers `data_pool` (`[replication]`)
+
+`fast_pool/sfs` est sur le **stripe sans redondance** (1 NVMe perdu = tout perdu).
+La section `[replication] [[sfs]]` declare une copie LENTE durable vers
+`data_pool/archives/sfs` (raidz2), via `zfs_replicate.py` (snapshots incrementaux,
+`zfs send | zfs recv -F` SANS `-p` -> le dst herite `/data_pool/archives/sfs`,
+**pas** de collision avec `/fast_pool/sfs`).
+
+```sh
+# corriger UNE fois l'ancienne copie manuelle dont le mountpoint collisionne :
+zfs inherit mountpoint data_pool/archives/sfs      # -> /data_pool/archives/sfs
+# puis synchro (manuelle ou via timer OpenRC) :
+python3 zfs_replicate.py --from-config             # lit [replication] d'infra.conf
+```
+> **Piege a l'origine de la collision** : ne PAS recopier les sfs avec
+> `zfs send -R`/`-p` (ils propagent `mountpoint=/fast_pool/sfs` au dst -> deux
+> datasets sur le meme point de montage). `zfs_replicate.py` evite ca par
+> construction. Le dataset `data_pool/archives/sfs` doit avoir un mountpoint
+> herite (`/data_pool/archives/sfs`) ou `none`, jamais `/fast_pool/sfs`.

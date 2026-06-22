@@ -182,7 +182,11 @@ def freeze(force=False):
 
         # 4. overlay OFFLINE : merged = lower(sfs) + upper(clone). Les whiteouts
         #    sont appliques par overlayfs -> merged = etat EXACT du systeme.
-        ov_opts = (f"lowerdir={d_lower},upperdir={real_upper},"
+        #    index=off : l'upper (clone) porte un xattr 'origin' herite de
+        #    l'overlay live ; on desactive la verification d'origine (meme raison
+        #    que init.py) pour ne jamais echouer en ESTALE si le file handle du
+        #    lower (squashfs reboucle) differe de celui enregistre.
+        ov_opts = (f"index=off,lowerdir={d_lower},upperdir={real_upper},"
                    f"workdir={real_work}")
         if _run(["mount", "-t", "overlay", "overlay", "-o", ov_opts,
                  d_merged]).returncode != 0:

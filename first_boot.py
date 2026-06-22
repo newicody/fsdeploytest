@@ -541,10 +541,19 @@ def run_build(config_path, rep, src="/usr/src/linux", infra_conf="infra.conf"):
 # --------------------------------------------------------------------------- #
 # autorisation git (reutilise le board)
 # --------------------------------------------------------------------------- #
-def request_git_authorization(rep, repo=None, kver=None):
+def request_git_authorization(rep, repo=None, kver=None, bypass=False):
     """Pousse le rapport/empreinte comme une idee 'first-boot' sur le board et
     demande l'autorisation. Sans repo/token configures, reste local (le rapport
-    est deja ecrit) et on demande une confirmation sur la machine."""
+    est deja ecrit) et on demande une confirmation sur la machine.
+
+    bypass=True (option --yes / --no-validation) : court-circuite TOUT (board git
+    ET invite locale) et finalise directement. Aucun token ni board requis ;
+    utile en execution non-interactive (sinon _local_confirm fait input() ->
+    EOFError -> refus 'differe')."""
+    if bypass:
+        rep.info("validation court-circuitee (--yes) : finalisation autorisee "
+                 "sans board git ni invite locale.")
+        return True
     try:
         import brainstorm
         import github_board as gb
@@ -622,6 +631,11 @@ def main():
                     help="autorise l'inference (systeme boote uniquement)")
     ap.add_argument("--stream", action="store_true",
                     help="streame la console de l'orchestrateur vers YouTube")
+    ap.add_argument("--yes", "-y", "--no-validation", dest="bypass_validation",
+                    action="store_true",
+                    help="court-circuite la validation (board git / invite "
+                         "locale) et finalise directement le first-boot : "
+                         "autorise sans rien demander (utile en non-interactif).")
     ap.add_argument("--dry-run", action="store_true",
                     help="verifie l'infra et s'arrete (pas de build)")
     a = ap.parse_args()
@@ -754,7 +768,8 @@ def main():
 
     kver = detect_kver(a.src)
     print(">> demande d'autorisation (git/local)...", flush=True)
-    authorized = request_git_authorization(rep, repo=repo, kver=kver)
+    authorized = request_git_authorization(rep, repo=repo, kver=kver,
+                                           bypass=a.bypass_validation)
     write_report(rep)
     if authorized:
         print(f">> first-boot termine pour {kver}. BootNext arme (essai unique). "

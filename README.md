@@ -1953,3 +1953,122 @@ python3 zfs_replicate.py --from-config             # lit [replication] d'infra.c
 > datasets sur le meme point de montage). `zfs_replicate.py` evite ca par
 > construction. Le dataset `data_pool/archives/sfs` doit avoir un mountpoint
 > herite (`/data_pool/archives/sfs`) ou `none`, jamais `/fast_pool/sfs`.
+
+## `operate.py` — exploitation (chroot / booté / rescue)
+
+`operate.py` est l'entrée d'exploitation analogue à `first_boot.py`, mais **sans
+hypothèse d'environnement** : il lit l'`infra.conf` **physiquement présent** sur
+la machine (`/etc/infra.conf`, sinon la copie du dépôt, sinon `--infra PATH`) et
+**détecte le contexte** (`chroot` / `booted` / `rescue`) qu'il affiche — il ne
+refuse aucun contexte. C'est un **dispatcher mince** : chaque sous-commande
+délègue au module existant (avec `INFRA_CONF` exporté) ; `operate` n'ajoute que
+la logique d'environnement (montage ESP/efivars, restage initramfs multi-ESP). Il
+tourne depuis le dépôt, à côté de ses modules (comme `first_boot.py` /
+`kernel_build.py`).
+
+`operate.py -h` liste tout. Cas d'usage fréquents :
+
+| Besoin | Commande |
+|---|---|
+| État env + contexte + conformité | `operate.py status` |
+| Rebuild noyau **complet** (+ recrée **toutes** les entrées EFI par profil) | `operate.py kernel` |
+| Rebuild noyau avec un nouveau `.config` | `operate.py kernel --config K.config` |
+| **Rebuild initramfs seul** + restage sur toutes les ESP (après modif `init.py`) | `operate.py initramfs` |
+| Idem pour un autre noyau | `operate.py initramfs --kver 7.0.12` |
+| Figer l'overlay vivant en `rootfs-vN.sfs` | `operate.py freeze` |
+| Basculer / revenir de version rootfs | `operate.py select use v3` · `operate.py select rollback` · `operate.py select list` |
+| Refaire un rootfs depuis une base propre | `operate.py clean --source <racine> --staging /data_pool/staging` puis `operate.py rootfs --rootfs-src /data_pool/staging` |
+| Promouvoir le noyau fraîchement booté | `operate.py confirm` |
+| Snapshots | `operate.py snapshot rotate --apply` |
+| Réplication durable (lit `[replication]`) | `operate.py replicate` |
+| Audit stockage | `operate.py storage` |
+| Préparer / diagnostiquer le `.config` | `operate.py config` · `operate.py diagnose` |
+| Monter les ESP à leur `install_mount` | `operate.py esp` |
+
+> L'option globale `--infra /chemin/infra.conf` se place **avant** la commande.
+> Tout ce qui suit la commande est transmis tel quel au module cible
+> (`operate.py snapshot -h` montre l'aide de `snapshot_manager`).
+
+### Récupération overlay corrompu / nouveau `rootfs.sfs`, avec `operate.py`
+
+Scénario vécu : un nouveau `rootfs.sfs` (CRC différent) + un correctif dans
+`init.py` (overlay `index=off`, reset propre de l'upper). `init.py` vivant dans
+l'**initramfs**, il faut un initramfs neuf sur l'ESP — pas un rebuild noyau.
+
+- **Correctif `init.py` seul** (cas fréquent) — rebuild initramfs + restage sur
+  **toutes** les ESP, sans recompiler le noyau :
+  ```sh
+  operate.py initramfs
+  ```
+  Les entrées EFI existantes référencent toutes le même `initramfs-<kver>.zst` :
+  **tous les profils** (`normal`/`safe`/`debug`/`i915only`, sur chaque ESP) prennent
+  le nouvel initramfs. Reboote. (C'est l'équivalent outillé de la section
+  « Initramfs seul » plus haut, mais multi-ESP et indépendant du contexte.)
+
+- **Si tu changes aussi le noyau ou les cmdlines**, ou pour **recréer les entrées
+  NVRAM elles-mêmes** (tous profils) :
+  ```sh
+  operate.py kernel                 # ou : operate.py kernel --config K.config
+  ```
+  `kernel_build` (étape 6bis) recrée **une entrée EFI par profil `[uki]`**
+  (`normal`/`safe`/`debug`/`i915only`) sur **chaque** ESP NVRAM — **pas seulement
+  i915**, dès lors que `INFRA_CONF` est défini, ce qu'`operate` garantit toujours.
+  (Le « seulement i915 » observé auparavant venait d'un run **sans** `INFRA_CONF` :
+  l'étape 6bis prévient alors « profils NON crees, seule l'entree classique
+  existe ».)
+
+Ces deux commandes fonctionnent en **chroot** comme en **booté**. En **rescue
+initramfs pur** (shell busybox, sans `operate.py` ni toolchain), la sortie de
+secours immédiate reste **manuelle** — les datasets sont déjà montés par
+`init.py` :
+```sh
+rm -rf /mnt/ovl/upper /mnt/ovl/work && mkdir -p /mnt/ovl/upper /mnt/ovl/work
+mount -t overlay overlay -o lowerdir=/mnt/lower,upperdir=/mnt/ovl/upper,workdir=/mnt/ovl/work,index=off /mnt/root
+```
+puis, une fois rebooté ou chrooté, on refait proprement avec `operate.py initramfs`.
+
+## Tests de sainteté — process et garde-fous
+
+Les vérifications existent depuis longtemps mais étaient éparses et lancées à la
+main. Le process est maintenant **orchestré, read-only et journalisé** via
+`operate.py check`, et les garde-fous sont **imposés aux points clés**.
+
+### Inventaire (tous read-only)
+
+| Module | Vérifie | Garde-fou imposé |
+|---|---|---|
+| `validate_boot.py` | sfs (magic squashfs + montage RO test + contenu attendu), ESP (vfat + place) | non (rend un verdict) |
+| `initramfs_verify.py` | contenu cpio : `init`, `zfs.ko`, `zfs_load_order`, `zpool/zfs/mount.zfs`, `python3` + manifeste SHA-256 | au **build** (`build_initramfs` → sys.exit) |
+| `kernel_diagnose.py` | `.config` vs requis, modules+dmesg, attrs zfs, `health.json` du boot | non (diagnostic post-boot) |
+| `first_boot.verify_infra`+`preflight` | conformité réel/déclaré, UEFI/arch/outils/espace/montages | **oui** (first_boot STOP sur critique) |
+| `boot_confirm.healthy()` | pool + route par défaut | **oui** (pas de promotion BootOrder si KO) |
+| `init.py health_check()` | écrit `/run/health.json` (état ZFS/disques/mémoire) | non (rapport, lu ensuite par diagnose) |
+
+### Orchestration read-only : `operate.py check`
+
+Agrège les vérificateurs **sans rien modifier** (montages en RO + démontage
+auto ; seule écriture = la ligne de journal). Utilisable en chroot / booté /
+rescue.
+
+```sh
+operate.py check                 # verdict lisible (infra + sfs actif + modules-<kver> + ESP)
+operate.py check --strict        # rc != 0 si un critique echoue  -> garde-fou scriptable
+operate.py check --diagnose      # + kernel_diagnose (runtime/dmesg/health)
+```
+
+- **Mode lecture seule** : c'est la nature même de `check` (aucune écriture
+  hors journal ; les montages sont RO et démontés). Sans root, les montages-test
+  sfs/ESP sont sautés (mode dégradé) ; avec root, contrôle complet.
+- **Cohérence croisée** : `check` signale si `modules-<kver>.sfs` manque pour le
+  noyau courant (kver initramfs vs modules).
+- **Garde-fou imposé** : `--strict` rend `rc=1` si critique → à mettre devant une
+  opération sensible, ex. `operate.py check --strict && operate.py kernel`.
+
+### Journalisation via le manager
+
+Chaque invocation d'`operate.py` écrit dans le manager
+(`boot_pool/manager/history.jsonl`, via `kernel_registry.log_event`) : un
+événement `operate` (`start:` / `end: … -> rc=N`) et, pour `check`, un événement
+`check` (`crit=… warn=… strict=…`). C'est **best-effort** : si le manager n'est
+pas monté (chroot/rescue), l'opération n'échoue pas pour autant. Relire le
+journal : `python3 -c "import kernel_registry as k; [print(e) for e in k.KernelRegistry().history()]"`.

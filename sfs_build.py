@@ -242,11 +242,17 @@ def deploy_appliance_scripts(rootfs_src, ref_dir, log=print):
 
 
 def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
-                     log=print, force=False, force_live=False, ref_dir=None):
-    """Cree rootfs.sfs depuis l'arborescence rootfs_src. rootfs_src DOIT etre une
-    copie nettoyee par clean_rootfs (marqueur .cleaned-for-sfs) ; sinon on REFUSE
-    de figer (risque : figer le systeme vivant, etat incoherent). --force-live
-    (force_live=True) passe outre explicitement. Retourne SfsResult."""
+                     log=print, force=False, force_live=False, ref_dir=None,
+                     versioned=True):
+    """Cree le rootfs squashfs depuis l'arborescence rootfs_src. rootfs_src DOIT
+    etre une copie nettoyee par clean_rootfs (marqueur .cleaned-for-sfs) ; sinon
+    on REFUSE de figer (risque : figer le systeme vivant). force_live passe outre.
+
+    versioned=True (defaut, CONFORME a l'architecture) : ecrit 'rootfs-vN.sfs'
+    (N = version suivante) et (re)pointe le lien 'rootfs.sfs' -> 'rootfs-vN.sfs'.
+    C'est ce que select_rootfs (use/rollback) et freeze_overlay attendent en aval
+    ; un fichier plat 'rootfs.sfs' casserait _active()/_versions(). versioned=False
+    revient a l'ancien fichier plat (deconseille). Retourne SfsResult."""
     if not os.path.isdir(rootfs_src):
         return SfsResult(False, "", f"source absente : {rootfs_src}")
     # GARDE : ne pas figer le systeme vivant par erreur
@@ -268,19 +274,39 @@ def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
     mp = _sfs_mountpoint(sfs_dataset, log)
     if mp is None:
         return SfsResult(False, "", f"{sfs_dataset} non monte")
-    dst = os.path.join(mp, name)
-    if os.path.exists(dst) and not force:
-        size_mb = os.path.getsize(dst) / (1024 * 1024)
-        log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree (force=False)")
-        return SfsResult(True, dst, "deja present", int(size_mb))
     # DEPLOIEMENT : copier les scripts appliance A JOUR dans le rootfs AVANT de
     # figer. Sinon le sfs garderait la version deja presente -> vieux code fige.
     deploy_appliance_scripts(rootfs_src, ref_dir, log=log)
     # exclusions pseudo-FS/volatils : -e doit etre le DERNIER flag mksquashfs
     # (tout ce qui suit est traite comme motif d'exclusion).
     extra = ["-e"] + ROOTFS_EXCLUDES
-    # plus de staging : _mksquashfs ecrit le .new a cote de dst (meme FS) puis
-    # os.replace atomique. Une seule ecriture du .sfs, zero copie.
+
+    if versioned:
+        # MODELE CANONIQUE : rootfs-vN.sfs + lien rootfs.sfs -> rootfs-vN.sfs.
+        # On REUTILISE select_rootfs (versionnage + lien atomique) -- pas de
+        # logique parallele. Chaque build = une nouvelle version (comme
+        # freeze_overlay) ; l'ancienne est memorisee pour rollback.
+        try:
+            import select_rootfs
+        except Exception as e:
+            return SfsResult(False, "", f"select_rootfs indisponible : {e}")
+        vers = select_rootfs._versions(mp)
+        nextn = (vers[-1][0] + 1) if vers else 1
+        target = f"rootfs-v{nextn}.sfs"
+        dst = os.path.join(mp, target)
+        res = _mksquashfs(rootfs_src, dst, mp, log, extra=extra)
+        if not res.ok:
+            return res
+        select_rootfs._set_link(mp, target)        # publication atomique du lien
+        log(f"  rootfs versionne : {name} -> {target} (v{nextn})")
+        return res
+
+    # MODE NON VERSIONNE (deconseille, NON conforme) : fichier plat 'name'.
+    dst = os.path.join(mp, name)
+    if os.path.exists(dst) and not force:
+        size_mb = os.path.getsize(dst) / (1024 * 1024)
+        log(f"{dst} existe deja ({size_mb:.0f} Mo) -- pas recree (force=False)")
+        return SfsResult(True, dst, "deja present", int(size_mb))
     return _mksquashfs(rootfs_src, dst, mp, log, extra=extra)
 
 
@@ -309,13 +335,17 @@ if __name__ == "__main__":
     ap.add_argument("--force-live", action="store_true",
                     help="autorise a figer une racine sans marqueur clean_rootfs "
                          "(systeme vivant) -- a tes risques")
+    ap.add_argument("--no-versioned", action="store_true",
+                    help="ecrit un fichier plat rootfs.sfs au lieu du modele "
+                         "versionne rootfs-vN.sfs + lien (DECONSEILLE, non conforme)")
     a = ap.parse_args()
     if not a.rootfs_src and not a.modules:
         ap.error("fournir --rootfs-src et/ou --modules")
     rc = 0
     if a.rootfs_src:
         r = build_rootfs_sfs(a.rootfs_src, a.dataset, force=a.force,
-                             force_live=a.force_live)
+                             force_live=a.force_live,
+                             versioned=not a.no_versioned)
         print(repr(r))
         rc |= 0 if r.ok else 1
     if a.modules:

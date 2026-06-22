@@ -649,6 +649,13 @@ def main():
 
     cfg_raw = ConfigObj(a.infra)
     cfg = ConfigView(cfg_raw, "infra")
+    # manager : racine UNIQUE (registre + rapport + journal). infra.conf
+    # [manager] root, sauf si MANAGER_ROOT deja impose par l'env (env > config).
+    # On l'exporte AVANT tout usage du registre pour que kernel_registry,
+    # write_report et la journalisation pointent au meme endroit.
+    manager_root = (cfg_raw.get("manager", {}) or {}).get("root") \
+        or "/boot_pool/manager"
+    os.environ.setdefault("MANAGER_ROOT", manager_root)
     # config git : [git] dans infra.conf, surchargee par les options CLI
     gitc = cfg.get("git", {})
     repo = a.repo or (gitc.repo if gitc else None)
@@ -759,18 +766,20 @@ def main():
                     rep.warn(f"  [!] {s} modifie il y a {age_h:.1f} h mais sfs NON "
                              f"regenere -> ta modif N'IRA PAS au boot sans --rootfs-src.")
     built = run_build(a.config, rep, src=a.src, infra_conf=a.infra)
-    write_report(rep)
+    kver = detect_kver(a.src)
+    write_report(rep, kver=kver,
+                 result=("build-ok" if built else "build-echoue"))
     if not built:
         print("!! build echoue (cf. sortie kernel_build). Rien arme.", flush=True)
         _push_failure(rep, repo, "build echoue")
         stop_stream(stream)
         sys.exit(3)
 
-    kver = detect_kver(a.src)
     print(">> demande d'autorisation (git/local)...", flush=True)
     authorized = request_git_authorization(rep, repo=repo, kver=kver,
                                            bypass=a.bypass_validation)
-    write_report(rep)
+    write_report(rep, kver=kver,
+                 result=("finalise" if authorized else "differe"))
     if authorized:
         print(f">> first-boot termine pour {kver}. BootNext arme (essai unique). "
               "Reboote pour tester ; boot_confirm promeut si sain.", flush=True)
@@ -786,22 +795,36 @@ def detect_kver(src):
     return out.strip() if rc == 0 and out.strip() else os.uname().release
 
 
-def write_report(rep, path="/boot_pool/manager/first-boot-report.txt"):
+def write_report(rep, kver=None, result=None):
+    """Ecrit le rapport first-boot DANS le manager (meme racine que le registre :
+    MANAGER_ROOT, lui-meme issu d'infra.conf [manager] -- aucun chemin code en
+    dur) et journalise un evenement COHERENT (kind EV_FIRSTBOOT) rattache au
+    kver, comme les autres parties du logiciel. 'result' : None (empreinte) ou
+    'build-ok' / 'build-echoue' / 'finalise' / 'differe'."""
+    root = os.environ.get("MANAGER_ROOT", "/boot_pool/manager")
+    reg = None
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import kernel_registry
+        reg = kernel_registry.KernelRegistry()
+        root = str(reg.root)          # source unique de la racine du manager
+    except Exception:
+        pass
+    path = os.path.join(root, "first-boot-report.txt")
+    try:
+        os.makedirs(root, exist_ok=True)
         with open(path, "w") as f:
             f.write(rep.text())
     except OSError:
         pass
-    # journalise aussi dans le registre si dispo
-    try:
-        import kernel_registry
-        kernel_registry.KernelRegistry().log_event(
-            "study", None,
-            f"first-boot empreinte: {len(rep.criticals)} crit, "
-            f"{len(rep.warnings)} warn")
-    except Exception:
-        pass
+    # journal append-only du manager : evenement first-boot rattache au kver
+    if reg is not None:
+        try:
+            kind = getattr(kernel_registry, "EV_FIRSTBOOT", "first-boot")
+            detail = (f"result={result or 'empreinte'} "
+                      f"crit={len(rep.criticals)} warn={len(rep.warnings)}")
+            reg.log_event(kind, kver, detail)
+        except Exception:
+            pass
 
 
 def start_stream():

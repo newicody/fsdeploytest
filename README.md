@@ -1916,12 +1916,19 @@ rebuild** : `select_rootfs.py use <vN>` (ou `rollback`). Le lien
 `rootfs.sfs -> rootfs-vN.sfs` bascule (atomique), effet au prochain boot. C'est
 la facon RECOMMANDEE de "revenir a l'ancien rootfs".
 
-### Activer le modele versionne par liens (migration unique)
+### Modèle versionné par liens (désormais automatique)
 
-`select_rootfs.py` + `freeze_overlay.py` sont integres : `rootfs.sfs` est cense
-etre un **lien** vers `rootfs-vN.sfs`. Au depart, le `rootfs.sfs` cree par
-`sfs_build` est un **fichier reel** -> une migration unique (depuis le systeme
-boote ou un chroot ou `fast_pool/sfs` est monte sur `/fast_pool/sfs`) :
+`select_rootfs.py` + `freeze_overlay.py` reposent sur : `rootfs.sfs` est un
+**lien** vers `rootfs-vN.sfs`. **Depuis la mise en conformité, `sfs_build`
+(`build_rootfs_sfs`, donc aussi `first_boot --rootfs-src` et `operate rootfs`)
+produit directement ce modèle** : chaque build écrit `rootfs-vN.sfs` (version
+suivante) et (re)pointe le lien `rootfs.sfs -> rootfs-vN.sfs` (relatif, atomique),
+en mémorisant l'ancienne version pour `select_rootfs rollback`. Plus de migration
+manuelle. (`sfs_build --no-versioned` revient au fichier plat — déconseillé, non
+conforme.)
+
+Si une installation **ancienne** a encore un `rootfs.sfs` **fichier réel** (créé
+avant ce correctif), migration unique :
 
 ```sh
 cd /fast_pool/sfs
@@ -1929,10 +1936,10 @@ mv rootfs.sfs rootfs-v1.sfs
 sudo /usr/bin/python3 select_rootfs.py use v1     # cree rootfs.sfs -> rootfs-v1.sfs
 sudo /usr/bin/python3 select_rootfs.py list       # verifie l'actif + les versions
 ```
-Ensuite `freeze_overlay.py` produit v2, v3... et `select_rootfs.py use vN`
-bascule. `init.py` est INCHANGE : il monte `rootfs.sfs`, le lien est suivi de
-facon transparente (`os.open`/`losetup`), et le CRC32 calcule est celui de la
-cible -> le reset d'upper se declenche bien a chaque changement de version.
+Ensuite `freeze_overlay.py` produit v2, v3… et `select_rootfs.py use vN`
+bascule. `init.py` est INCHANGÉ : il monte `rootfs.sfs`, le lien est suivi de
+façon transparente (`os.open`/`losetup`), et le CRC32 calculé est celui de la
+cible → le reset d'upper se déclenche bien à chaque changement de version.
 
 ### Synchro durable des sfs vers `data_pool` (`[replication]`)
 
@@ -2033,16 +2040,22 @@ Les vérifications existent depuis longtemps mais étaient éparses et lancées 
 main. Le process est maintenant **orchestré, read-only et journalisé** via
 `operate.py check`, et les garde-fous sont **imposés aux points clés**.
 
-### Inventaire (tous read-only)
+### Table des opérations de sainteté
 
-| Module | Vérifie | Garde-fou imposé |
-|---|---|---|
-| `validate_boot.py` | sfs (magic squashfs + montage RO test + contenu attendu), ESP (vfat + place) | non (rend un verdict) |
-| `initramfs_verify.py` | contenu cpio : `init`, `zfs.ko`, `zfs_load_order`, `zpool/zfs/mount.zfs`, `python3` + manifeste SHA-256 | au **build** (`build_initramfs` → sys.exit) |
-| `kernel_diagnose.py` | `.config` vs requis, modules+dmesg, attrs zfs, `health.json` du boot | non (diagnostic post-boot) |
-| `first_boot.verify_infra`+`preflight` | conformité réel/déclaré, UEFI/arch/outils/espace/montages | **oui** (first_boot STOP sur critique) |
-| `boot_confirm.healthy()` | pool + route par défaut | **oui** (pas de promotion BootOrder si KO) |
-| `init.py health_check()` | écrit `/run/health.json` (état ZFS/disques/mémoire) | non (rapport, lu ensuite par diagnose) |
+Table de référence (à maintenir) : chaque vérification, quand elle peut intervenir, son garde-fou éventuel, ce qu'elle fait, les datasets/devices touchés et la config liée.
+
+| Opération | Quand | Garde-fou | Ce qu'elle fait | Datasets | Devices | Config liée |
+|---|---|---|---|---|---|---|
+| `validate_boot.py` | pré-boot, manuel, `operate check`, avant `kernel`/`select` | non — verdict (imposé par `operate check --strict`) | monte chaque sfs en **RO** (magic squashfs + `/sbin /etc /usr` attendus) + teste ESP (vfat + place) | `fast_pool/sfs` (`rootfs-vN.sfs`, `modules-<kver>.sfs`) | partitions ESP | `[efi]` (partuuid/partitions) |
+| `initramfs_verify.py` | build (auto via `build_initramfs`), manuel | **oui** au build (`sys.exit` si non bootable) | parse le cpio : `init`, `zfs.ko`, `zfs_load_order`, `zpool/zfs/mount.zfs`, `python3` ; manifeste SHA-256 ; verdict bootable | — | le fichier `initramfs-<kver>.zst` (ESP/build dir) | — |
+| `kernel_diagnose.py` | post-boot, manuel, `operate check --diagnose` | non — diagnostic | `.config` vs flags requis, modules chargés + motifs `dmesg`, attrs ZFS, lit `health.json` | `fast_pool/usr-src` (`.config`) | — | `[kernel]` (src, flags), `health.json` |
+| `first_boot.verify_infra` | first_boot (chroot), `operate check` | **oui** — first_boot STOP sur critique | conformité réel/déclaré : pools importés, datasets montés, ESP, firmware | `[datasets]` déclarés, pools | disques, partitions ESP | `[pools] [datasets] [efi] [firmware]` |
+| `first_boot.preflight` | first_boot (chroot) | **oui** — STOP sur critique/todo | UEFI, arch x86_64, outils (make/gcc/emerge/mksquashfs/efibootmgr/zstd/zfs…), espace, mémoire, efivarfs, 2ᵉ ESP | `fast_pool/usr-src`, `/var/tmp` | disques, ESP, efivarfs | `[kernel] [efi]` |
+| `build_initramfs.verify_bootable` | build | **oui** — `sys.exit` au build | chroot busybox + python s'exécutent dans l'initramfs assemblé | — | — | `FFMPEG_STATIC`, `YT_KEY` (env) |
+| `boot_confirm.healthy()` | post-boot | **oui** — pas de promotion `BootOrder` si KO | pool importé/ONLINE + route par défaut présente | pools | NIC (route), efivars (efibootmgr) | `[efi]` (BootOrder), manager |
+| `init.py health_check()` | au boot (initramfs) | non — rapport | écrit `/run/health.json` (état pools/disques/mémoire) → `NEWROOT/etc/health.json` | tous pools montés | disques | — |
+| `init.py` gate sanity *(planifié)* | au boot, après réseau, avant `switch_root` | **oui** — strict (ticket board + input) | `NEWROOT` complet (`/sbin /etc /usr /lib`), lower sfs monté, health OK ; KO → ticket Projects v2 + attente input/GitHub | `fast_pool/rootfs` (overlay), `fast_pool/sfs` (lower) | `/dev/console`, `eth0` | `[boot]` (sanity/timeouts/réponses), `[git]` |
+| `operate.py check` | chroot / booté / rescue, manuel/scripté | `--strict` → `rc≠0` (à imposer devant une op) | **orchestre** read-only : `verify_infra` + `validate_boot` (+ `kernel_diagnose` si `--diagnose`) ; verdict ; journalise le manager | `fast_pool/sfs`, pools | partitions ESP | `--strict/--diagnose`, `INFRA_CONF`, `[efi]` |
 
 ### Orchestration read-only : `operate.py check`
 

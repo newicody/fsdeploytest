@@ -45,6 +45,7 @@ EV_PROMOTE   = "promote"
 EV_INFERENCE = "inference"
 EV_STUDY     = "study"
 EV_NOTE      = "note"
+EV_FIRSTBOOT = "first-boot"  # orchestration first_boot (empreinte/build/finalisation)
 
 
 class KernelRegistry:

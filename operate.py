@@ -502,6 +502,18 @@ def main():
     if os.geteuid() != 0 and cmd not in NO_ROOT:
         sys.exit(f"root requis pour '{cmd}'.")
 
+    # manager : aligne MANAGER_ROOT sur infra.conf [manager] (env > config) pour
+    # que le journal d'operate ET les modules delegues (kernel_build, boot_confirm)
+    # pointent au MEME manager que first_boot. run_module propage os.environ.
+    if "MANAGER_ROOT" not in os.environ:
+        try:
+            from configobj import ConfigObj
+            mr = (ConfigObj(INFRA).get("manager", {}) or {}).get("root")
+            if mr:
+                os.environ["MANAGER_ROOT"] = mr
+        except Exception:
+            pass
+
     detail = (cmd + (" " + " ".join(passthrough) if passthrough else "")).strip()
     journal("operate", f"start: {detail}")
     if cmd in handlers:

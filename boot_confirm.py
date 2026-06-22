@@ -22,6 +22,22 @@ def log(s):
     print(f"[boot-confirm] {s}", flush=True)
 
 
+def _align_manager_root():
+    """Aligne MANAGER_ROOT sur infra.conf [manager] (env > config), comme
+    first_boot/operate, pour que la promotion ecrive dans le MEME manager.
+    Best-effort : si configobj/infra absent, on garde l'env/defaut."""
+    if "MANAGER_ROOT" in os.environ:
+        return
+    inf = os.environ.get("INFRA_CONF", "/etc/infra.conf")
+    try:
+        from configobj import ConfigObj
+        mr = (ConfigObj(inf).get("manager", {}) or {}).get("root")
+        if mr:
+            os.environ["MANAGER_ROOT"] = mr
+    except Exception:
+        pass
+
+
 def out(cmd):
     return subprocess.run(cmd, capture_output=True, text=True).stdout
 
@@ -53,6 +69,7 @@ def boot_order():
 
 
 def main():
+    _align_manager_root()
     if not healthy():
         log(f"HEALTH-CHECK ECHEC pour {KVER} — pas de promotion.")
         log("Un reboot repartira sur le noyau precedent (BootOrder inchange).")

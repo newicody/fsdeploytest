@@ -168,9 +168,13 @@ def main():
     ap.add_argument("--endpoint", default=DEF_ENDPOINT)
     ap.add_argument("--model", default=DEF_MODEL)
     ap.add_argument("--fragment", default="/tmp/proposed.config")
-    ap.add_argument("--history", default="/boot_pool/manager/config-history",
+    ap.add_argument("--history",
+                    default=os.path.join(
+                        os.environ.get("MANAGER_ROOT", "/boot_pool/manager"),
+                        "config-history"),
                     help="dossier parent d'archivage des configs validees "
-                         "(boot_pool = durable ; PAS fast_pool qui est un stripe)")
+                         "(defaut: <MANAGER_ROOT>/config-history ; boot_pool "
+                         "durable, PAS fast_pool qui est un stripe)")
     ap.add_argument("--force", action="store_true",
                     help="sauter le check de version (traiter les symboles courants)")
     a = ap.parse_args()

@@ -98,6 +98,7 @@ def main():
     if st["item"] and st["field"]:
         def _move():
             board.set_status(st["item"], gp.brainstorm.S_DEV)
+            time.sleep(2)
             for it in board.items():
                 if it["item_id"] == st["item"]:
                     if it["status"] != gp.brainstorm.S_DEV:

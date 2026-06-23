@@ -145,6 +145,40 @@ def degraded_repair():
     os.execv(sh, [sh])
 
 
+def _openrc_bin():
+    """Chemin du binaire 'openrc' (lance un runlevel), ou '' si absent."""
+    return which("openrc") or ("/sbin/openrc" if os.path.exists("/sbin/openrc")
+                               else "")
+
+
+def openrc_bringup():
+    """Initialise le RUNTIME OpenRC via les runlevels sysinit puis boot. C'est
+    l'etape qui manquait : elle cree /run/openrc (deptree, VERROUS, softlevel),
+    monte les pseudo-FS de facon idempotente et demarre sysfs/devfs/udev EN TANT
+    QUE SERVICES OpenRC. Sans elle, 'rc-service X start' echoue ('bad file
+    descriptor' sur les verrous /run/openrc, 'sysfs would not start', 'devfs
+    failed') car la base n'est pas initialisee et aucune dependance n'est
+    resolue. Best-effort ; retourne True si openrc a tourne (-> udev gere par
+    OpenRC, on n'en lance pas un second a la main)."""
+    openrc = _openrc_bin()
+    if not openrc:
+        log("[openrc] binaire 'openrc' absent -> bring-up MANUEL (fallback)")
+        return False
+    ran = True
+    for level in ("sysinit", "boot"):
+        log(f"[openrc] runlevel {level}...")
+        try:
+            rc = subprocess.run([openrc, level]).returncode
+        except OSError as e:
+            log(f"[openrc] {level} non lance ({e})")
+            ran = False
+            continue
+        if rc != 0:
+            log(f"[openrc] runlevel {level} rc={rc} (deja monte/demarre ? on "
+                "continue ; PID 1 ne quitte jamais)")
+    return ran
+
+
 def setup_dev():
     """Complete /dev apres le montage devtmpfs (minimal). Le devtmpfs herite de
     l'initramfs n'a NI /dev/fd NI /dev/dri (GPU) NI les liens standards. Sans ca :
@@ -171,8 +205,14 @@ def setup_dev():
     subprocess.run(["mount", "-t", "tmpfs", "-o", "mode=1777,nosuid,nodev",
                     "shm", "/dev/shm"], stderr=subprocess.DEVNULL)
 
-    # 3. eudev : peuple /dev dynamiquement (cree /dev/dri/card0 etc.).
-    #    Sur Gentoo/OpenRC le daemon est udevd (fourni par sys-fs/eudev).
+    # 3. udev : peuple /dev (cree /dev/dri/cardN, applique perms video/render).
+    #    Si OpenRC est present, c'est SON service 'udev' (lance par
+    #    openrc_bringup -> runlevel boot) qui s'en charge : on ne lance PAS un
+    #    second udevd a la main (cause du conflit 'devfs failed' / double daemon).
+    #    Sinon (fallback sans OpenRC), on lance eudev directement.
+    if _openrc_bin():
+        log("udev delegue a OpenRC (service udev du runlevel boot)")
+        return
     udevd = which("udevd") or "/sbin/udevd" if os.path.exists("/sbin/udevd") \
         else (which("systemd-udevd") or "")
     if not udevd:
@@ -555,6 +595,13 @@ def main():
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     os.chmod(RUNTIME_DIR, 0o700)
     os.environ["XDG_RUNTIME_DIR"] = RUNTIME_DIR
+
+    # BRING-UP OpenRC AVANT tout 'rc-service' : initialise le runtime
+    # (/run/openrc : deptree, verrous, softlevel) et demarre sysfs/devfs/udev
+    # comme services OpenRC. C'est ce qui corrige les echecs 'bad file
+    # descriptor', 'sysfs would not start', 'devfs failed' constates au demarrage
+    # des services. udev de ce runlevel peuple /dev/dri (perms GPU) avant seatd/cage.
+    openrc_bringup()
 
     if which("seatd"):
         subprocess.Popen(["seatd", "-g", "video"],

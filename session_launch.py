@@ -202,6 +202,43 @@ def ensure_zfs_booted():
         log(f"[zfs] zfs mount -a incomplet : {(r.stderr or '').strip()[:140]}")
 
 
+def prepare_syslog_socket():
+    """Solution SANS capabilities : syslog-ng tourne en 'logs' mais ne peut pas
+    creer /dev/log (dossier /dev = root:root). On lui donne un repertoire qu'il
+    POSSEDE (/run/syslog-ng, logs:logs) pour y binder la socket, et on relie
+    /dev/log dessus pour les clients (libc syslog()). A poser AVANT
+    start_services (devtmpfs+/run neufs a chaque boot). Best-effort.
+
+    IMPORTANT cote conf : la source syslog-ng doit binder /run/syslog-ng/log
+    (et non /dev/log). Sinon un system() qui fait unlink(/dev/log) avant bind
+    retire le lien et retombe sur l'EACCES dans /dev. /dev/log reste le point
+    d'entree des CLIENTS (eux ne font que connect()). Voir README."""
+    import grp
+    import pwd
+    try:
+        uid = pwd.getpwnam("logs").pw_uid
+        gid = grp.getgrnam("logs").gr_gid
+    except KeyError:
+        log("[syslog] user/group 'logs' absent -> socket non preparee")
+        return
+    d = "/run/syslog-ng"
+    try:
+        os.makedirs(d, exist_ok=True)
+        os.chown(d, uid, gid)
+        os.chmod(d, 0o755)
+    except OSError as e:
+        log(f"[syslog] {d} non prepare ({e})")
+        return
+    try:
+        if os.path.islink("/dev/log") or os.path.exists("/dev/log"):
+            os.remove("/dev/log")
+        os.symlink("/run/syslog-ng/log", "/dev/log")
+        log("[syslog] /run/syslog-ng (logs:logs) pret ; /dev/log -> "
+            "/run/syslog-ng/log")
+    except OSError as e:
+        log(f"[syslog] lien /dev/log non pose ({e})")
+
+
 def setup_dev():
     """Complete /dev apres le montage devtmpfs (minimal). Le devtmpfs herite de
     l'initramfs n'a NI /dev/fd NI /dev/dri (GPU) NI les liens standards. Sans ca :
@@ -641,6 +678,11 @@ def main():
     # SOCLE OpenRC (syslog-ng, dbus, udev...) dans l'ordre de [services] de
     # infra.conf. Lance AVANT le stream pour que les logs (syslog-ng -> /var/log)
     # et le bus (dbus) soient prets, et que le boot 'complet' soit streame ensuite.
+    # socle log : preparer la socket syslog-ng (repertoire logs:logs + lien
+    # /dev/log) AVANT start_services, sinon syslog-ng en 'logs' ne peut pas
+    # creer /dev/log (sans capabilities).
+    prepare_syslog_socket()
+
     start_services()
 
     # SESSION utilisateur dediee (non-root) : lire [session], creer l'utilisateur

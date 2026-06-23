@@ -222,12 +222,91 @@ def ensure_zfs_booted(infra_path=None):
         subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
         return
     log(f"[zfs] montage booted via zfs_mounts ({len(datasets)} datasets)...")
-    for ds, spec in datasets.items():
-        spec = spec or {}
-        mp = spec.get("mountpoint")        # declare ; sinon propriete ZFS (None)
-        # /var/log peut preexister non-vide dans l'overlay -> remplacement voulu.
-        allow_ne = (mp == "/var/log")
-        zfs_mounts.ensure_mounted(ds, target=mp, log=log, allow_nonempty=allow_ne)
+    # RECURSIVITE : on enumere les datasets REELS (zfs list) plutot que la seule
+    # liste declaree, pour couvrir les enfants DYNAMIQUES (ex data_pool/home/<user>
+    # en multi-utilisateur, snapshots promus...). On trie par PROFONDEUR (parent
+    # avant enfant) : un enfant ne peut etre monte avant son parent. Les
+    # mountpoints declares servent surtout aux datasets legacy (cible explicite).
+    declared = {ds: (spec or {}).get("mountpoint") for ds, spec in datasets.items()}
+    try:
+        r = subprocess.run(["zfs", "list", "-H", "-o", "name"],
+                           capture_output=True, text=True)
+        names = [n for n in r.stdout.splitlines() if n.strip()]
+    except OSError:
+        names = list(declared)
+    names.sort(key=lambda n: (n.count("/"), n))     # parent -> enfant
+    for ds in names:
+        st = zfs_mounts.inspect(ds)
+        if not st.exists:
+            continue
+        mp = st.mountpoint                          # propriete reelle
+        if mp in ("none", "-", ""):
+            continue                                # conteneur : rien a monter
+        target = declared.get(ds)                   # None sauf legacy/explicite
+        if mp == "legacy" and not target:
+            log(f"  [skip] {ds} legacy sans cible declaree")
+            continue
+        allow_ne = (target == "/var/log" or mp == "/var/log")
+        zfs_mounts.ensure_mounted(ds, target=target, log=log,
+                                  allow_nonempty=allow_ne)
+
+
+def load_github_token(infra_path=None):
+    """Charge GITHUB_TOKEN depuis un fichier (comme /etc/yt.key pour YouTube),
+    sinon TOUT le reporting git est silencieusement saute (board push, synchro
+    manager) car le code est garde par os.environ.get('GITHUB_TOKEN'). Source :
+    [manager] token_file, sinon /etc/github.token, sinon <MANAGER_ROOT>/github.
+    token. Best-effort ; n'ecrase pas un token deja present dans l'env."""
+    if os.environ.get("GITHUB_TOKEN"):
+        return
+    cands = []
+    path = _locate_infra(infra_path)
+    if path:
+        try:
+            from configobj import ConfigObj
+            m = ConfigObj(path).get("manager", {}) or {}
+            if m.get("token_file"):
+                cands.append(m["token_file"])
+            if m.get("root"):
+                cands.append(os.path.join(m["root"], "github.token"))
+        except Exception:
+            pass
+    cands += ["/etc/github.token", "/boot_pool/manager/github.token"]
+    for f in cands:
+        try:
+            if f and os.path.isfile(f):
+                tok = open(f).read().strip()
+                if tok:
+                    os.environ["GITHUB_TOKEN"] = tok
+                    log(f"[git] GITHUB_TOKEN charge depuis {f} (reporting actif)")
+                    return
+        except OSError:
+            continue
+    log("[git] aucun token GitHub trouve -> reporting git desactive "
+        "(deposer le token dans [manager] token_file pour l'activer)")
+
+
+def run_boot_confirm():
+    """Lance boot_confirm en ARRIERE-PLAN apres le socle : health-check du noyau
+    fraichement boote -> promotion (efibootmgr + registre) -> remontee git. En
+    tache de fond pour ne pas retarder le compositeur. Idempotent : si le noyau
+    est deja 'current', promote ne change rien (pas de commit/push). Best-effort.
+    Herite de GITHUB_TOKEN/MANAGER_ROOT deja exportes -> la remontee fonctionne."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = ["/usr/local/sbin/boot_confirm.py",
+             os.path.join(here, "boot_confirm.py"),
+             which("boot_confirm.py") or ""]
+    bc = next((c for c in cands if c and os.path.isfile(c)), "")
+    if not bc:
+        log("[boot-confirm] script introuvable -> promotion non lancee")
+        return
+    try:
+        subprocess.Popen(["python3", bc],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+        log(f"[boot-confirm] lance en arriere-plan ({bc})")
+    except OSError as e:
+        log(f"[boot-confirm] non lance ({e})")
 
 
 def prepare_syslog_socket():
@@ -730,6 +809,11 @@ def main():
     # fast_pool/sfs, staging, boot_pool/manager, images... absents en booted.
     ensure_zfs_booted()
 
+    # token GitHub (boot_pool/manager dispo apres ensure_zfs_booted) -> reactive
+    # le reporting git (push board de first_boot, synchro manager d'operate/
+    # boot_confirm). Sans lui, tout push est silencieusement saute.
+    load_github_token()
+
     if which("seatd"):
         subprocess.Popen(["seatd", "-g", "video"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -746,6 +830,11 @@ def main():
     prepare_syslog_socket()
 
     start_services()
+
+    # PROMOTION du noyau fraichement boote : health-check -> efibootmgr + registre
+    # -> remontee git. En arriere-plan (ne bloque pas le compositeur). Le reseau
+    # (initramfs) et le token sont prets a ce stade.
+    run_boot_confirm()
 
     # SESSION utilisateur dediee (non-root) : lire [session], creer l'utilisateur
     # + groupes (video/input/seat/render), preparer le verrou. cage tournera en

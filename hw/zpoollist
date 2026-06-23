@@ -1,0 +1,4 @@
+NAME        SIZE  ALLOC   FREE  CKPOINT  EXPANDSZ   FRAG    CAP  DEDUP    HEALTH  ALTROOT
+boot_pool  19.5G  2.45G  17.0G        -         -     2%    12%  1.00x    ONLINE  -
+data_pool  18.1T   141G  18.0T        -         -     0%     0%  1.00x    ONLINE  -
+fast_pool  1.81T   162G  1.65T        -         -     1%     8%  1.00x    ONLINE  -

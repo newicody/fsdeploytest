@@ -179,27 +179,55 @@ def openrc_bringup():
     return ran
 
 
-def ensure_zfs_booted():
+def _locate_infra(infra_path=None):
+    """Trouve infra.conf (le sfs l'embarque). Retourne le chemin ou ''."""
+    cands = [infra_path] if infra_path else []
+    cands += ["/etc/infra.conf", "/infra.conf", "/sbin/infra.conf"]
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    return ""
+
+
+def ensure_zfs_booted(infra_path=None):
     """Apres switch_root, les montages /mnt/* de l'initramfs ont DISPARU (ils
-    etaient hors NEWROOT) ; en revanche les pools restent IMPORTES (etat noyau).
-    On remonte donc les datasets a leur mountpoint REEL pour le systeme booted :
-    fast_pool/sfs (rootfs.sfs pour select/freeze/operate), fast_pool/staging,
-    fast_pool/usr-src, boot_pool/manager (registre/journal), boot_pool/images,
-    data_pool/* ... Best-effort, idempotent (ignore deja-monte/legacy/none)."""
+    etaient hors NEWROOT) ; les pools restent IMPORTES (etat noyau). On remonte
+    chaque dataset declare a son mountpoint REEL via l'AUTORITE zfs_mounts
+    (ensure_mounted), et NON via 'zfs mount -a' : ce dernier SAUTE les datasets
+    canmount=noauto (data_pool/home, etc.) -> /home reste l'overlay et le home
+    utilisateur finit sur la racine. ensure_mounted fait un 'zfs mount <ds>'
+    explicite (qui monte meme en noauto), gere legacy/target, et VERIFIE.
+    Idempotent : un dataset deja monte au bon endroit est laisse tel quel."""
     if not which("zpool"):
         log("[zfs] zpool absent -> montages booted sautes")
         return
-    # filet : importer tout pool encore absent (ex boot_pool si l'init ne l'a pas
-    # fait). -N = sans monter ; on monte juste apres.
+    # filet : importer tout pool encore absent (ex boot_pool). -N = sans monter.
     subprocess.run(["zpool", "import", "-aN"], stderr=subprocess.DEVNULL)
-    # monter les datasets canmount=on a leur mountpoint (equivalent du service
-    # OpenRC zfs-mount). Idempotent : saute ce qui est deja monte (l'overlay et
-    # les datasets deplaces sous NEWROOT restent en place).
-    r = subprocess.run(["zfs", "mount", "-a"], capture_output=True, text=True)
-    if r.returncode == 0:
-        log("[zfs] datasets booted montes (zfs mount -a)")
-    else:
-        log(f"[zfs] zfs mount -a incomplet : {(r.stderr or '').strip()[:140]}")
+    try:
+        import zfs_mounts
+    except Exception as e:
+        log(f"[zfs] zfs_mounts indisponible ({e}) -> repli 'zfs mount -a'")
+        subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
+        return
+    path = _locate_infra(infra_path)
+    if not path:
+        log("[zfs] infra.conf introuvable -> repli 'zfs mount -a'")
+        subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
+        return
+    try:
+        from configobj import ConfigObj
+        datasets = ConfigObj(path).get("datasets", {}) or {}
+    except Exception as e:
+        log(f"[zfs] [datasets] illisible ({e}) -> repli 'zfs mount -a'")
+        subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
+        return
+    log(f"[zfs] montage booted via zfs_mounts ({len(datasets)} datasets)...")
+    for ds, spec in datasets.items():
+        spec = spec or {}
+        mp = spec.get("mountpoint")        # declare ; sinon propriete ZFS (None)
+        # /var/log peut preexister non-vide dans l'overlay -> remplacement voulu.
+        allow_ne = (mp == "/var/log")
+        zfs_mounts.ensure_mounted(ds, target=mp, log=log, allow_nonempty=allow_ne)
 
 
 def prepare_syslog_socket():
@@ -471,6 +499,32 @@ def _read_session_config(infra_path="/etc/infra.conf"):
     }
 
 
+def _home_dataset_ready(home_ds="data_pool/home", mp="/home"):
+    """Garantit que `mp` (=/home) est bien le dataset `home_ds` MONTE, et pas
+    l'overlay racine. Le monte au besoin via zfs_mounts. Retourne True seulement
+    si c'est confirme. Empeche useradd --create-home de polluer la racine."""
+    try:
+        import zfs_mounts
+    except Exception:
+        # repli minimal : /proc/mounts doit montrer home_ds sur mp
+        try:
+            with open("/proc/mounts") as f:
+                for ln in f:
+                    p = ln.split()
+                    if len(p) >= 2 and p[0] == home_ds and p[1] == mp:
+                        return True
+        except OSError:
+            pass
+        subprocess.run(["zfs", "mount", home_ds], stderr=subprocess.DEVNULL)
+        return os.path.ismount(mp)
+    st = zfs_mounts.inspect(home_ds)
+    if st.mounted and os.path.abspath(st.where or "") == mp:
+        return True
+    zfs_mounts.ensure_mounted(home_ds, target=mp, log=log)
+    st = zfs_mounts.inspect(home_ds)
+    return bool(st.mounted and os.path.abspath(st.where or "") == mp)
+
+
 def ensure_user(user, groups):
     """Cree l'utilisateur dedie (non-root) s'il manque et l'ajoute aux groupes
     requis (video/input/seat/render : acces GPU/entrees via seatd). Retourne
@@ -493,6 +547,14 @@ def ensure_user(user, groups):
     # creation : home dans /home/<user>, shell bash, groupes
     if not which("useradd"):
         log(f"[session] useradd absent : impossible de creer l'utilisateur {user}")
+        return None
+    # GARDE-FOU : /home DOIT etre data_pool/home monte avant --create-home, sinon
+    # le home atterrit sur l'overlay racine (volatil, mauvais dataset). On le
+    # monte ; si on n'y arrive pas, on REFUSE plutot que de polluer la racine.
+    if not _home_dataset_ready():
+        log("[session] data_pool/home NON monte sur /home -> creation de "
+            f"{user} REFUSEE (eviterait un home sur la racine/overlay). "
+            "Verifier le montage ZFS (zfs_mounts/ensure_zfs_booted).")
         return None
     existing = []
     for g in groups:

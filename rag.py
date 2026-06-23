@@ -27,15 +27,28 @@ import ov_pipelines
 
 def _autoboot_home():
     """Home de l'utilisateur de session (donnees durables sur data_pool/home).
-    AUTOBOOT_HOME (exporte par session_launch) prioritaire ; sinon ~ si non-root ;
-    sinon /home/eric (appliance mono-utilisateur)."""
+    Resout le home de l'utilisateur COURANT (multi-utilisateurs supporte) :
+    AUTOBOOT_HOME (exporte par session_launch) prioritaire ; sinon le home du
+    compte effectif (pwd) ; sinon $HOME si non-root. Pas de compte code en dur."""
     h = os.environ.get("AUTOBOOT_HOME")
     if h:
         return h
+    try:
+        import pwd
+        pw = pwd.getpwuid(os.getuid())
+        if pw.pw_dir and pw.pw_dir not in ("/", "/root", ""):
+            return pw.pw_dir
+    except (KeyError, ImportError):
+        pass
     h = os.path.expanduser("~")
     if h and h not in ("/root", "/", ""):
         return h
-    return "/home/eric"
+    # dernier recours : home derive du nom d'utilisateur effectif sous /home
+    try:
+        import pwd
+        return os.path.join("/home", pwd.getpwuid(os.getuid()).pw_name)
+    except Exception:
+        return os.path.expanduser("~") or "/tmp"
 
 
 def _autoboot_dir(kind):

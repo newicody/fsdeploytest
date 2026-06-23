@@ -179,6 +179,29 @@ def openrc_bringup():
     return ran
 
 
+def ensure_zfs_booted():
+    """Apres switch_root, les montages /mnt/* de l'initramfs ont DISPARU (ils
+    etaient hors NEWROOT) ; en revanche les pools restent IMPORTES (etat noyau).
+    On remonte donc les datasets a leur mountpoint REEL pour le systeme booted :
+    fast_pool/sfs (rootfs.sfs pour select/freeze/operate), fast_pool/staging,
+    fast_pool/usr-src, boot_pool/manager (registre/journal), boot_pool/images,
+    data_pool/* ... Best-effort, idempotent (ignore deja-monte/legacy/none)."""
+    if not which("zpool"):
+        log("[zfs] zpool absent -> montages booted sautes")
+        return
+    # filet : importer tout pool encore absent (ex boot_pool si l'init ne l'a pas
+    # fait). -N = sans monter ; on monte juste apres.
+    subprocess.run(["zpool", "import", "-aN"], stderr=subprocess.DEVNULL)
+    # monter les datasets canmount=on a leur mountpoint (equivalent du service
+    # OpenRC zfs-mount). Idempotent : saute ce qui est deja monte (l'overlay et
+    # les datasets deplaces sous NEWROOT restent en place).
+    r = subprocess.run(["zfs", "mount", "-a"], capture_output=True, text=True)
+    if r.returncode == 0:
+        log("[zfs] datasets booted montes (zfs mount -a)")
+    else:
+        log(f"[zfs] zfs mount -a incomplet : {(r.stderr or '').strip()[:140]}")
+
+
 def setup_dev():
     """Complete /dev apres le montage devtmpfs (minimal). Le devtmpfs herite de
     l'initramfs n'a NI /dev/fd NI /dev/dri (GPU) NI les liens standards. Sans ca :
@@ -602,6 +625,11 @@ def main():
     # descriptor', 'sysfs would not start', 'devfs failed' constates au demarrage
     # des services. udev de ce runlevel peuple /dev/dri (perms GPU) avant seatd/cage.
     openrc_bringup()
+
+    # REMONTER les datasets ZFS du systeme booted : les montages /mnt/* de
+    # l'initramfs ont disparu au switch_root (pools toujours importes). Sans ca :
+    # fast_pool/sfs, staging, boot_pool/manager, images... absents en booted.
+    ensure_zfs_booted()
 
     if which("seatd"):
         subprocess.Popen(["seatd", "-g", "video"],

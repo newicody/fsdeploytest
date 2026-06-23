@@ -35,7 +35,8 @@ IMPORT_SCAN_DIRS = ["/dev"]          # rempli plus finement par _scan_dirs()
 DATA_POOL   = "data_pool"            # importe aussi (donnees : home, log, archives)
 
 # --- mode secours (degrade niveau 1) -----------------------------------------
-RESCUE_POOL    = "boot_pool"
+BOOT_POOL      = "boot_pool"          # manager (manifest/journal) + images secours
+RESCUE_POOL    = BOOT_POOL
 RESCUE_SFS_DS  = f"{RESCUE_POOL}/images"
 RESCUE_ROOTFS  = "rootfs.sfs"
 
@@ -398,10 +399,15 @@ def list_pool_datasets(pool):
     return names
 
 
-def mount_pool_recursive(pool, under):
+def mount_pool_recursive(pool, under, respect_mountpoint=False):
     """Monte TOUS les datasets montables d'un pool SOUS `under`, dans l'ordre
     parent->enfant. Un dataset dont le PARENT a echoue est saute (dependance).
-    mountpoint=none/legacy traites correctement. Retourne (ok:set, failed:set)."""
+    mountpoint=none/legacy traites correctement. Retourne (ok:set, failed:set).
+
+    respect_mountpoint=True : la cible est NEWROOT + mountpoint_systeme du dataset
+    (ex data_pool/home mountpoint=/home -> NEWROOT/home), au lieu d'empiler sous
+    `under`. Indispensable pour que /home et /modeles atterrissent au bon endroit
+    (sinon data_pool/home finit a NEWROOT/mnt/data/home = sur l'upper volatil)."""
     ok, failed = set(), set()
     for ds in list_pool_datasets(pool):
         parent = ds.rsplit("/", 1)[0] if "/" in ds else None
@@ -413,9 +419,14 @@ def mount_pool_recursive(pool, under):
         if mp == "none":
             ok.add(ds)                # 'none' = conteneur, rien a monter, OK
             continue
-        # cible sous `under` : on reproduit l'arborescence relative au pool
-        rel = ds[len(pool):].lstrip("/")
-        target = os.path.join(under, rel) if rel else under
+        if (respect_mountpoint and mp not in ("legacy", "none", "-", "")
+                and mp.startswith("/")):
+            # respecter le mountpoint systeme : NEWROOT + /home -> NEWROOT/home
+            target = under.rstrip("/") + mp
+        else:
+            # cible sous `under` : on reproduit l'arborescence relative au pool
+            rel = ds[len(pool):].lstrip("/")
+            target = os.path.join(under, rel) if rel else under
         if mount_zfs_dataset(ds, target):
             ok.add(ds)
             log(f"  monte {ds} -> {target}")
@@ -805,6 +816,17 @@ def main():
             log(f"[!] import {DATA_POOL} echoue -> /home et donnees indisponibles "
                 f"(non bloquant pour le boot)")
 
+    # --- 3ter. import boot_pool (manager : manifest/journal + images) -------
+    # L'import reste valide a travers switch_root (etat noyau). Sans lui, le
+    # manager (boot_pool/manager) est indisponible booted -> registre/journal/
+    # boot_confirm muets, et boot_pool/images (secours) absent. Non bloquant.
+    if not rescue:
+        if import_pool(BOOT_POOL) == 0:
+            log(f"{BOOT_POOL} importe (manager + images disponibles)")
+        else:
+            log(f"[!] import {BOOT_POOL} echoue -> manager indisponible "
+                f"(non bloquant pour le boot)")
+
     # --- 4. overlay racine : lower=rootfs.sfs (ro) + upper -----------------
     debug_shell("overlay")
     # Normal : upper = dataset persistant fast_pool/rootfs (systeme mutable).
@@ -926,16 +948,17 @@ def main():
         degraded_reasons.append("couches var/log + usr-src non montees (upper degrade)")
 
     # --- 4bis-2. data_pool : montage recursif ORDONNE sous NEWROOT ----------
-    # home, log, archives... Parent monte avant enfant (dependance). Un dataset
-    # dont le parent a echoue est saute. Non bloquant : le systeme boote meme si
-    # data_pool est partiel (mais on le consigne en degrade pour les datasets
-    # critiques). data_pool/home -> NEWROOT/home, etc. selon mountpoint.
+    # On respecte le MOUNTPOINT SYSTEME de chaque dataset : data_pool/home
+    # (mountpoint=/home) -> NEWROOT/home, data_pool/modeles (mountpoint=/...) ->
+    # NEWROOT/..., etc. (avant : tout sous NEWROOT/mnt/data, donc /home tombait
+    # sur l'upper volatil et les donnees utilisateur n'etaient pas persistantes).
+    # Parent monte avant enfant. Non bloquant : le systeme boote meme si
+    # data_pool est partiel (consigne en degrade pour les datasets critiques).
     if not rescue and pool_imported(DATA_POOL):
-        log(f"montage recursif ordonne de {DATA_POOL} sous {NEWROOT}...")
-        # cible : on respecte le mountpoint du dataset s'il pointe deja vers un
-        # chemin systeme (ex /data_pool/home -> NEWROOT/data_pool/home), sinon
-        # on derive du nom. mount_pool_recursive gere l'ordre + les dependances.
-        ok_ds, failed_ds = mount_pool_recursive(DATA_POOL, f"{NEWROOT}/mnt/data")
+        log(f"montage recursif ordonne de {DATA_POOL} sous {NEWROOT} "
+            "(mountpoints systeme respectes)...")
+        ok_ds, failed_ds = mount_pool_recursive(DATA_POOL, NEWROOT,
+                                                respect_mountpoint=True)
         if failed_ds:
             log(f"[!] {len(failed_ds)} dataset(s) data_pool non monte(s) : "
                 f"{', '.join(sorted(failed_ds))}")

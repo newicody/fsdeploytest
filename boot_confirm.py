@@ -95,6 +95,15 @@ def main():
     except Exception as e:
         log(f"registre non mis a jour ({e}) -- non bloquant")
 
+    # REMONTEE GIT : pousser l'audit trail du manager (qui contient desormais la
+    # promotion) vers le remote. C'est l'arc "promote -> git" du schema. Best-effort.
+    try:
+        import manager_git
+        if manager_git.sync(f"promote {KVER}", push=True, log=log):
+            log("promotion remontee dans git (manager)")
+    except Exception as e:
+        log(f"remontee git non faite ({e}) -- non bloquant")
+
     log(f"OK — {KVER} est desormais le noyau par defaut.")
 
 

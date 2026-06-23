@@ -48,6 +48,16 @@ EV_NOTE      = "note"
 EV_FIRSTBOOT = "first-boot"  # orchestration first_boot (empreinte/build/finalisation)
 
 
+def _manager_commit(message, root):
+    """Commit local de l'audit trail (manager_git), best-effort. Le push est
+    fait aux frontieres d'operation. Jamais bloquant pour le journal."""
+    try:
+        import manager_git
+        manager_git.sync(message, root=str(root), push=False)
+    except Exception:
+        pass
+
+
 class KernelRegistry:
     """Index des versions de noyau sur un arbre de fichiers unique."""
 
@@ -129,6 +139,11 @@ class KernelRegistry:
                "detail": detail}
         with open(self.history_path, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # COMMIT git local (rapide, durable sur le mirror) : chaque operation
+        # journalisee est tracee dans git. Le PUSH (remontee vers le remote) est
+        # fait aux frontieres d'operation (operate/boot_confirm/first_boot) pour
+        # ne pas mettre de latence reseau sur ce chemin. Best-effort.
+        _manager_commit(f"{kind} {kver or ''}".strip() or kind, self.root)
         return rec
 
     def history(self, kind=None, kver=None):

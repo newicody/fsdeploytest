@@ -521,6 +521,14 @@ def main():
     else:
         rc = cmd_pass(cmd, passthrough)
     journal("operate", f"end: {detail} -> rc={rc}")
+    # REMONTEE GIT : pousser l'audit trail (journal de cette operation) vers le
+    # remote du manager. Frontiere d'operation -> push une fois par commande.
+    # Best-effort : n'affecte jamais le rc de l'operation.
+    try:
+        import manager_git
+        manager_git.sync(f"operate {detail} (rc={rc})", push=True)
+    except Exception:
+        pass
     sys.exit(rc)
 
 

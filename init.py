@@ -947,24 +947,19 @@ def main():
     elif not rescue:
         degraded_reasons.append("couches var/log + usr-src non montees (upper degrade)")
 
-    # --- 4bis-2. data_pool : montage recursif ORDONNE sous NEWROOT ----------
-    # On respecte le MOUNTPOINT SYSTEME de chaque dataset : data_pool/home
-    # (mountpoint=/home) -> NEWROOT/home, data_pool/modeles (mountpoint=/...) ->
-    # NEWROOT/..., etc. (avant : tout sous NEWROOT/mnt/data, donc /home tombait
-    # sur l'upper volatil et les donnees utilisateur n'etaient pas persistantes).
-    # Parent monte avant enfant. Non bloquant : le systeme boote meme si
-    # data_pool est partiel (consigne en degrade pour les datasets critiques).
+    # --- 4bis-2. data_pool : PAS monte ici --------------------------------
+    # Par conception (cf. README "qui monte quoi, et quand") les datasets HORS
+    # chemin de boot -- boot_pool/manager et data_pool/* (home, modeles, log,
+    # archives) -- sont montes par le SYSTEME BOOTE (session_launch.ensure_zfs_
+    # booted via zfs_mounts), a leur mountpoint REEL et apres switch_root. On ne
+    # les monte donc plus sous NEWROOT depuis l'initramfs : le faire imposait un
+    # 'zfs mount' a l'emplacement naturel + bind, fragile a travers switch_root
+    # (le bind ne survivait pas proprement -> /home finissait vide et le home
+    # utilisateur etait cree sur l'overlay racine). L'import du pool (3bis) suffit
+    # ; les datasets restent disponibles pour le montage booted.
     if not rescue and pool_imported(DATA_POOL):
-        log(f"montage recursif ordonne de {DATA_POOL} sous {NEWROOT} "
-            "(mountpoints systeme respectes)...")
-        ok_ds, failed_ds = mount_pool_recursive(DATA_POOL, NEWROOT,
-                                                respect_mountpoint=True)
-        if failed_ds:
-            log(f"[!] {len(failed_ds)} dataset(s) data_pool non monte(s) : "
-                f"{', '.join(sorted(failed_ds))}")
-            # les datasets data_pool sont non-critiques (cf. infra.conf) -> warning
-        else:
-            log(f"data_pool monte ({len(ok_ds)} datasets, ordre parent->enfant OK)")
+        log(f"{DATA_POOL} importe ; ses datasets (home, modeles, ...) seront "
+            "montes par le systeme booted (ensure_zfs_booted), pas sous NEWROOT")
 
     # --- 4ter. mode degrade : rapport + temoin (session de reparation) ------
     degraded = rescue or bool(degraded_reasons)

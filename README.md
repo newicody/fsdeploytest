@@ -2085,3 +2085,45 @@ Chaque invocation d'`operate.py` écrit dans le manager
 `check` (`crit=… warn=… strict=…`). C'est **best-effort** : si le manager n'est
 pas monté (chroot/rescue), l'opération n'échoue pas pour autant. Relire le
 journal : `python3 -c "import kernel_registry as k; [print(e) for e in k.KernelRegistry().history()]"`.
+
+## Stockage des données (home, modèles, RAG, brainstorm, tmp)
+
+Architecture mono-utilisateur (`eric`), donnée durable sur `data_pool` (raidz2),
+scratch volatil sur `fast_pool` (stripe). Monté automatiquement au boot par
+`init.py` (`mount_pool_recursive` respecte le `mountpoint` ZFS de chaque dataset).
+
+| Donnée | Emplacement | Dataset | Durable ? |
+|---|---|---|---|
+| Home utilisateur | `/home` | `data_pool/home` (mountpoint=/home) | oui |
+| Modèles LLM (OpenVINO/Ollama) | `/var/lib/models` | `data_pool/modeles` | oui |
+| RAG (corpus+index, par projet) | `~/.autoboot/rag/<projet>/` | `data_pool/home` | oui |
+| brainstorm (idées) | `~/.autoboot/brainstorm/` | `data_pool/home` | oui |
+| tmp commun | `~/fast` (bind sur fast_pool/tmp) | `fast_pool/tmp` | non (volatil) |
+
+- **RAG par projet** : chaque sous-dossier de `~/.autoboot/rag/` est un domaine =
+  un type de donnée/projet (`kernel`, `python3`, `mavoiture`, `mon-garage`…).
+  `rag.py` gère déjà le multi-domaines ; le store est durable (survit aux rebuilds
+  de `rootfs.sfs`, contrairement à l'upper de l'overlay).
+- **brainstorm** durable aussi ; les idées sont par ailleurs poussées sur le board
+  GitHub (double filet).
+- `~/.autoboot/{rag,brainstorm}` et `~/fast` sont préparés par `session_launch`
+  (`setup_user_dirs`), qui exporte aussi `AUTOBOOT_HOME` et `MODELS_DIR` pour que
+  l'app, `rag`, `brainstorm` et `operate` lancés dans la session résolvent les
+  bons chemins même via root.
+- La session graphique tourne **en tant que `eric`** (`[session] user = eric`,
+  `cage` démoté par `run_session_app`).
+
+### Mise en place ZFS (une fois)
+
+```sh
+# home durable monte sur /home (data_pool/home existe deja : juste le mountpoint)
+zfs set mountpoint=/home data_pool/home
+# modeles durables monte sur /var/lib/models (nouveau dataset)
+zfs create -o mountpoint=/var/lib/models data_pool/modeles
+# y deposer les modeles OpenVINO : /var/lib/models/qwen3-30b-a3b-int4-ov, etc.
+```
+
+Au prochain boot, `init.py` monte `data_pool/home` sur `/home` et
+`data_pool/modeles` sur `/var/lib/models` ; `session_launch` crée
+`/home/eric/.autoboot/{rag,brainstorm}` et lie `~/fast` à `fast_pool/tmp`.
+`infra.conf` déclare ces datasets ([datasets]) et `[inference] models_dir`.

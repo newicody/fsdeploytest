@@ -30,6 +30,31 @@ from pathlib import Path
 
 import ov_pipelines
 
+
+def _autoboot_home():
+    """Home de session (durable, data_pool/home). AUTOBOOT_HOME prioritaire ;
+    sinon ~ si non-root ; sinon /home/eric (appliance mono-utilisateur)."""
+    h = os.environ.get("AUTOBOOT_HOME")
+    if h:
+        return h
+    h = os.path.expanduser("~")
+    if h and h not in ("/root", "/", ""):
+        return h
+    return "/home/eric"
+
+
+def _autoboot_dir(kind):
+    return os.path.join(_autoboot_home(), ".autoboot", kind)
+
+
+def _model(name):
+    """Resout un modele sous MODELS_DIR (data_pool/modeles, defaut /var/lib/
+    models). Accepte un chemin absolu, 'models/foo-ov' (legacy) ou 'foo-ov'."""
+    if os.path.isabs(name):
+        return name
+    return os.path.join(os.environ.get("MODELS_DIR", "/var/lib/models"),
+                        os.path.basename(name))
+
 # statuts du board (cycle de vie). prod = declencheur d'action (compilation).
 S_IDEA, S_WIP, S_DEV, S_PROD, S_DROP = "idea", "wip", "dev", "prod", "drop"
 VALID_STATUS = (S_IDEA, S_WIP, S_DEV, S_PROD, S_DROP)
@@ -312,16 +337,15 @@ class BrainstormEngine:
     router/llm : pipelines (kind router/llm), crees a la demande si None.
     """
 
-    def __init__(self, store="/fast_pool/brainstorm/ideas", rag_engine=None,
+    def __init__(self, store=None, rag_engine=None,
                  router=None, llm=None,
-                 router_model="models/qwen2.5-0.5b-instruct-ov",
-                 llm_model="models/qwen3-30b-a3b-int4-ov"):
-        self.store = store
+                 router_model=None, llm_model=None):
+        self.store = store or _autoboot_dir("brainstorm")
         self.rag = rag_engine
         self._router = router
         self._llm = llm
-        self._router_model = router_model
-        self._llm_model = llm_model
+        self._router_model = router_model or _model("qwen2.5-0.5b-instruct-ov")
+        self._llm_model = llm_model or _model("qwen3-30b-a3b-int4-ov")
 
     @property
     def router(self):
@@ -422,7 +446,8 @@ class BrainstormEngine:
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="flux brainstorm (local)")
-    ap.add_argument("--store", default="/fast_pool/brainstorm/ideas")
+    ap.add_argument("--store", default=None,
+                    help="dossier des idees (defaut: ~/.autoboot/brainstorm)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     pf = sub.add_parser("add-file"); pf.add_argument("path")
     pb = sub.add_parser("add-boot")
@@ -437,7 +462,7 @@ def main():
     if a.cmd == "add-file":
         idea = from_file(a.path)
         for i, total, it in eng.process([idea]):
-            print(f"  {i}/{total} {it!r} -> {a.store}/{it.id}.json")
+            print(f"  {i}/{total} {it!r} -> {eng.store}/{it.id}.json")
     elif a.cmd == "add-boot":
         idea = from_boot_report(a.health, a.diag)
         for i, total, it in eng.process([idea]):

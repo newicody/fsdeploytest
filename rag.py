@@ -24,6 +24,32 @@ from pathlib import Path
 
 import ov_pipelines
 
+
+def _autoboot_home():
+    """Home de l'utilisateur de session (donnees durables sur data_pool/home).
+    AUTOBOOT_HOME (exporte par session_launch) prioritaire ; sinon ~ si non-root ;
+    sinon /home/eric (appliance mono-utilisateur)."""
+    h = os.environ.get("AUTOBOOT_HOME")
+    if h:
+        return h
+    h = os.path.expanduser("~")
+    if h and h not in ("/root", "/", ""):
+        return h
+    return "/home/eric"
+
+
+def _autoboot_dir(kind):
+    return os.path.join(_autoboot_home(), ".autoboot", kind)
+
+
+def _model(name):
+    """Resout un modele sous MODELS_DIR (data_pool/modeles, defaut /var/lib/
+    models). Accepte un chemin absolu, 'models/foo-ov' (legacy) ou 'foo-ov'."""
+    if os.path.isabs(name):
+        return name
+    return os.path.join(os.environ.get("MODELS_DIR", "/var/lib/models"),
+                        os.path.basename(name))
+
 try:
     import numpy as np
 except ImportError:
@@ -211,15 +237,14 @@ class RagEngine:
     -> crees a la demande a partir des chemins de modele fournis.
     """
 
-    def __init__(self, root="/fast_pool/rag", embedder=None, reranker=None,
-                 embed_model="models/qwen3-embedding-0.6b-ov",
-                 rerank_model="models/qwen3-reranker-0.6b-ov"):
-        self.root = root
+    def __init__(self, root=None, embedder=None, reranker=None,
+                 embed_model=None, rerank_model=None):
+        self.root = root or _autoboot_dir("rag")
         self._domains = {}       # domaine -> DomainIndex
         self._embedder = embedder
         self._reranker = reranker
-        self._embed_model = embed_model
-        self._rerank_model = rerank_model
+        self._embed_model = embed_model or _model("qwen3-embedding-0.6b-ov")
+        self._rerank_model = rerank_model or _model("qwen3-reranker-0.6b-ov")
 
     # --- acces pipelines (lazy) -------------------------------------------
     @property
@@ -346,7 +371,9 @@ class RagEngine:
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="RAG multi-domaines (local)")
-    ap.add_argument("--root", default="/fast_pool/rag")
+    ap.add_argument("--root", default=None,
+                    help="racine des index (defaut: ~/.autoboot/rag ; chaque "
+                         "sous-dossier = un domaine/projet : kernel, python3, ...)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     pi = sub.add_parser("ingest")
     pi.add_argument("domain")
@@ -366,7 +393,7 @@ def main():
             n = total
             print(f"\r  {i}/{total} {c.source}", end="", flush=True)
         eng.save()
-        print(f"\n{n} chunk(s) indexe(s) dans '{a.domain}' -> {a.root}")
+        print(f"\n{n} chunk(s) indexe(s) dans '{a.domain}' -> {eng.root}")
     elif a.cmd == "query":
         ctx, sources = eng.build_context(a.question, domains=a.domain)
         if not sources:

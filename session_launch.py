@@ -417,6 +417,58 @@ def ensure_user(user, groups):
         return None
 
 
+def _fast_tmp_src():
+    """Mountpoint de fast_pool/tmp (tmp commun volatil). Le monte au besoin.
+    Retourne le chemin ou '' si indisponible."""
+    try:
+        mp = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint",
+                             "fast_pool/tmp"], capture_output=True,
+                            text=True).stdout.strip()
+    except OSError:
+        return ""
+    if not mp.startswith("/") or mp in ("none", "legacy"):
+        return ""
+    if not os.path.ismount(mp):
+        subprocess.run(["zfs", "mount", "fast_pool/tmp"],
+                       stderr=subprocess.DEVNULL)
+    return mp if os.path.isdir(mp) else ""
+
+
+def setup_user_dirs(uid, gid, home, infra_path="/etc/infra.conf"):
+    """Prepare les donnees de l'utilisateur de session :
+      - ~/.autoboot/{rag,brainstorm} : DURABLE (data_pool/home) ;
+      - ~/fast : tmp commun VOLATIL (bind sur fast_pool/tmp) ;
+      - exporte AUTOBOOT_HOME + MODELS_DIR pour les enfants (app, rag,
+        brainstorm, operate). Best-effort : aucune erreur ne bloque la session."""
+    for sub in (".autoboot", ".autoboot/rag", ".autoboot/brainstorm"):
+        p = os.path.join(home, sub)
+        try:
+            os.makedirs(p, exist_ok=True)
+            os.chown(p, uid, gid)
+        except OSError as e:
+            log(f"[session] {p} non prepare ({e})")
+    fast = os.path.join(home, "fast")
+    try:
+        os.makedirs(fast, exist_ok=True)
+        os.chown(fast, uid, gid)
+    except OSError:
+        pass
+    src = _fast_tmp_src()
+    if src and not os.path.ismount(fast):
+        rc = subprocess.run(["mount", "--bind", src, fast]).returncode
+        log(f"[session] ~/fast -> {src} " + ("OK" if rc == 0 else "(bind echoue)"))
+    elif not src:
+        log("[session] fast_pool/tmp non monte -> ~/fast indisponible")
+    os.environ["AUTOBOOT_HOME"] = home
+    try:
+        from configobj import ConfigObj
+        md = (ConfigObj(infra_path).get("inference", {}) or {}).get("models_dir")
+        if md:
+            os.environ.setdefault("MODELS_DIR", md)
+    except Exception:
+        pass
+
+
 def _demote(uid, gid):
     """Retourne une fonction preexec qui bascule le processus enfant vers
     l'utilisateur non-root (setgid puis setuid, ordre important)."""
@@ -521,6 +573,8 @@ def main():
     # tant que cet utilisateur ; PID 1 (root) reste le parent qui survit.
     scfg = _read_session_config()
     session_user = ensure_user(scfg["user"], scfg["groups"])
+    if session_user:
+        setup_user_dirs(*session_user)
 
     key = read_key()
     stop_initramfs_stream()

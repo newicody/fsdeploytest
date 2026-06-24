@@ -48,6 +48,20 @@ EV_NOTE      = "note"
 EV_FIRSTBOOT = "first-boot"  # orchestration first_boot (empreinte/build/finalisation)
 
 
+def _infra_manager_root():
+    """[manager] root de l'infra.conf PHYSIQUE (repli quand MANAGER_ROOT n'est
+    pas dans l'env -- ex module appele hors operate/first_boot/session_launch).
+    None si introuvable. Garde kernel_registry auto-suffisant sur le contrat."""
+    for c in (os.environ.get("INFRA_CONF"), "/etc/infra.conf"):
+        if c and os.path.isfile(c):
+            try:
+                from configobj import ConfigObj
+                return (ConfigObj(c).get("manager", {}) or {}).get("root") or None
+            except Exception:
+                return None
+    return None
+
+
 def _manager_commit(message, root):
     """Commit local de l'audit trail (manager_git), best-effort. Le push est
     fait aux frontieres d'operation. Jamais bloquant pour le journal."""
@@ -62,8 +76,8 @@ class KernelRegistry:
     """Index des versions de noyau sur un arbre de fichiers unique."""
 
     def __init__(self, root=None):
-        self.root = Path(root or os.environ.get(
-            "MANAGER_ROOT", "/boot_pool/manager"))
+        self.root = Path(root or os.environ.get("MANAGER_ROOT")
+                         or _infra_manager_root() or "/boot_pool/manager")
         self.manifest_path = self.root / "manifest.json"
         self.kernels_dir = self.root / "kernels"
         self.configs_dir = self.root / "configs"

@@ -210,6 +210,37 @@ def _sfs_dir():
 # --------------------------------------------------------------------------- #
 # delegation aux modules existants
 # --------------------------------------------------------------------------- #
+def _load_github_token():
+    """Charge GITHUB_TOKEN depuis [manager] token_file (sinon /etc/github.token,
+    sinon <MANAGER_ROOT>/github.token), comme session_launch. operate est un
+    process SEPARE : il n'herite pas du token charge par session_launch au boot.
+    Sans ca, la remontee git de fin de commande ET les push board des modules
+    delegues sont silencieusement sautes hors booted. N'ecrase pas un token deja
+    present. Best-effort."""
+    if os.environ.get("GITHUB_TOKEN"):
+        return
+    cands = []
+    try:
+        from configobj import ConfigObj
+        m = ConfigObj(INFRA).get("manager", {}) or {}
+        if m.get("token_file"):
+            cands.append(m["token_file"])
+        if m.get("root"):
+            cands.append(os.path.join(m["root"], "github.token"))
+    except Exception:
+        pass
+    cands += ["/etc/github.token", "/boot_pool/manager/github.token"]
+    for f in cands:
+        try:
+            if f and os.path.isfile(f):
+                tok = open(f).read().strip()
+                if tok:
+                    os.environ["GITHUB_TOKEN"] = tok
+                    return
+        except OSError:
+            pass
+
+
 def run_module(script, args):
     path = os.path.join(HERE, script)
     if not os.path.isfile(path):
@@ -513,6 +544,11 @@ def main():
                 os.environ["MANAGER_ROOT"] = mr
         except Exception:
             pass
+
+    # TOKEN github : indispensable pour que la remontee git (fin de commande) ET
+    # les push board des modules delegues fonctionnent hors booted. operate ne
+    # l'herite pas de session_launch (process separe) -> on le charge ici.
+    _load_github_token()
 
     detail = (cmd + (" " + " ".join(passthrough) if passthrough else "")).strip()
     journal("operate", f"start: {detail}")

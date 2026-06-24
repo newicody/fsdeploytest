@@ -416,55 +416,6 @@ def mount_zfs_dataset(dataset, target):
     return remount_to(dataset, target, allow_nonempty=True)
 
 
-def list_pool_datasets(pool):
-    """Datasets du pool TRIES par profondeur (parent avant enfant). Indispensable :
-    boot_pool doit etre monte avant boot_pool/images, etc."""
-    rc, out = capture(["zfs", "list", "-H", "-o", "name", "-r", pool])
-    if rc != 0:
-        return []
-    names = [n for n in out.splitlines() if n.strip()]
-    # tri par nombre de '/' (profondeur) puis alphabetique -> parent en premier
-    names.sort(key=lambda n: (n.count("/"), n))
-    return names
-
-
-def mount_pool_recursive(pool, under, respect_mountpoint=False):
-    """Monte TOUS les datasets montables d'un pool SOUS `under`, dans l'ordre
-    parent->enfant. Un dataset dont le PARENT a echoue est saute (dependance).
-    mountpoint=none/legacy traites correctement. Retourne (ok:set, failed:set).
-
-    respect_mountpoint=True : la cible est NEWROOT + mountpoint_systeme du dataset
-    (ex data_pool/home mountpoint=/home -> NEWROOT/home), au lieu d'empiler sous
-    `under`. Indispensable pour que /home et /modeles atterrissent au bon endroit
-    (sinon data_pool/home finit a NEWROOT/mnt/data/home = sur l'upper volatil)."""
-    ok, failed = set(), set()
-    for ds in list_pool_datasets(pool):
-        parent = ds.rsplit("/", 1)[0] if "/" in ds else None
-        if parent and parent in failed:
-            log(f"  [skip] {ds} : parent {parent} non monte (dependance)")
-            failed.add(ds)
-            continue
-        mp = zfs_mountpoint(ds)
-        if mp == "none":
-            ok.add(ds)                # 'none' = conteneur, rien a monter, OK
-            continue
-        if (respect_mountpoint and mp not in ("legacy", "none", "-", "")
-                and mp.startswith("/")):
-            # respecter le mountpoint systeme : NEWROOT + /home -> NEWROOT/home
-            target = under.rstrip("/") + mp
-        else:
-            # cible sous `under` : on reproduit l'arborescence relative au pool
-            rel = ds[len(pool):].lstrip("/")
-            target = os.path.join(under, rel) if rel else under
-        if mount_zfs_dataset(ds, target):
-            ok.add(ds)
-            log(f"  monte {ds} -> {target}")
-        else:
-            failed.add(ds)
-            log(f"  [!] {ds} NON monte")
-    return ok, failed
-
-
 def disk_inventory():
     """Liste les disques physiques vus par le noyau (hors loop/ram/zram)."""
     disks = []

@@ -794,7 +794,37 @@ def main():
         # dans le rootfs avant de figer. Defaut = repertoire de first_boot.py.
         ref = getattr(a, "appliance_ref", None) or os.path.dirname(
             os.path.abspath(__file__))
-        rs = sfs_build.build_rootfs_sfs(a.rootfs_src, "fast_pool/sfs",
+        # ROUTAGE PAR STAGING (contrat) : sauf si rootfs_src est DEJA une copie
+        # nettoyee (marqueur clean_rootfs), on rsync+nettoie la source dans
+        # fast_pool/staging (zone reconstructible declaree dans [datasets]), puis
+        # on fige DEPUIS le staging propre. Le systeme source n'est jamais mute.
+        if sfs_build._is_clean_copy(a.rootfs_src):
+            build_src = a.rootfs_src
+            print(f">> {a.rootfs_src} deja nettoye (marqueur) -> build direct",
+                  flush=True)
+        else:
+            staging = _ds_mountpoint("fast_pool/staging")
+            if not staging:
+                print("!! fast_pool/staging non monte -> routage du build "
+                      "impossible (zfs mount fast_pool/staging).", flush=True)
+                _push_failure(rep, repo, "staging indisponible")
+                stop_stream(stream)
+                sys.exit(4)
+            print(f">> routage build via staging : {a.rootfs_src} -> {staging} "
+                  "(clean_rootfs : rsync + nettoyage + marqueur)...", flush=True)
+            crc = subprocess.run([sys.executable,
+                                  os.path.join(os.path.dirname(
+                                      os.path.abspath(__file__)),
+                                      "clean_rootfs.py"),
+                                  "--source", a.rootfs_src,
+                                  "--staging", staging, "--yes"]).returncode
+            if crc != 0:
+                print("!! clean_rootfs a echoue -> build avorte.", flush=True)
+                _push_failure(rep, repo, "clean_rootfs echoue")
+                stop_stream(stream)
+                sys.exit(4)
+            build_src = staging
+        rs = sfs_build.build_rootfs_sfs(build_src, "fast_pool/sfs",
                                         log=lambda m: print("   " + m, flush=True),
                                         force=getattr(a, "force_sfs", True),
                                         force_live=getattr(a, "force_live", False),

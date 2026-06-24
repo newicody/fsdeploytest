@@ -309,7 +309,10 @@ def check_datasets(cfg, rep):
         # proprietes attendues (toutes les cles sauf 'critical')
         diverg = []
         for prop, want in decl.items():
-            if prop == "critical":
+            # 'critical'/'pool' ne sont pas des proprietes ZFS (metadonnees du
+            # contrat) ; 'role' est un commentaire. On ne verifie que les vraies
+            # proprietes ZFS du dataset.
+            if prop in ("critical", "pool"):
                 continue
             g_rc, got, _ = sh(["zfs", "get", "-H", "-o", "value", prop, ds])
             if g_rc == 0 and got and got != str(want):

@@ -60,11 +60,11 @@ def verify(infra_path):
     try:
         from configobj import ConfigObj
         cfg = ConfigObj(infra_path)
-        storage = cfg.get("storage", {})
+        storage = cfg.get("datasets", {})
     except Exception as e:
         sys.exit(f"infra.conf illisible ({e})")
     if not storage:
-        sys.exit("aucune section [storage] dans infra.conf")
+        sys.exit("aucune section [datasets] dans infra.conf")
     if not _capture(["zfs", "version"])[0] == 0 and not os.path.exists(
             "/sbin/zfs"):
         # zfs absent : on ne peut pas verifier le reel
@@ -88,7 +88,8 @@ def verify(infra_path):
         if not _ds_exists(ds):
             n_absent += 1
             log(f"[ABSENT] {ds}")
-            log(f"         role : {role}")
+            if role:
+                log(f"         role : {role}")
             suggestions.append(f"zfs create {ds}")
             continue
         # 3. proprietes attendues

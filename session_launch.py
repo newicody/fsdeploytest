@@ -189,66 +189,42 @@ def _locate_infra(infra_path=None):
     return ""
 
 
-def ensure_zfs_booted(infra_path=None):
-    """Apres switch_root, les montages /mnt/* de l'initramfs ont DISPARU (ils
-    etaient hors NEWROOT) ; les pools restent IMPORTES (etat noyau). On remonte
-    chaque dataset declare a son mountpoint REEL via l'AUTORITE zfs_mounts
-    (ensure_mounted), et NON via 'zfs mount -a' : ce dernier SAUTE les datasets
-    canmount=noauto (data_pool/home, etc.) -> /home reste l'overlay et le home
-    utilisateur finit sur la racine. ensure_mounted fait un 'zfs mount <ds>'
-    explicite (qui monte meme en noauto), gere legacy/target, et VERIFIE.
-    Idempotent : un dataset deja monte au bon endroit est laisse tel quel."""
+def ensure_zfs_booted():
+    """Apres switch_root, les montages /mnt/* de l'initramfs ont disparu (hors
+    NEWROOT) ; les pools restent IMPORTES (etat noyau). On (re)monte les datasets
+    du systeme booted a leur mountpoint REEL avec le mecanisme STANDARD, qui
+    RESPECTE le contrat 'canmount' d'infra.conf (reflete dans la propriete ZFS) :
+      - canmount=on / defaut -> monte (fast_pool/sfs, data_pool/home, ...) ;
+      - canmount=noauto       -> SAUTE (fast_pool/rootfs = upper de l'overlay,
+                                  fast_pool/staging) : ne JAMAIS auto-monter ;
+      - canmount=off          -> SAUTE (reserve, archives conteneur).
+    'zfs mount -a' monte dans l'ordre parent->enfant et inclut les enfants
+    DYNAMIQUES (data_pool/home/<user> en multi-utilisateur). Idempotent.
+
+    IMPORTANT : on ne fait PAS 'zfs mount <ds>' dataset par dataset -> un montage
+    explicite monterait MEME les canmount=noauto (l'upper de l'overlay), ce qui
+    casse l'overlay et le check rootfs. 'zfs mount -a' est le bon outil : il EST
+    le contrat canmount. La garde de creation utilisateur (ensure_user) verifie
+    ensuite que /home est bien data_pool/home avant tout --create-home."""
     if not which("zpool"):
         log("[zfs] zpool absent -> montages booted sautes")
         return
     # filet : importer tout pool encore absent (ex boot_pool). -N = sans monter.
     subprocess.run(["zpool", "import", "-aN"], stderr=subprocess.DEVNULL)
-    try:
-        import zfs_mounts
-    except Exception as e:
-        log(f"[zfs] zfs_mounts indisponible ({e}) -> repli 'zfs mount -a'")
-        subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
-        return
-    path = _locate_infra(infra_path)
-    if not path:
-        log("[zfs] infra.conf introuvable -> repli 'zfs mount -a'")
-        subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
-        return
-    try:
-        from configobj import ConfigObj
-        datasets = ConfigObj(path).get("datasets", {}) or {}
-    except Exception as e:
-        log(f"[zfs] [datasets] illisible ({e}) -> repli 'zfs mount -a'")
-        subprocess.run(["zfs", "mount", "-a"], stderr=subprocess.DEVNULL)
-        return
-    log(f"[zfs] montage booted via zfs_mounts ({len(datasets)} datasets)...")
-    # RECURSIVITE : on enumere les datasets REELS (zfs list) plutot que la seule
-    # liste declaree, pour couvrir les enfants DYNAMIQUES (ex data_pool/home/<user>
-    # en multi-utilisateur, snapshots promus...). On trie par PROFONDEUR (parent
-    # avant enfant) : un enfant ne peut etre monte avant son parent. Les
-    # mountpoints declares servent surtout aux datasets legacy (cible explicite).
-    declared = {ds: (spec or {}).get("mountpoint") for ds, spec in datasets.items()}
-    try:
-        r = subprocess.run(["zfs", "list", "-H", "-o", "name"],
+    r = subprocess.run(["zfs", "mount", "-a"], capture_output=True, text=True)
+    if r.returncode == 0:
+        log("[zfs] datasets booted montes (zfs mount -a ; canmount respecte)")
+    else:
+        log(f"[zfs] zfs mount -a incomplet : {(r.stderr or '').strip()[:140]}")
+    # verification ciblee du CONTRAT au boot booted : fast_pool/sfs (rootfs.sfs
+    # lisible -> operate check) et data_pool/home (/home) DOIVENT etre montes.
+    # On le SIGNALE sans rien forcer (forcer casserait le contrat canmount).
+    for ds in ("fast_pool/sfs", "data_pool/home"):
+        g = subprocess.run(["zfs", "get", "-H", "-o", "value", "mounted", ds],
                            capture_output=True, text=True)
-        names = [n for n in r.stdout.splitlines() if n.strip()]
-    except OSError:
-        names = list(declared)
-    names.sort(key=lambda n: (n.count("/"), n))     # parent -> enfant
-    for ds in names:
-        st = zfs_mounts.inspect(ds)
-        if not st.exists:
-            continue
-        mp = st.mountpoint                          # propriete reelle
-        if mp in ("none", "-", ""):
-            continue                                # conteneur : rien a monter
-        target = declared.get(ds)                   # None sauf legacy/explicite
-        if mp == "legacy" and not target:
-            log(f"  [skip] {ds} legacy sans cible declaree")
-            continue
-        allow_ne = (target == "/var/log" or mp == "/var/log")
-        zfs_mounts.ensure_mounted(ds, target=target, log=log,
-                                  allow_nonempty=allow_ne)
+        if g.returncode == 0 and g.stdout.strip() == "no":
+            log(f"[zfs] ATTENTION : {ds} non monte apres 'zfs mount -a' "
+                "(verifier canmount/mountpoint/overlay)")
 
 
 def load_github_token(infra_path=None):

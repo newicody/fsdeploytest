@@ -47,9 +47,10 @@ UPPER_DS   = f"{POOL}/rootfs"     # upper de l'overlay racine (systeme mutable)
 LOG_DS     = f"{POOL}/log"        # monte sur NEWROOT/var/log (persistant ; /var lui-meme reste dans l'overlay rootfs)
 USRSRC_DS  = f"{POOL}/usr-src"    # monte sur NEWROOT/usr/src (sources noyau, build)
 
-IP_ADDR  = "192.168.1.10/24"   # redondant si ip= passe par la cmdline noyau
-GATEWAY  = "192.168.1.1"
-DNS      = "8.8.8.8"
+# Reseau : PLUS de valeurs en dur. La cmdline noyau 'ip=...' (declaree dans
+# [uki]/[kernel] cmdline d'infra.conf, cuite dans l'UKI) est le contrat ; le
+# noyau l'applique deja, et init.py la PARSE (cf. _net_from_cmdline) pour son
+# repli. Sans token ip=, init.py ne configure rien a la main (pas de defaut code).
 
 YT_KEY_FILE = "/etc/yt.key"    # cle deposee dans l'initramfs (cf. build_initramfs)
 RTMP   = "rtmp://a.rtmp.youtube.com/live2"
@@ -168,6 +169,34 @@ def cmdline():
 def debug_enabled():
     toks = cmdline().split()
     return "debug" in toks or "init_debug" in toks
+
+
+def _mask_to_prefix(mask):
+    """255.255.255.0 -> 24. 24 par defaut si illisible."""
+    try:
+        return sum(bin(int(o)).count("1") for o in mask.split("."))
+    except (ValueError, AttributeError):
+        return 24
+
+
+def _net_from_cmdline():
+    """Derive (cidr, gateway, dns, device) du token 'ip=' de /proc/cmdline -- LE
+    contrat reseau (declare dans [uki]/[kernel] cmdline d'infra.conf, cuit dans
+    l'UKI). None si absent. Format noyau :
+        ip=<client>::<gw>:<netmask>:<host>:<device>:<autoconf>:<dns0>[:<dns1>]
+    Ex: ip=192.168.1.10::192.168.1.1:255.255.255.0::eth0:off:8.8.8.8"""
+    for tok in cmdline().split():
+        if tok.startswith("ip="):
+            f = tok[3:].split(":")
+            if len(f) >= 6 and f[0] and "." in f[0]:
+                client = f[0]
+                gw = f[2] if len(f) > 2 else ""
+                mask = f[3] if len(f) > 3 else ""
+                dev = f[5] if len(f) > 5 else ""
+                dns = f[7] if len(f) > 7 and f[7] else ""
+                cidr = f"{client}/{_mask_to_prefix(mask)}" if mask else client
+                return cidr, gw, dns, dev
+    return None
 
 
 def debug_log(msg):
@@ -1004,24 +1033,36 @@ def main():
         except OSError as e:
             log(f"modules.sfs non monte ({e})")
 
-    # --- 6. reseau statique (souvent deja fait par ip= cmdline) -------------
-    iface = None
-    for n in sorted(os.listdir("/sys/class/net")):
-        if n == "lo":
-            continue
-        if os.path.exists(f"/sys/class/net/{n}/device"):
-            iface = n
-            break
-    if iface:
-        run(["ip", "link", "set", iface, "up"])
-        run(["ip", "addr", "add", IP_ADDR, "dev", iface])   # echoue sans danger si ip= deja la
-        run(["ip", "route", "add", "default", "via", GATEWAY])
-        os.makedirs(f"{NEWROOT}/etc", exist_ok=True)
-        with open(f"{NEWROOT}/etc/resolv.conf", "w") as f:
-            f.write(f"nameserver {DNS}\n")
-        log(f"reseau: {iface} {IP_ADDR} gw {GATEWAY} dns {DNS}")
+    # --- 6. reseau : DERIVE de la cmdline 'ip=' (contrat infra), pas de dur ----
+    # Le noyau a deja applique ip= ; ce bloc est un repli idempotent. Sans token
+    # ip=, on ne configure rien a la main (aucune valeur codee en dur).
+    net = _net_from_cmdline()
+    if not net:
+        log("aucun token ip= dans la cmdline -> reseau laisse au noyau "
+            "(ou indisponible) ; rien configure a la main")
     else:
-        log("aucune interface detectee (peut-etre deja via ip= cmdline)")
+        cidr, gw, dns, dev = net
+        iface = dev if (dev and os.path.isdir(f"/sys/class/net/{dev}")) else None
+        if not iface:
+            for n in sorted(os.listdir("/sys/class/net")):
+                if n == "lo":
+                    continue
+                if os.path.exists(f"/sys/class/net/{n}/device"):
+                    iface = n
+                    break
+        if iface:
+            run(["ip", "link", "set", iface, "up"])
+            run(["ip", "addr", "add", cidr, "dev", iface])  # sans danger si ip= deja la
+            if gw:
+                run(["ip", "route", "add", "default", "via", gw])
+            os.makedirs(f"{NEWROOT}/etc", exist_ok=True)
+            if dns:
+                with open(f"{NEWROOT}/etc/resolv.conf", "w") as f:
+                    f.write(f"nameserver {dns}\n")
+            log(f"reseau (cmdline): {iface} {cidr}"
+                + (f" gw {gw}" if gw else "") + (f" dns {dns}" if dns else ""))
+        else:
+            log("aucune interface detectee (peut-etre deja via ip= cmdline)")
 
     # --- 7. handoff du stream initramfs -> NEWROOT/etc (survit au switch_root)
     # session_launch lira ces fichiers pour tuer ce ffmpeg et basculer sur la

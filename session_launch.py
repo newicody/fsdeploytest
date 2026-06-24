@@ -536,6 +536,8 @@ def _read_session_config(infra_path="/etc/infra.conf"):
     defaults = {
         "user": "appliance",
         "groups": ["video", "input", "seat", "render"],
+        "compositor": "sway",
+        "xkb_layout": "fr",
         "app": "foot",
         "app_fallback": "foot",
         "lock_enabled": False,
@@ -567,6 +569,8 @@ def _read_session_config(infra_path="/etc/infra.conf"):
     return {
         "user": s.get("user", defaults["user"]),
         "groups": _list(s.get("groups"), defaults["groups"]),
+        "compositor": str(s.get("compositor", defaults["compositor"])).lower(),
+        "xkb_layout": s.get("xkb_layout", defaults["xkb_layout"]),
         "app": s.get("app", defaults["app"]),
         "app_fallback": s.get("app_fallback", defaults["app_fallback"]),
         "lock_enabled": str(lock.get("enabled", "false")).lower() == "true",
@@ -725,27 +729,88 @@ def _demote(uid, gid, user):
     return preexec
 
 
+def _write_sway_config(scfg, uid):
+    """Genere une config sway minimale pour la session kiosk : pas de bordure,
+    fond uni, lance l'app, et -- si le verrou est actif -- 'exec swayidle' qui
+    declenche swaylock APRES que le compositeur soit up (bon moment + bon
+    WAYLAND_DISPLAY, contrairement a un swayidle lance avant le compositeur).
+    swaylock valide le mot de passe du compte via PAM. Ecrite dans le runtime de
+    l'utilisateur. Retourne le chemin."""
+    path = f"/run/user/{uid}/sway.config"
+    app = scfg["app"]
+    lines = [
+        "# config sway generee par session_launch (kiosk appliance)",
+        "default_border none",
+        "default_floating_border none",
+        "output * bg #101010 solid_color",
+        f"exec {app}",
+    ]
+    if scfg["lock_enabled"] and scfg["lock_backend"] == "swaylock" \
+            and which("swaylock"):
+        lock = "swaylock " + " ".join(scfg["lock_options"])
+        idle = scfg["lock_idle"]
+        if idle > 0 and which("swayidle"):
+            # verrou apres <idle>s d'inactivite ET avant mise en veille
+            lines.append(f"exec swayidle -w "
+                         f"timeout {idle} '{lock}' "
+                         f"before-sleep '{lock}'")
+            log(f"[session] sway : verrou auto apres {idle}s "
+                "(swayidle -> swaylock, mot de passe PAM)")
+        else:
+            log("[session] sway : swaylock dispo mais swayidle absent/idle=0 "
+                "-> pas de verrouillage automatique")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.chown(path, uid, scfg.get("_gid", -1))
+    except OSError:
+        pass
+    return path
+
+
 def run_session_app(scfg, uid, gid, home):
-    """Lance cage avec l'app principale, EN TANT QUE l'utilisateur dedie (non-root).
-    Retourne le code retour de cage. Le verrou swaylock (si active) est gere a
-    part. PID 1 (root) reste le parent : il survit a la sortie de cage."""
+    """Lance le compositeur de session EN UTILISATEUR DEDIE (non-root) avec l'app.
+      - compositor=sway (defaut) : sway + config generee (exec app +
+        swayidle/swaylock pour le verrou ; layer-shell correct pour le verrou) ;
+      - compositor=cage : cage mono-app (repli kiosk simple).
+    Retourne le code retour. PID 1 (root) reste le parent : il survit a la sortie
+    du compositeur. La bascule utilisateur passe par _demote -> initgroups (acces
+    seatd/GPU)."""
+    comp = scfg.get("compositor", "sway")
+    scfg["_gid"] = gid
     app = scfg["app"]
     app_argv = app.split() if isinstance(app, str) else list(app)
-    # XDG_RUNTIME_DIR de l'utilisateur (pas /run/user/0)
-    user_runtime = f"/run/user/{uid}"
+    user_runtime = f"/run/user/{uid}"          # PAS /run/user/0
     os.makedirs(user_runtime, exist_ok=True)
     os.chown(user_runtime, uid, gid)
     os.chmod(user_runtime, 0o700)
     env = dict(os.environ,
                HOME=home, USER=scfg["user"], LOGNAME=scfg["user"],
-               XDG_RUNTIME_DIR=user_runtime)
+               XDG_RUNTIME_DIR=user_runtime,
+               XKB_DEFAULT_LAYOUT=scfg.get("xkb_layout", "fr"))
+
+    if comp == "sway" and which("sway"):
+        cfg_path = _write_sway_config(scfg, uid)
+        log(f"[session] sway -c {cfg_path} (app {app} ; "
+            f"utilisateur {scfg['user']}, uid={uid})")
+        try:
+            return subprocess.run(["sway", "-c", cfg_path], env=env,
+                                  preexec_fn=_demote(uid, gid,
+                                                     scfg["user"])).returncode
+        except OSError as e:
+            log(f"[session] echec lancement sway : {e}")
+            return 1
+
+    # compositor=cage (ou sway absent) : cage mono-app
     if not which("cage"):
-        log("[session] cage absent")
+        log(f"[session] compositeur '{comp}' demande mais ni sway ni cage "
+            "disponibles")
         return 127
     log(f"[session] cage -- {app} (utilisateur {scfg['user']}, uid={uid})")
     try:
-        return subprocess.run(["cage", "--"] + app_argv,
-                              env=env, preexec_fn=_demote(uid, gid, scfg["user"])).returncode
+        return subprocess.run(["cage", "--"] + app_argv, env=env,
+                              preexec_fn=_demote(uid, gid,
+                                                 scfg["user"])).returncode
     except OSError as e:
         log(f"[session] echec lancement cage en non-root : {e}")
         return 1
@@ -777,6 +842,22 @@ def start_idle_lock(scfg, uid, gid, home):
     else:
         log("[session] verrou swaylock disponible (swayidle absent ou idle=0 : "
             "pas de verrouillage automatique)")
+
+
+def _has_password(user):
+    """L'utilisateur a-t-il un mot de passe utilisable (pour swaylock via PAM) ?
+    Lit /etc/shadow (root). Champ vide / '!' / '*' / '!!' = pas de mot de passe
+    -> swaylock ne pourra pas deverrouiller. True/False, None si inconnu."""
+    try:
+        with open("/etc/shadow") as f:
+            for ln in f:
+                p = ln.split(":")
+                if p and p[0] == user:
+                    h = p[1] if len(p) > 1 else ""
+                    return bool(h) and h not in ("!", "*", "!!", "x")
+    except OSError:
+        return None
+    return None
 
 
 def main():
@@ -849,6 +930,10 @@ def main():
     session_user = ensure_user(scfg["user"], scfg["groups"])
     if session_user:
         setup_user_dirs(*session_user)
+        if scfg["lock_enabled"] and _has_password(scfg["user"]) is False:
+            log(f"[session] verrou actif mais le compte '{scfg['user']}' n'a "
+                "PAS de mot de passe -> swaylock ne pourra pas deverrouiller. "
+                f"Definis-en un : passwd {scfg['user']}")
 
     key = read_key()
     stop_initramfs_stream()
@@ -866,8 +951,11 @@ def main():
     def run_compositor():
         if session_user:
             uid, gid, home = session_user
-            # verrou d'inactivite (swaylock) si active, lance avec la session
-            start_idle_lock(scfg, uid, gid, home)
+            # Verrou : sous SWAY il est dans la config generee (exec swayidle ->
+            # swaylock, lance APRES le compositeur). Sous CAGE seulement, on tente
+            # le lanceur separe (best effort ; layer-shell limite sous cage).
+            if scfg.get("compositor", "sway") != "sway":
+                start_idle_lock(scfg, uid, gid, home)
             rc = run_session_app(scfg, uid, gid, home)
             if rc != 0 and scfg["app"] != scfg["app_fallback"]:
                 log(f"[session] app '{scfg['app']}' echouee -> repli "
@@ -875,13 +963,13 @@ def main():
                 scfg2 = dict(scfg, app=scfg["app_fallback"])
                 rc = run_session_app(scfg2, uid, gid, home)
             return rc
-        # repli : pas d'utilisateur dedie (creation echouee) -> cage en root
-        log("[session] pas d'utilisateur dedie -> cage en root (repli)")
-        if which("cage"):
-            return subprocess.run(["cage", "--", scfg["app_fallback"]]).returncode
+        # repli : pas d'utilisateur dedie (creation echouee) -> compositeur en root
+        log("[session] pas d'utilisateur dedie -> compositeur en root (repli)")
         if which("sway"):
             return subprocess.run(["sway"]).returncode
-        log("aucun compositeur (cage/sway) installe")
+        if which("cage"):
+            return subprocess.run(["cage", "--", scfg["app_fallback"]]).returncode
+        log("aucun compositeur (sway/cage) installe")
         return 127
 
     # BOUCLE PID 1 : le compositeur peut se TERMINER (tu fermes foot) ou ECHOUER.

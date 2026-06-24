@@ -489,21 +489,73 @@ def preflight(cfg, src, rep):
         rep.crit(f"{src} illisible ({e}) -- boucle de symlink ?")
         todo.append(f"# rm {src} ; ln -s /usr/src/linux-<version> {src}")
 
-    # --- 8. ESP du 2e disque non montee (rsync impossible) ------------------
-    efi = cfg.get("efi", {}) if hasattr(cfg, "get") else {}
-    parts = efi.get("partitions", []) if efi else []
-    if isinstance(parts, str):
-        parts = [parts]
+    # --- 8. ESP montees (via le CONTRAT [efi] = sous-sections esp1/esp2, pas
+    #        une liste a plat 'partitions' qui n'existe pas) -------------------
     try:
         mounts = open("/proc/mounts").read()
     except OSError:
         mounts = ""
-    for i, p in enumerate(parts):
-        if os.path.exists(p) and p not in mounts:
-            rep.warn(f"ESP {p} presente mais NON montee")
-            todo.append(f"mkdir -p /mnt/esp{i} ; mount {p} /mnt/esp{i}")
+    try:
+        import boot_layout
+        for e in boot_layout.load_esps(os.environ.get("INFRA_CONF", "infra.conf")):
+            dev = e.device()
+            if dev and dev not in mounts:
+                rep.warn(f"ESP {dev} presente mais NON montee")
+                todo.append(f"mkdir -p {e.install_mount} ; "
+                            f"mount {dev} {e.install_mount}")
+    except Exception as ex:
+        rep.warn(f"verif ESP via boot_layout impossible ({ex})")
+
+    # --- 9. DROITS D'ECRITURE sur les cibles du build (resolues du contrat) --
+    # first_boot ecrit dans : fast_pool/sfs (modules-<ver>.sfs + rootfs.sfs),
+    # fast_pool/staging (rootfs en construction), usr-src (compilation), manager
+    # (rapport/registre). Chaque cible doit etre MONTEE et INSCRIPTIBLE -- sinon
+    # echec en plein build. On le detecte ICI, via les mountpoints d'infra.conf.
+    _check_write_access(src, rep)
 
     return todo
+
+
+def _ds_mountpoint(ds):
+    """Mountpoint REEL d'un dataset (zfs get). '' si non monte/legacy/none."""
+    try:
+        p = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint", ds],
+                           capture_output=True, text=True).stdout.strip()
+        return p if p not in ("", "-", "none", "legacy") else ""
+    except OSError:
+        return ""
+
+
+def _check_write_access(src, rep):
+    """Verifie que first_boot peut ECRIRE sur tout ce dont il a besoin, AVANT
+    d'agir. Cibles resolues depuis le contrat ([datasets] mountpoints via ZFS,
+    [manager] root via MANAGER_ROOT). Non monte ou lecture seule = critique."""
+    # (dataset, description). staging est la zone de construction reconstructible.
+    for ds, what in (("fast_pool/sfs", "images sfs (modules-<ver>.sfs, rootfs.sfs)"),
+                     ("fast_pool/staging", "staging de construction du rootfs")):
+        mp = _ds_mountpoint(ds)
+        if not mp:
+            rep.crit(f"{ds} non monte -> {what} impossible "
+                     f"(monte-le : zfs mount {ds})")
+        elif not os.path.isdir(mp):
+            rep.crit(f"{ds} monte sur {mp} mais repertoire absent ({what})")
+        elif not os.access(mp, os.W_OK):
+            rep.crit(f"PAS de droit d'ecriture sur {mp} ({what}) -- "
+                     f"lance first_boot en root ou corrige les permissions")
+        else:
+            rep.ok(f"ecriture OK : {ds} -> {mp} ({what})")
+    # usr-src (compilation + modules_install) et manager (rapport/registre)
+    extra = [(os.path.dirname(os.path.realpath(src)) or src,
+              "compilation noyau / modules_install"),
+             (os.environ.get("MANAGER_ROOT", "/boot_pool/manager"),
+              "rapport + registre (manager)")]
+    for path, what in extra:
+        probe = path if os.path.isdir(path) else (os.path.dirname(path) or "/")
+        if not os.access(probe, os.W_OK):
+            rep.crit(f"PAS de droit d'ecriture sur {probe} ({what}) -- "
+                     f"lance first_boot en root ou corrige les permissions")
+        else:
+            rep.ok(f"ecriture OK : {probe} ({what})")
 
 
 def _efivars_ok():

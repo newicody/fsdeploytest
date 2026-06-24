@@ -38,7 +38,7 @@ flowchart TD
     I --> J["mount modules-ver.sfs"]
     J --> K["Reseau statique"]
     K --> L["switch_root vers session_launch.py"]
-    L --> M["seatd + cage + bascule capture wayland"]
+    L --> M["seatd + sway (ou cage) + bascule capture wayland"]
     M --> N["Session graphique streamee"]
 ```
 
@@ -272,7 +272,7 @@ zfs create -o refreservation=200G -o mountpoint=none fast_pool/reserve
 | `fast_pool/sfs`, `boot_pool/images` | `init.py` (initramfs) | `mount.zfs` explicite, **pas** d'auto-mount |
 | `fast_pool/rootfs` (upper) | `init.py` | upper de l'overlay racine (persistant) |
 | `fast_pool/log`, `fast_pool/usr-src` | `init.py` | `mount.zfs` sur `NEWROOT/{var/log,usr/src}` (`/var` vient de l'overlay) |
-| `boot_pool/manager`, `data_pool/*` | système booté (OpenRC) | auto-mount ZFS standard (mountpoint) |
+| `boot_pool/manager`, `data_pool/*` | système booté (`session_launch`) | `zfs mount -a` (respecte `canmount`) ; `data_pool/home` forcé sur `/home` (overlay `-O`) |
 
 > En **mode secours** (fast_pool absent), `init.py` saute tous les datasets
 > `fast_pool/*` : upper = tmpfs volatile, pas de var/log/usr-src persistants.
@@ -327,9 +327,10 @@ l'espace utilisateur (un échec = fonctionnalité absente, jamais de panic).
 │                         #   avant de compter dessus -- module commun
 ├── zfs_replicate.py      # replication incrementale (zfs send -i) fast_pool/log
 │                         #   -> data_pool/log (durable) ; rotation des snapshots
-├── session_launch.py     # post-switch_root (PID 1 du rootfs) : seatd + cage +
-│                         #   bascule du stream fbdev → capture wayland
-├── efi_install.py        # install EFI initiale (un seul noyau, manuel)
+├── session_launch.py     # post-switch_root (PID 1 du rootfs) : seatd + sway
+│                         #   (ou cage) + bascule du stream fbdev → capture wayland
+├── manager_git.py        # remontee git de l'audit trail du manager : commit local
+│                         #   par operation + push aux frontieres (token ephemere)
 ├── first_boot.py         # orchestrateur first-boot (chroot) : verifie infra +
 │                         #   compile + initramfs + EFI + rapport + autorisation git
 ├── infra.conf            # declaration de l'infrastructure VOULUE (a editer)
@@ -434,7 +435,7 @@ echo 'LIBVA_DRIVER_NAME="iHD"' >> /etc/env.d/90intel-media
 env-update && source /etc/profile
 
 # Session graphique + capture/stream
-emerge -av gui-wm/cage sys-auth/seatd gui-apps/foot \
+emerge -av gui-wm/sway gui-wm/cage sys-auth/seatd gui-apps/foot gui-apps/swayidle gui-apps/swaylock \
            gui-apps/wf-recorder media-video/ffmpeg
 # wl-screenrec (préféré, VAAPI Intel) : GURU ou `cargo install wl-screenrec`
 
@@ -670,8 +671,8 @@ done
 # echoue sur "switch_root: $NEWROOT/sbin/session_launch.py absent"
 [ -x "$R/sbin/session_launch.py" ] || echo "MANQUANT/non-executable: $R/sbin/session_launch.py"
 
-# binaires requis par session_launch.py (cage/sway, seatd, ffmpeg, wl-screenrec...)
-for b in cage seatd ffmpeg; do
+# binaires requis par session_launch.py (sway/cage, seatd, ffmpeg, wl-screenrec...)
+for b in sway seatd ffmpeg; do
   [ -x "$R/usr/bin/$b" ] || [ -x "$R/usr/sbin/$b" ] || echo "MANQUANT: $b dans le rootfs"
 done
 ```
@@ -799,11 +800,13 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > **Tous** les montages d'init.py (sfs, upper de l'overlay, secours, récursif)
 > passent par cette fonction.
 >
-> **`data_pool` importé + montage récursif ORDONNÉ** : `data_pool` (home, log,
-> archives) est désormais importé et monté sous `NEWROOT` via
-> `mount_pool_recursive`, qui trie les datasets par profondeur (**parent monté
-> avant enfant** : `boot_pool` avant `boot_pool/images`) et **saute** un dataset
-> dont le parent a échoué. `mountpoint=none` = conteneur, rien à monter.
+> **`data_pool` importé, monté par le système BOOTÉ** : `init.py` *importe*
+> `data_pool` (datasets disponibles) mais ne monte PAS ses datasets — ils ne sont
+> pas sur le chemin de boot. `session_launch.ensure_zfs_booted` les monte après
+> `switch_root` via `zfs mount -a` (respecte `canmount` : monte `on`, saute
+> `noauto`/`off`, ordre parent→enfant, enfants dynamiques inclus) ; `data_pool/home`
+> est forcé sur `/home` (overlay `-O`) au besoin. L'ancien montage récursif sous
+> `NEWROOT` depuis l'initramfs a été retiré (fragile à `switch_root`).
 >
 > **Garde overlay** : avant d'assembler l'overlay racine, init.py vérifie que
 > `/mnt/sfs` est un **vrai point de montage** (`os.path.ismount`), pas un
@@ -1051,8 +1054,8 @@ PARTUUID), indépendamment du point de montage.
 
 **Garde anti-`/boot`** : `install_mount` ne peut jamais être `/boot` ni
 `/boot/efi` (qui peuvent contenir le `/boot` de Gentoo, sans rapport). Défauts :
-`/mnt/esp1`, `/mnt/esp2`. `kernel_build.py`, `first_boot.py` et `efi_install.py`
-résolvent tous l'ESP via `boot_layout` (repli env-vars si l'ini est absente).
+`/mnt/esp1`, `/mnt/esp2`. `kernel_build.py` et `first_boot.py`
+résolvent l'ESP via `boot_layout` (repli env-vars si l'ini est absente).
 
 ```ini
 [efi]
@@ -1177,8 +1180,9 @@ sha par fichier) permet un contrôle d'intégrité avant un boot ou après copie
 
 
 ```sh
-# ajuster DISK/PART/KERNEL_SRC via l'environnement si besoin
-sudo /usr/bin/python3 efi_install.py
+# (efi_install.py retire) : le staging ESP + les entrees EFI sont desormais faits
+# par first_boot.py (first-boot complet) ou kernel_build.py, qui resolvent les ESP
+# via boot_layout/[efi] et creent une entree par profil [uki].
 ```
 Désactiver **Secure Boot** (ou signer le bzImage), puis rebooter.
 
@@ -1275,10 +1279,10 @@ zfs create -o compression=zstd -o atime=off -o xattr=sa -o acltype=posixacl \
 
 ## 11. Variables à éditer
 
-- `init.py` : `IP_ADDR`, `GATEWAY`, `DNS`, `YT_KEY` — `KVER` dérivé de `uname -r`
+- `init.py` : `YT_KEY` ; réseau **dérivé de la cmdline `ip=`** (plus de `IP_ADDR`/`GATEWAY`/`DNS` en dur) ; `KVER` via `uname -r`
 - `session_launch.py` : clé lue dans `/etc/yt.key` (posée par `init.py`)
 - `build_initramfs.py` : `KVER`, `PYBIN`, `FFMPEG_STATIC` (env)
-- `efi_install.py` / `kernel_build.py` : `ESP`, `DISK`, `PART`, `CMDLINE` (env)
+- `kernel_build.py` : `ESP`, `DISK`, `PART`, `CMDLINE` (env) — ESP résolues via `boot_layout`/`[efi]`
 - `kernel_watch.py` : `--src`, `--endpoint`, `--model`
 
 ---
@@ -1657,8 +1661,9 @@ Dans l'ordre, ce qui détermine si ça boote (testé en isolation, à valider en
 5. **Entrée EFI de secours déjà en place** *avant* de tester ce noyau, pour que
    `BootNext` (essai unique) puisse retomber dessus en cas d'échec.
 6. **Cmdline EFI** : `xe.force_probe=4c8b i915.force_probe=!4c8b` + `ip=…`
-   identiques entre `efi_install.py`/`kernel_build.py` et les valeurs réelles
-   (IP, PCI ID). `init.py` a les mêmes valeurs en repli (`IP_ADDR`, etc.).
+   cohérents entre `kernel_build.py` (qui bake la cmdline) et les valeurs réelles
+   (IP, PCI ID). `init.py` ne code plus rien en dur : il **dérive** le réseau du
+   token `ip=` de la cmdline.
 
 Diagnostic en cas d'échec : le rescue shell de `init.py` (busybox, sinon REPL
 Python) s'ouvre sur la console au premier `die()` — lis le dernier message
@@ -1797,19 +1802,22 @@ eclean-kernel -n 2                     # ménage manuel des noyaux
 > ne casse pas le build.
 
 > **Session utilisateur dediee + verrou (`[session]`)** : `session_launch` lance
-> le compositeur en **utilisateur non-root** dedie (plus sur que cage en root).
-> `[session]` definit : `user` (cree s'il manque via `useradd`), `groups`
-> (`video`/`input`/`seat`/`render` : acces DRM + entrees via seatd), `app`
-> (lancee dans cage, ex foot/firefox) et `app_fallback`. `ensure_user` cree
-> l'utilisateur + groupes (idempotent) ; `run_session_app` lance
-> `cage -- <app>` avec `setuid/setgid` vers cet utilisateur et son propre
-> `XDG_RUNTIME_DIR=/run/user/<uid>`. **PID 1 (root) reste le parent** et survit a
-> la sortie de cage (boucle de relance). Verrou d'ecran optionnel
-> (`[session][[lock]]`) : `swaylock` (PAM natif, eprouve) declenche sur
-> inactivite par `swayidle` apres `idle_timeout` secondes ; une couche
-> `python-pam` peut etre ajoutee pour une logique d'auth personnalisee. Le verrou
-> d'ecran Wayland n'est PAS reimplemente en Python (composant de securite :
-> swaylock est le standard wlroots).
+> le compositeur en **utilisateur non-root** dedie. `[session]` definit : `user`
+> (cree s'il manque via `useradd`), `groups` (`video`/`input`/`seat`/`render` :
+> acces DRM + entrees via seatd), `compositor` (**`sway` par defaut**, `cage` en
+> repli), `xkb_layout` (clavier, ex `fr`), `app` et `app_fallback`. `ensure_user`
+> cree l'utilisateur + groupes (idempotent ; garde-fou : refuse `--create-home`
+> tant que `/home` n'est pas le dataset `data_pool/home`). `run_session_app` demote
+> l'enfant via `_demote`, qui appelle **`os.initgroups` AVANT `setuid`** : sans ca
+> l'enfant perd les groupes supplementaires -> pas d'acces a `/run/seatd.sock`
+> (root:video) ni au GPU (c'est ce qui imposait un `chmod 777` a la main). En
+> `sway`, une config minimale est GENEREE (`exec <app>` + `exec swayidle -> swaylock`
+> pour le verrou, lance APRES le compositeur, au bon `WAYLAND_DISPLAY`). **PID 1
+> (root) reste le parent** et survit a la sortie du compositeur (boucle de relance).
+> Verrou d'ecran (`[session][[lock]]`) : `swaylock` valide le mot de passe du compte
+> par **PAM** (faire `passwd <user>`), declenche par `swayidle` apres `idle_timeout`
+> secondes. Le verrou Wayland n'est PAS reimplemente en Python (composant de
+> securite : swaylock est le standard wlroots).
 
 > **Gestion des snapshots (`[snapshots]` + `snapshot_manager.py`)** : gestionnaire
 > central de tous les snapshots ZFS, classes par TYPE selon leur prefixe (apres
@@ -2089,8 +2097,8 @@ journal : `python3 -c "import kernel_registry as k; [print(e) for e in k.KernelR
 ## Stockage des données (home, modèles, RAG, brainstorm, tmp)
 
 Architecture mono-utilisateur (`eric`), donnée durable sur `data_pool` (raidz2),
-scratch volatil sur `fast_pool` (stripe). Monté automatiquement au boot par
-`init.py` (`mount_pool_recursive` respecte le `mountpoint` ZFS de chaque dataset).
+scratch volatil sur `fast_pool` (stripe). Les datasets `data_pool/*` sont montés
+par le système booté (`session_launch` : `zfs mount -a`, respecte `canmount`).
 
 | Donnée | Emplacement | Dataset | Durable ? |
 |---|---|---|---|
@@ -2111,7 +2119,7 @@ scratch volatil sur `fast_pool` (stripe). Monté automatiquement au boot par
   l'app, `rag`, `brainstorm` et `operate` lancés dans la session résolvent les
   bons chemins même via root.
 - La session graphique tourne **en tant que `eric`** (`[session] user = eric`,
-  `cage` démoté par `run_session_app`).
+  compositeur démoté par `run_session_app` : `sway` par défaut, `cage` en repli).
 
 ### Mise en place ZFS (une fois)
 

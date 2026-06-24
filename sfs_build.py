@@ -310,12 +310,18 @@ def build_rootfs_sfs(rootfs_src, sfs_dataset="fast_pool/sfs", name="rootfs.sfs",
     return _mksquashfs(rootfs_src, dst, mp, log, extra=extra)
 
 
-def build_modules_sfs(kver, sfs_dataset="fast_pool/sfs", log=print, force=False):
-    """Cree modules-<kver>.sfs depuis /lib/modules/<kver>. Retourne SfsResult."""
+def build_modules_sfs(kver, sfs_dataset="fast_pool/sfs", log=print, force=False,
+                      mod_root="/"):
+    """Cree modules-<kver>.sfs depuis <mod_root>/lib/modules/<kver>. mod_root='/'
+    par defaut (=> /lib/modules/<kver>, retro-compatible). Un TAMPON hors /lib
+    peut etre fourni (INSTALL_MOD_PATH du build) pour ne pas figer le /lib du
+    systeme vivant. Retourne SfsResult."""
     mp = _sfs_mountpoint(sfs_dataset, log)
     if mp is None:
         return SfsResult(False, "", f"{sfs_dataset} non monte")
-    src = f"/lib/modules/{kver}"
+    src = os.path.join(mod_root, "lib/modules", kver)
+    if not os.path.isdir(src):
+        return SfsResult(False, "", f"arbre modules absent : {src}")
     dst = os.path.join(mp, f"modules-{kver}.sfs")
     if os.path.exists(dst) and not force:
         size_mb = os.path.getsize(dst) / (1024 * 1024)

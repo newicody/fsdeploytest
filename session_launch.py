@@ -218,13 +218,35 @@ def ensure_zfs_booted():
         log(f"[zfs] zfs mount -a incomplet : {(r.stderr or '').strip()[:140]}")
     # verification ciblee du CONTRAT au boot booted : fast_pool/sfs (rootfs.sfs
     # lisible -> operate check) et data_pool/home (/home) DOIVENT etre montes.
-    # On le SIGNALE sans rien forcer (forcer casserait le contrat canmount).
-    for ds in ("fast_pool/sfs", "data_pool/home"):
-        g = subprocess.run(["zfs", "get", "-H", "-o", "value", "mounted", ds],
-                           capture_output=True, text=True)
-        if g.returncode == 0 and g.stdout.strip() == "no":
-            log(f"[zfs] ATTENTION : {ds} non monte apres 'zfs mount -a' "
-                "(verifier canmount/mountpoint/overlay)")
+    sfs_mounted = subprocess.run(
+        ["zfs", "get", "-H", "-o", "value", "mounted", "fast_pool/sfs"],
+        capture_output=True, text=True).stdout.strip()
+    if sfs_mounted == "no":
+        log("[zfs] ATTENTION : fast_pool/sfs non monte apres 'zfs mount -a' "
+            "(verifier canmount/mountpoint) -> operate check echouera")
+
+    # data_pool/home : DOIT etre sur /home. 'zfs mount -a' echoue souvent ici car
+    # la propriete ZFS overlay=off (defaut historique) REFUSE de monter par-dessus
+    # un /home non vide (contenu parasite laisse sur l'overlay racine par un boot
+    # anterieur). On rend le comportement persistant (overlay=on) et on FORCE un
+    # montage overlay (-O) : le contenu parasite est masque, /home devient bien le
+    # dataset. C'est ce qui evite le 'umount /home/.. ; rm -R /home/* ; mount'
+    # manuel a chaque boot. ensure_user/setup_user_dirs operent ensuite DANS le
+    # dataset, donc plus aucun nouveau parasite ne s'accumule.
+    home_mounted = subprocess.run(
+        ["zfs", "get", "-H", "-o", "value", "mounted", "data_pool/home"],
+        capture_output=True, text=True).stdout.strip()
+    if home_mounted == "no":
+        subprocess.run(["zfs", "set", "overlay=on", "data_pool/home"],
+                       stderr=subprocess.DEVNULL)
+        rr = subprocess.run(["zfs", "mount", "-O", "data_pool/home"],
+                            capture_output=True, text=True)
+        if rr.returncode == 0:
+            log("[zfs] data_pool/home monte sur /home (overlay -O ; parasite "
+                "de l'overlay masque, overlay=on rendu persistant)")
+        else:
+            log("[zfs] data_pool/home : echec montage force sur /home : "
+                f"{(rr.stderr or '').strip()[:120]}")
 
 
 def load_github_token(infra_path=None):
@@ -686,10 +708,18 @@ def setup_user_dirs(uid, gid, home, infra_path="/etc/infra.conf"):
         pass
 
 
-def _demote(uid, gid):
+def _demote(uid, gid, user):
     """Retourne une fonction preexec qui bascule le processus enfant vers
-    l'utilisateur non-root (setgid puis setuid, ordre important)."""
+    l'utilisateur non-root. CRITIQUE : os.initgroups() AVANT setuid pour heriter
+    des groupes SUPPLEMENTAIRES (video/input/seat/render). Sans ca, l'enfant
+    n'a que le gid primaire -> pas d'acces a /run/seatd.sock (root:video) ni au
+    GPU/entrees (c'est ce qui imposait le 'chmod 777 /run/seatd.sock' a la main).
+    Ordre : initgroups -> setgid -> setuid (en root, avant la bascule)."""
     def preexec():
+        try:
+            os.initgroups(user, gid)
+        except (OSError, KeyError):
+            pass
         os.setgid(gid)
         os.setuid(uid)
     return preexec
@@ -715,7 +745,7 @@ def run_session_app(scfg, uid, gid, home):
     log(f"[session] cage -- {app} (utilisateur {scfg['user']}, uid={uid})")
     try:
         return subprocess.run(["cage", "--"] + app_argv,
-                              env=env, preexec_fn=_demote(uid, gid)).returncode
+                              env=env, preexec_fn=_demote(uid, gid, scfg["user"])).returncode
     except OSError as e:
         log(f"[session] echec lancement cage en non-root : {e}")
         return 1
@@ -741,7 +771,7 @@ def start_idle_lock(scfg, uid, gid, home):
         # verrouille apres <idle> s d'inactivite
         subprocess.Popen(
             ["swayidle", "-w", "timeout", str(idle), " ".join(lock_cmd)],
-            env=env, preexec_fn=_demote(uid, gid),
+            env=env, preexec_fn=_demote(uid, gid, scfg["user"]),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log(f"[session] verrou auto apres {idle}s d'inactivite (swayidle+swaylock)")
     else:

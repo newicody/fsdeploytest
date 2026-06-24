@@ -39,6 +39,48 @@ def out(cmd):
     return subprocess.run(cmd, capture_output=True, text=True).stdout
 
 
+def _staging_buffer(kver):
+    """Tampon d'installation des modules HORS /lib (on ne pollue pas le /lib du
+    systeme vivant ni l'overlay : modules-<ver>.sfs est bati depuis une zone
+    propre). Emplacement CHOISI DANS L'INFRA, pas en dur : sous le dataset
+    fast_pool/staging (role construction, reconstructible). Retourne le ROOT a
+    passer en INSTALL_MOD_PATH (les modules iront dans <root>/lib/modules/<kver>)
+    ou None si staging indisponible. canmount=noauto -> on le monte explicitement
+    (montage de BUILD, legitime ; sans rapport avec l'auto-montage du boot)."""
+    ds = os.environ.get("STAGING_DS", "fast_pool/staging")
+    subprocess.run(["zfs", "mount", ds], stderr=subprocess.DEVNULL)
+    mp = subprocess.run(["zfs", "get", "-H", "-o", "value", "mountpoint", ds],
+                        capture_output=True, text=True).stdout.strip()
+    if not mp or mp in ("legacy", "none") or not os.path.isdir(mp):
+        return None
+    root = os.path.join(mp, "modroot")
+    target = os.path.join(root, "lib/modules", kver)
+    if os.path.isdir(target):
+        shutil.rmtree(target, ignore_errors=True)      # repart propre pour ce kver
+    os.makedirs(os.path.join(root, "lib/modules"), exist_ok=True)
+    return root
+
+
+def _import_zfs_kmod(kver, mod_root):
+    """Copie les .ko de zfs-kmod (poses par emerge dans /lib/modules/<kver>, voie
+    Gentoo) vers le tampon, pour que modules-<kver>.sfs les contienne sans lire
+    /lib. zfs.ko, spl.ko et leurs sous-modules vivent dans le meme sous-dossier
+    (typiquement 'extra'). Retourne la liste des sous-dossiers importes."""
+    done = []
+    for mod in ("zfs", "spl"):
+        ko = subprocess.run(["modinfo", "-k", kver, "-n", mod],
+                            capture_output=True, text=True).stdout.strip()
+        if not ko or not os.path.exists(ko):
+            continue
+        srcdir = os.path.dirname(ko)
+        rel = os.path.relpath(srcdir, f"/lib/modules/{kver}")
+        dstdir = os.path.join(mod_root, "lib/modules", kver, rel)
+        shutil.copytree(srcdir, dstdir, dirs_exist_ok=True)
+        if rel not in done:
+            done.append(rel)
+    return done
+
+
 def backup_kernel_config(src, kver):
     """Sauvegarde la .config du noyau compile vers boot_pool/manager/configs/
     (pool redondant). La compilation se fait vite sur fast_pool (stripe), mais la
@@ -246,9 +288,16 @@ def main():
     msg(f"build noyau {kver} (-j{JOBS}"
         + (f" {' '.join(make_flags)}" if make_flags else "") + ")")
 
-    # 1. noyau + modules in-tree
+    # 1. noyau + modules in-tree. modules_install -> TAMPON hors /lib (choisi
+    # dans l'infra), pour ne pas figer le /lib du systeme vivant dans le sfs.
     run(["make", "-C", SRC, f"-j{JOBS}"] + make_flags)
-    run(["make", "-C", SRC, "modules_install"] + make_flags)
+    mod_root = _staging_buffer(kver)
+    if not mod_root:
+        sys.exit("fast_pool/staging indisponible -> impossible d'installer les "
+                 "modules hors /lib (monte-le : zfs mount fast_pool/staging).")
+    run(["make", "-C", SRC, "modules_install",
+         f"INSTALL_MOD_PATH={mod_root}"] + make_flags)
+    msg(f"modules in-tree -> tampon {mod_root}/lib/modules/{kver} (hors /lib)")
 
     # 2. zfs/spl hors-arbre contre ce noyau (voie Gentoo)
     link = "/usr/src/linux"
@@ -276,9 +325,16 @@ def main():
     # redondant). La compilation reussie est confirmee ici (zfs.ko OK).
     backup_kernel_config(SRC, kver)
 
-    # 3. modules-<ver>.sfs sur fast_pool/sfs (via le module dedie)
+    # 3. modules-<ver>.sfs sur fast_pool/sfs, bati depuis le TAMPON (hors /lib).
+    # zfs-kmod a ete installe par emerge dans /lib/modules/<kver> (voie Gentoo) ;
+    # on importe ses .ko dans le tampon, puis depmod -b tampon -> le sfs est
+    # autonome et complet (in-tree + zfs/spl) sans figer /lib.
+    imp = _import_zfs_kmod(kver, mod_root)
+    msg(f"zfs-kmod importe dans le tampon ({', '.join(imp) or 'aucun'})")
+    run(["depmod", "-b", mod_root, kver])
     import sfs_build
-    r = sfs_build.build_modules_sfs(kver, "fast_pool/sfs", log=msg, force=True)
+    r = sfs_build.build_modules_sfs(kver, "fast_pool/sfs", log=msg, force=True,
+                                    mod_root=mod_root)
     if not r.ok:
         sys.exit(f"creation modules.sfs echouee : {r.reason}")
     sfs_out = r.path

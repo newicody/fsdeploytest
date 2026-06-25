@@ -572,6 +572,19 @@ def run_build(config_path, rep, src="/usr/src/linux", infra_conf="infra.conf"):
     """Stage le .config fourni puis delegue a kernel_build.py (compile,
     zfs-kmod, sfs, initramfs, EFI, registre). Pas de reecriture : on appelle
     la chaine existante."""
+    # Bootstrap source : s'assurer qu'un arbre noyau est pose ET selectionne avant
+    # tout make/.config (sinon il n'y a pas de source). source_manager possede le
+    # cycle de vie (fetch tarball kernel.org -> select /usr/src/linux). Idempotent :
+    # si une source est deja active, on ne refetch pas.
+    try:
+        import source_manager as smgr
+        kc = smgr._kernel_cfg(infra_conf)
+        active = smgr.ensure(kc["version"], smgr._container(src), kc["mirror"], src,
+                             log=lambda m: rep.info(m))
+        if active:
+            rep.ok(f"source noyau active : linux-{active}")
+    except Exception as e:
+        rep.warn(f"bootstrap source noyau : {e}")
     dst = os.path.join(src, ".config")
     if os.path.abspath(config_path) != os.path.abspath(dst):
         import shutil

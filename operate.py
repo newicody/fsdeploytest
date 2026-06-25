@@ -262,6 +262,7 @@ def kernel_src():
 # sous-commandes en simple passthrough vers leur module (memes args/CLI)
 PASS = {
     "config":     "kernel_watch.py",
+    "dispatch":   "dispatch.py",
     "diagnose":   "kernel_diagnose.py",
     "freeze":     "freeze_overlay.py",
     "select":     "select_rootfs.py",

@@ -861,7 +861,7 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > on débugge éternellement du vieux code figé.
 >
 > **PID 1 résilient (compositeur)** : `session_launch.py` ne fait **plus**
-> `execvp("cage")` direct. Il **boucle** sur le compositeur : que cage se termine
+> `execvp("cage")` direct. Il **boucle** sur le compositeur : qu'il se termine
 > **proprement** (tu fermes foot) ou **échoue**, PID 1 ne meurt jamais (sinon
 > kernel panic). Sortie propre → relance ; échec → nouvelle tentative, et après 3
 > échecs consécutifs → shell de maintenance (puis re-tentative). Cause typique du
@@ -949,7 +949,7 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > « cannot set LC_* » si la locale n'est pas compilée — génère-la via
 > `/etc/locale.gen` + `locale-gen`), et les variables Wayland
 > (`XDG_SESSION_TYPE=wayland`, `XDG_CURRENT_DESKTOP`, `QT_QPA_PLATFORM`,
-> `GDK_BACKEND`, `SDL_VIDEODRIVER`) utiles à cage et à **XWayland** à venir. Les
+> `GDK_BACKEND`, `SDL_VIDEODRIVER`) utiles au compositeur wlroots (sway/cage) et à **XWayland** à venir. Les
 > shells interactifs (maintenance, foot) sont lancés en **login shell** (`bash -l`)
 > et sourcent donc `/etc/profile` normalement.
 >
@@ -958,7 +958,7 @@ GuC/HuC/DMC — Rocket Lake réutilise les blobs Tiger Lake), crée les nœuds
 > mais **pas** `/dev/dri/` (GPU), `/dev/fd`, `/dev/shm`, ni les
 > permissions/groupes. Conséquences observées : `emerge` refuse (« failed to
 > validate a sane /dev »), bash process-substitution casse (« broken /dev/fd »),
-> et cage/wlroots ne trouve pas `/dev/dri/card0` (« unable to create the wlroots
+> et le compositeur wlroots ne trouve pas `/dev/dri/card0` (« unable to create the wlroots
 > backend »). `session_launch.setup_dev()` corrige : crée les liens standards
 > (`/dev/fd → /proc/self/fd`, stdin/out/err…), monte `/dev/shm`, puis lance
 > **eudev** (`udevd --daemon` + `udevadm trigger` + `settle`) qui peuple `/dev`
@@ -1736,7 +1736,7 @@ eclean-kernel -n 2                     # ménage manuel des noyaux
 - `init.py` est figé sur **x86_64** (`NR_finit_module=313`, loader `ld-linux-x86-64`).
 - `init.py`, `session_launch.py` deviennent **PID 1** : s'ils plantent ou se
   terminent, c'est un kernel panic. `init.py` a un filet (rescue) ; un
-  compositeur (cage) qui sort en fin de session reste un point de fragilité.
+  compositeur (sway/cage) qui sort en fin de session reste un point de fragilité.
 - CPython embarqué gonfle l'initramfs de ~30-50 Mo (coût de « tout en Python »).
 - Les appels `mount`/`finit_module`/`switch_root` ne se valident qu'au **boot réel** ;
   le reste (parseurs, liaison ctypes) est testé hors-cible.

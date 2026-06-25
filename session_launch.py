@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 /sbin/session_launch.py — execute apres switch_root, dans le rootfs Gentoo
-(PID 1). Monte le minimum, lance le compositeur wlroots kiosk (cage), et
+(PID 1). Monte le minimum, lance la session graphique de l'utilisateur (sway via dbus-run-session,
 bascule le stream de fbdev (initramfs) vers la capture wayland.
 
-Dependances rootfs : seatd, cage (ou sway), foot, ffmpeg, et
+Dependances rootfs : seatd, sway, foot, ffmpeg, et
 wl-screenrec OU wf-recorder.
 """
 import os
@@ -25,6 +25,21 @@ def log(msg):
     except OSError:
         pass
     print(line, end="", flush=True)
+
+
+def _safe(label, fn, *args, **kwargs):
+    """Execute une phase de boot en ISOLANT ses erreurs : journalise + continue au
+    lieu d'avorter. session_launch = PID 1 : une phase non critique qui plante ne
+    doit ni empecher d'atteindre la session, ni (avec la garde _never_die) paniquer
+    le noyau."""
+    try:
+        return fn(*args, **kwargs)
+    except BaseException as ex:
+        import traceback
+        log(f"[pid1] phase '{label}' a echoue ({type(ex).__name__}: {ex}) -> on continue")
+        for ln in traceback.format_exc().splitlines()[-3:]:
+            log("  " + ln)
+        return None
 
 
 def sh(cmd, **kw):
@@ -66,7 +81,7 @@ def start_wayland_stream(key):
             "Pour activer : ecris ta cle de diffusion dans /etc/yt.key")
         return
     sock = os.path.join(RUNTIME_DIR, "wayland-0")
-    for _ in range(40):                        # attendre cage (jusqu'a 20 s)
+    for _ in range(40):                        # attendre le compositeur (jusqu'a 20 s)
         if os.path.exists(sock):
             break
         time.sleep(0.5)
@@ -349,7 +364,7 @@ def setup_dev():
     l'initramfs n'a NI /dev/fd NI /dev/dri (GPU) NI les liens standards. Sans ca :
       - bash process substitution casse ('broken /dev/fd')
       - emerge refuse ('failed to validate a sane /dev')
-      - cage/wlroots ne trouve pas /dev/dri/card0 -> 'unable to create backend'
+      - le compositeur wlroots ne trouve pas /dev/dri/card0 -> 'unable to create backend'
     On cree les liens standards PUIS on lance eudev (udevd) qui peuple
     dynamiquement /dev (cree /dev/dri/cardN quand le module GPU est charge,
     applique permissions/groupes video/render)."""
@@ -433,7 +448,7 @@ def locale_available(loc):
 
 def setup_environment():
     """Initialise l'environnement systeme + Wayland pour PID 1 et ses enfants
-    (seatd, cage, et XWayland plus tard). On NE source PAS /etc/profile en bloc
+    (seatd, le compositeur wlroots, XWayland plus tard). On NE source PAS /etc/profile en bloc
     (concu pour un shell de login, inadapte/risque pour PID 1) : on definit
     EXPLICITEMENT ce dont le compositeur a besoin. Les shells interactifs
     (maintenance, foot) sourceront /etc/profile via 'sh -l'."""
@@ -468,10 +483,10 @@ def setup_environment():
     os.environ["LANG"] = loc
     os.environ["LC_ALL"] = loc
 
-    # 3. Wayland : type de session + bureau (utile a cage, XWayland, portails).
+    # 3. Wayland : type de session + bureau (utile au compositeur, XWayland, portails).
     #    XDG_RUNTIME_DIR est defini juste apres (depend de RUNTIME_DIR).
     os.environ.setdefault("XDG_SESSION_TYPE", "wayland")
-    os.environ.setdefault("XDG_CURRENT_DESKTOP", "cage")
+    os.environ.setdefault("XDG_CURRENT_DESKTOP", "sway")
     os.environ.setdefault("MOZ_ENABLE_WAYLAND", "1")   # si firefox un jour
     os.environ.setdefault("QT_QPA_PLATFORM", "wayland;xcb")
     os.environ.setdefault("GDK_BACKEND", "wayland,x11")
@@ -533,17 +548,15 @@ def start_services(infra_path="/etc/infra.conf"):
 
 def _read_session_config(infra_path="/etc/infra.conf"):
     """Lit [session] d'infra.conf. Retourne un dict avec defauts surs."""
+def _read_session_config(infra_path="/etc/infra.conf"):
+    """Lit [session] d'infra.conf. Defauts surs. La session graphique N'EST PAS
+    geree par Python : on lance 'session_cmd' (defaut 'dbus-run-session sway') via
+    un LOGIN SHELL, et sway lit la config de l'utilisateur (~/.config/sway) :
+    verrou (swayidle/swaylock), clavier, apps -> TOUT cote utilisateur."""
     defaults = {
         "user": "appliance",
         "groups": ["video", "input", "seat", "render"],
-        "compositor": "sway",
-        "xkb_layout": "fr",
-        "app": "foot",
-        "app_fallback": "foot",
-        "lock_enabled": False,
-        "lock_idle": 300,
-        "lock_backend": "swaylock",
-        "lock_options": ["--daemonize"],
+        "session_cmd": "dbus-run-session sway",
     }
     if not os.path.exists(infra_path):
         for c in ("/etc/infra.conf", "/infra.conf", "/sbin/infra.conf"):
@@ -565,18 +578,10 @@ def _read_session_config(infra_path="/etc/infra.conf"):
             return d
         return v if isinstance(v, list) else [x.strip() for x in v.split(",")]
 
-    lock = s.get("lock", {})
     return {
         "user": s.get("user", defaults["user"]),
         "groups": _list(s.get("groups"), defaults["groups"]),
-        "compositor": str(s.get("compositor", defaults["compositor"])).lower(),
-        "xkb_layout": s.get("xkb_layout", defaults["xkb_layout"]),
-        "app": s.get("app", defaults["app"]),
-        "app_fallback": s.get("app_fallback", defaults["app_fallback"]),
-        "lock_enabled": str(lock.get("enabled", "false")).lower() == "true",
-        "lock_idle": int(lock.get("idle_timeout", defaults["lock_idle"]) or 0),
-        "lock_backend": lock.get("backend", defaults["lock_backend"]),
-        "lock_options": _list(lock.get("options"), defaults["lock_options"]),
+        "session_cmd": s.get("session_cmd", defaults["session_cmd"]),
     }
 
 
@@ -729,135 +734,37 @@ def _demote(uid, gid, user):
     return preexec
 
 
-def _write_sway_config(scfg, uid):
-    """Genere une config sway minimale pour la session kiosk : pas de bordure,
-    fond uni, lance l'app, et -- si le verrou est actif -- 'exec swayidle' qui
-    declenche swaylock APRES que le compositeur soit up (bon moment + bon
-    WAYLAND_DISPLAY, contrairement a un swayidle lance avant le compositeur).
-    swaylock valide le mot de passe du compte via PAM. Ecrite dans le runtime de
-    l'utilisateur. Retourne le chemin."""
-    path = f"/run/user/{uid}/sway.config"
-    app = scfg["app"]
-    lines = [
-        "# config sway generee par session_launch (kiosk appliance)",
-        "default_border none",
-        "default_floating_border none",
-        "output * bg #101010 solid_color",
-        f"exec {app}",
-    ]
-    if scfg["lock_enabled"] and scfg["lock_backend"] == "swaylock" \
-            and which("swaylock"):
-        lock = "swaylock " + " ".join(scfg["lock_options"])
-        idle = scfg["lock_idle"]
-        if idle > 0 and which("swayidle"):
-            # verrou apres <idle>s d'inactivite ET avant mise en veille
-            lines.append(f"exec swayidle -w "
-                         f"timeout {idle} '{lock}' "
-                         f"before-sleep '{lock}'")
-            log(f"[session] sway : verrou auto apres {idle}s "
-                "(swayidle -> swaylock, mot de passe PAM)")
-        else:
-            log("[session] sway : swaylock dispo mais swayidle absent/idle=0 "
-                "-> pas de verrouillage automatique")
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    try:
-        os.chown(path, uid, scfg.get("_gid", -1))
-    except OSError:
-        pass
-    return path
-
-
 def run_session_app(scfg, uid, gid, home):
-    """Lance le compositeur de session EN UTILISATEUR DEDIE (non-root) avec l'app.
-      - compositor=sway (defaut) : sway + config generee (exec app +
-        swayidle/swaylock pour le verrou ; layer-shell correct pour le verrou) ;
-      - compositor=cage : cage mono-app (repli kiosk simple).
-    Retourne le code retour. PID 1 (root) reste le parent : il survit a la sortie
-    du compositeur. La bascule utilisateur passe par _demote -> initgroups (acces
-    seatd/GPU)."""
-    comp = scfg.get("compositor", "sway")
-    scfg["_gid"] = gid
-    app = scfg["app"]
-    app_argv = app.split() if isinstance(app, str) else list(app)
+    """Lance la session graphique EN UTILISATEUR DEDIE (non-root). Python NE gere
+    PAS sway : il lance simplement 'session_cmd' ([session], defaut
+    'dbus-run-session sway') via un LOGIN SHELL. bash --login source /etc/profile
+    + le profil utilisateur (env, locale) ; dbus-run-session fournit le bus de
+    session ; sway lit ~/.config/sway de l'utilisateur (verrou swayidle/swaylock,
+    clavier xkb, apps -> TOUT cote utilisateur). _demote applique os.initgroups
+    AVANT setuid (acces seatd/GPU). PID 1 (root) reste le parent et survit a la
+    sortie. Toute erreur -> code retour, JAMAIS une exception jusqu'a PID 1."""
+    cmd = scfg.get("session_cmd", "dbus-run-session sway")
     user_runtime = f"/run/user/{uid}"          # PAS /run/user/0
-    os.makedirs(user_runtime, exist_ok=True)
-    os.chown(user_runtime, uid, gid)
-    os.chmod(user_runtime, 0o700)
-    env = dict(os.environ,
-               HOME=home, USER=scfg["user"], LOGNAME=scfg["user"],
-               XDG_RUNTIME_DIR=user_runtime,
-               XKB_DEFAULT_LAYOUT=scfg.get("xkb_layout", "fr"))
-
-    if comp == "sway" and which("sway"):
-        cfg_path = _write_sway_config(scfg, uid)
-        log(f"[session] sway -c {cfg_path} (app {app} ; "
-            f"utilisateur {scfg['user']}, uid={uid})")
-        try:
-            return subprocess.run(["sway", "-c", cfg_path], env=env,
-                                  preexec_fn=_demote(uid, gid,
-                                                     scfg["user"])).returncode
-        except OSError as e:
-            log(f"[session] echec lancement sway : {e}")
-            return 1
-
-    # compositor=cage (ou sway absent) : cage mono-app
-    if not which("cage"):
-        log(f"[session] compositeur '{comp}' demande mais ni sway ni cage "
-            "disponibles")
-        return 127
-    log(f"[session] cage -- {app} (utilisateur {scfg['user']}, uid={uid})")
     try:
-        return subprocess.run(["cage", "--"] + app_argv, env=env,
+        os.makedirs(user_runtime, exist_ok=True)
+        os.chown(user_runtime, uid, gid)
+        os.chmod(user_runtime, 0o700)
+    except OSError as e:
+        log(f"[session] XDG_RUNTIME_DIR {user_runtime} : {e}")
+    env = dict(os.environ, HOME=home, USER=scfg["user"], LOGNAME=scfg["user"],
+               XDG_RUNTIME_DIR=user_runtime)
+    shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+    log(f"[session] {shell} --login -c '{cmd}' "
+        f"(utilisateur {scfg['user']}, uid={uid})")
+    try:
+        return subprocess.run([shell, "--login", "-c", cmd], env=env,
                               preexec_fn=_demote(uid, gid,
                                                  scfg["user"])).returncode
-    except OSError as e:
-        log(f"[session] echec lancement cage en non-root : {e}")
+    except BaseException as ex:                 # jamais d'exception jusqu'a PID 1
+        log(f"[session] echec lancement session : {type(ex).__name__}: {ex}")
         return 1
 
 
-def start_idle_lock(scfg, uid, gid, home):
-    """Verrou d'ecran sur inactivite via swayidle + swaylock (si lock.enabled).
-    swaylock valide le mot de passe du compte via PAM. Lance en tant que
-    l'utilisateur. Best effort (non bloquant). Une couche python-pam peut etre
-    ajoutee ici pour une logique d'auth personnalisee."""
-    if not scfg["lock_enabled"]:
-        return
-    if scfg["lock_backend"] != "swaylock" or not which("swaylock"):
-        log("[session] verrou demande mais swaylock absent -> pas de verrou. "
-            "(emerge gui-apps/swaylock)")
-        return
-    user_runtime = f"/run/user/{uid}"
-    env = dict(os.environ, HOME=home, USER=scfg["user"],
-               XDG_RUNTIME_DIR=user_runtime)
-    lock_cmd = ["swaylock"] + scfg["lock_options"]
-    idle = scfg["lock_idle"]
-    if idle > 0 and which("swayidle"):
-        # verrouille apres <idle> s d'inactivite
-        subprocess.Popen(
-            ["swayidle", "-w", "timeout", str(idle), " ".join(lock_cmd)],
-            env=env, preexec_fn=_demote(uid, gid, scfg["user"]),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        log(f"[session] verrou auto apres {idle}s d'inactivite (swayidle+swaylock)")
-    else:
-        log("[session] verrou swaylock disponible (swayidle absent ou idle=0 : "
-            "pas de verrouillage automatique)")
-
-
-def _has_password(user):
-    """L'utilisateur a-t-il un mot de passe utilisable (pour swaylock via PAM) ?
-    Lit /etc/shadow (root). Champ vide / '!' / '*' / '!!' = pas de mot de passe
-    -> swaylock ne pourra pas deverrouiller. True/False, None si inconnu."""
-    try:
-        with open("/etc/shadow") as f:
-            for ln in f:
-                p = ln.split(":")
-                if p and p[0] == user:
-                    h = p[1] if len(p) > 1 else ""
-                    return bool(h) and h not in ("!", "*", "!!", "x")
-    except OSError:
-        return None
-    return None
 
 
 def main():
@@ -869,10 +776,10 @@ def main():
     subprocess.run(["mount", "-t", "devpts", "devpts", "/dev/pts"],
                    stderr=subprocess.DEVNULL)
     # COMPLETER /dev : liens standards + eudev (cree /dev/dri, /dev/fd...).
-    # Sans ca : emerge 'sane /dev' KO, bash process-substitution KO, cage KO.
-    setup_dev()
+    # Sans ca : emerge 'sane /dev' KO, bash process-substitution KO, compositeur KO.
+    _safe("setup_dev", setup_dev)
     # ENVIRONNEMENT : base systeme (HOME/USER/PATH/LANG) + variables Wayland,
-    # pour PID 1 et tous ses enfants (seatd, cage, XWayland a venir).
+    # pour PID 1 et tous ses enfants (seatd, le compositeur, XWayland a venir).
     setup_environment()
 
     # MODE DEGRADE : rapport + shell de reparation, pas de session normale
@@ -888,18 +795,18 @@ def main():
     # (/run/openrc : deptree, verrous, softlevel) et demarre sysfs/devfs/udev
     # comme services OpenRC. C'est ce qui corrige les echecs 'bad file
     # descriptor', 'sysfs would not start', 'devfs failed' constates au demarrage
-    # des services. udev de ce runlevel peuple /dev/dri (perms GPU) avant seatd/cage.
-    openrc_bringup()
+    # des services. udev de ce runlevel peuple /dev/dri (perms GPU) avant seatd/compositeur.
+    _safe("openrc_bringup", openrc_bringup)
 
     # REMONTER les datasets ZFS du systeme booted : les montages /mnt/* de
     # l'initramfs ont disparu au switch_root (pools toujours importes). Sans ca :
     # fast_pool/sfs, staging, boot_pool/manager, images... absents en booted.
-    ensure_zfs_booted()
+    _safe("ensure_zfs_booted", ensure_zfs_booted)
 
     # token GitHub (boot_pool/manager dispo apres ensure_zfs_booted) -> reactive
     # le reporting git (push board de first_boot, synchro manager d'operate/
     # boot_confirm). Sans lui, tout push est silencieusement saute.
-    load_github_token()
+    _safe("load_github_token", load_github_token)
 
     if which("seatd"):
         subprocess.Popen(["seatd", "-g", "video"],
@@ -914,26 +821,22 @@ def main():
     # socle log : preparer la socket syslog-ng (repertoire logs:logs + lien
     # /dev/log) AVANT start_services, sinon syslog-ng en 'logs' ne peut pas
     # creer /dev/log (sans capabilities).
-    prepare_syslog_socket()
+    _safe("prepare_syslog_socket", prepare_syslog_socket)
 
-    start_services()
+    _safe("start_services", start_services)
 
     # PROMOTION du noyau fraichement boote : health-check -> efibootmgr + registre
     # -> remontee git. En arriere-plan (ne bloque pas le compositeur). Le reseau
     # (initramfs) et le token sont prets a ce stade.
-    run_boot_confirm()
+    _safe("run_boot_confirm", run_boot_confirm)
 
     # SESSION utilisateur dediee (non-root) : lire [session], creer l'utilisateur
-    # + groupes (video/input/seat/render), preparer le verrou. cage tournera en
-    # tant que cet utilisateur ; PID 1 (root) reste le parent qui survit.
+    # + groupes (video/input/seat/render). La session (sway) tournera en tant que
+    # cet utilisateur ; PID 1 (root) reste le parent qui survit.
     scfg = _read_session_config()
     session_user = ensure_user(scfg["user"], scfg["groups"])
     if session_user:
         setup_user_dirs(*session_user)
-        if scfg["lock_enabled"] and _has_password(scfg["user"]) is False:
-            log(f"[session] verrou actif mais le compte '{scfg['user']}' n'a "
-                "PAS de mot de passe -> swaylock ne pourra pas deverrouiller. "
-                f"Definis-en un : passwd {scfg['user']}")
 
     key = read_key()
     stop_initramfs_stream()
@@ -945,32 +848,23 @@ def main():
         os._exit(0)
 
     # Compositeur kiosk EN UTILISATEUR DEDIE. CRITIQUE : jamais d'execvp direct
-    # (remplacerait PID 1 -> si cage meurt, kernel panic). On lance en
-    # SOUS-PROCESSUS demote (setuid/setgid vers l'utilisateur), on surveille,
+    # (remplacerait PID 1 -> si la session meurt, kernel panic). On lance en
+    # SOUS-PROCESSUS demote (initgroups+setuid vers l'utilisateur), on surveille,
     # et en cas d'echec on retombe sur un shell. PID 1 (root) ne quitte JAMAIS.
     def run_compositor():
         if session_user:
             uid, gid, home = session_user
-            # Verrou : sous SWAY il est dans la config generee (exec swayidle ->
-            # swaylock, lance APRES le compositeur). Sous CAGE seulement, on tente
-            # le lanceur separe (best effort ; layer-shell limite sous cage).
-            if scfg.get("compositor", "sway") != "sway":
-                start_idle_lock(scfg, uid, gid, home)
-            rc = run_session_app(scfg, uid, gid, home)
-            if rc != 0 and scfg["app"] != scfg["app_fallback"]:
-                log(f"[session] app '{scfg['app']}' echouee -> repli "
-                    f"'{scfg['app_fallback']}'")
-                scfg2 = dict(scfg, app=scfg["app_fallback"])
-                rc = run_session_app(scfg2, uid, gid, home)
-            return rc
-        # repli : pas d'utilisateur dedie (creation echouee) -> compositeur en root
-        log("[session] pas d'utilisateur dedie -> compositeur en root (repli)")
-        if which("sway"):
-            return subprocess.run(["sway"]).returncode
-        if which("cage"):
-            return subprocess.run(["cage", "--", scfg["app_fallback"]]).returncode
-        log("aucun compositeur (sway/cage) installe")
-        return 127
+            return run_session_app(scfg, uid, gid, home)
+        # repli : creation utilisateur echouee -> session en root via login shell
+        # (meme session_cmd ; sway lira /root/.config/sway). Pas de cage.
+        log("[session] pas d'utilisateur dedie -> session en root (repli)")
+        cmd = scfg.get("session_cmd", "dbus-run-session sway")
+        shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+        try:
+            return subprocess.run([shell, "--login", "-c", cmd]).returncode
+        except BaseException as ex:
+            log(f"[session] repli root echoue : {type(ex).__name__}: {ex}")
+            return 1
 
     # BOUCLE PID 1 : le compositeur peut se TERMINER (tu fermes foot) ou ECHOUER.
     # Dans les DEUX cas, PID 1 ne doit pas mourir (sinon kernel panic). On
@@ -1006,5 +900,36 @@ def main():
             time.sleep(2)
 
 
+def _never_die():
+    """Garde ULTIME de PID 1. session_launch est PID 1 du rootfs : si l'interpreteur
+    Python SORT (return de main, sys.exit, OU une exception non rattrapee -- ex un
+    mauvais subprocess.run qui leve FileNotFoundError), le noyau panique
+    ('Attempted to kill init'). Ici on garantit que ca n'arrive JAMAIS : toute
+    sortie/exception de main() est journalisee (avec trace) et on retombe sur un
+    shell de secours, puis on reboucle. Seul un 'poweroff'/'reboot' explicite
+    arrete la machine."""
+    import traceback
+    while True:
+        try:
+            main()
+            log("[pid1] main() est revenu (anormal) -> shell de secours")
+        except BaseException as ex:        # y compris SystemExit, erreurs inattendues
+            try:
+                log("=" * 56)
+                log(f"[pid1] EXCEPTION non rattrapee : {type(ex).__name__}: {ex}")
+                for ln in traceback.format_exc().splitlines():
+                    log("  " + ln)
+                log("[pid1] PID 1 NE MEURT PAS -> shell de secours. "
+                    "'exit' pour reboucler ; 'poweroff' pour eteindre.")
+                log("=" * 56)
+            except BaseException:
+                pass
+        try:
+            shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+            subprocess.run([shell, "-l"])
+        except BaseException:
+            time.sleep(5)                  # dernier filet : ne jamais boucler a vide
+
+
 if __name__ == "__main__":
-    main()
+    _never_die()

@@ -34,15 +34,18 @@ def _load_modes(log=print):
 
 
 def to_orchestrator(artifact, ctx=None, log=print):
-    """Route vers l'orchestrateur OpenVINO (foyer : ov_pipelines). Brique a venir :
-    ici on SIGNALE le routage ; l'orchestration reelle (workers Claude/Gemini, avis
-    direct, retravail des avis) est l'etape suivante. Un artefact route:direct ne
-    passe JAMAIS ici."""
-    log(f"[dispatch] artefact #{artifact.get('number')} (mode {artifact.get('mode')})"
-        " -> orchestrateur OpenVINO (ov_pipelines) [routage signale, inference a venir]")
-    return {"action": "inference", "via": "openvino",
-            "reason": "needs:inference -> orchestrateur (ov_pipelines)",
-            "number": artifact.get("number"), "mode": artifact.get("mode")}
+    """Route vers l'orchestrateur OpenVINO : workers en parallele (local +
+    Claude/Gemini si configures) -> arbitrage -> synthese. Le resultat (porte
+    'synthesis') est ensuite reposte par post_feedback. Un artefact route:direct
+    ne passe JAMAIS ici."""
+    try:
+        import arbiter
+        return arbiter.orchestrate(artifact, log=log)
+    except Exception as e:
+        log(f"[dispatch] arbitre indisponible ({e}) -> routage signale seulement")
+        return {"action": "inference", "via": "openvino",
+                "reason": f"arbitre indisponible : {e}",
+                "number": artifact.get("number"), "mode": artifact.get("mode")}
 
 
 def dispatch_one(artifact, ctx=None, log=print):
@@ -95,8 +98,12 @@ def post_feedback(entry, decision, board=None, token=None, log=print):
         body += f"\n\n{decision['reason']}"
     if "applied" in decision:
         body += f"\n\nbuild execute : {decision['applied']}"
-    if decision.get("via") == "openvino":
-        body += "\n\n(route -> orchestrateur OpenVINO ; inference a venir)"
+    if decision.get("synthesis"):
+        wk = ", ".join(decision.get("workers", [])) or "?"
+        body += (f"\n\n---\n**Synthese (arbitre {decision.get('arbiter', '?')}"
+                 f" ; workers : {wk})** :\n\n{decision['synthesis']}")
+    elif decision.get("via") == "openvino":
+        body += "\n\n(route -> orchestrateur OpenVINO)"
     try:
         b.tp.add_comment(num, body)
         cur = b.tp.get_issue(num)

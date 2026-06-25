@@ -31,6 +31,8 @@ import os
 
 TYPE_PREFIX = "type:"        # type d'artefact
 STATE_PREFIX = "state:"      # cycle de vie (deja utilise par github_board)
+AXIS_PREFIX = "axis:"        # axe transversal (taxonomy.conf)
+DOMAIN_PREFIX = "domain:"    # sous-domaine du mode (taxonomy.conf)
 ROUTE_DIRECT = "route:direct"   # bypass orchestrateur -> handler direct du mode
 NEEDS_INFER = "needs:inference"
 
@@ -96,12 +98,23 @@ def _label_names(issue):
 
 
 def classify(issue, repo="", mode=""):
-    """Normalise une Issue en ARTEFACT projet-agnostique a partir de ses labels."""
+    """Normalise une Issue en ARTEFACT projet-agnostique a partir de ses labels,
+    et valide mode/axis/domain/state contre la taxonomie (permissif : un inconnu
+    est signale via 'valid', jamais rejete)."""
     labels = _label_names(issue)
-    atype = next((l[len(TYPE_PREFIX):] for l in labels
-                  if l.startswith(TYPE_PREFIX)), "")
-    state = next((l[len(STATE_PREFIX):] for l in labels
-                  if l.startswith(STATE_PREFIX)), "")
+
+    def _pick(prefix):
+        return next((l[len(prefix):] for l in labels if l.startswith(prefix)), "")
+
+    atype = _pick(TYPE_PREFIX)
+    state = _pick(STATE_PREFIX)
+    axis = _pick(AXIS_PREFIX)
+    domain = _pick(DOMAIN_PREFIX)
+    try:
+        import taxonomy
+        valid = taxonomy.validate(mode=mode, axis=axis, domain=domain, state=state)
+    except Exception:
+        valid = {}
     return {
         "repo": repo,
         "mode": mode,
@@ -111,8 +124,11 @@ def classify(issue, repo="", mode=""):
         "labels": labels,
         "type": atype,
         "state": state,
+        "axis": axis,
+        "domain": domain,
         "route_direct": ROUTE_DIRECT in labels,
         "needs_inference": NEEDS_INFER in labels,
+        "valid": valid,
     }
 
 

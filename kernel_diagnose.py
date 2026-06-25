@@ -62,6 +62,14 @@ REQUIRED = [
     ("CONFIG_IP_PNP",       "y",  WARN, "config IP par cmdline (ip=) inoperante"),
     ("CONFIG_FW_LOADER",    "y",  CRIT, "firmware GuC/HuC/rtl_nic non chargeable"),
     ("CONFIG_DRM",          "y",  CRIT, "aucun affichage"),
+    # --- socle STREAM PRECOCE (capture fbdev de /dev/fb0 dans l'initramfs) ---
+    # Le stream de boot lit /dev/fb0 (le plus stable+performant : simple memcpy,
+    # pas de DRM-master ni de conversion de format comme kmsgrab). Pour que
+    # /dev/fb0 existe DES l'EFI GOP et reste continu au handoff vers xe/i915 :
+    ("CONFIG_FB",                 "y", WARN, "pas de /dev/fb0 -> stream fbdev precoce KO"),
+    ("CONFIG_DRM_SIMPLEDRM",      "y", WARN, "pas de /dev/fb0 des l'EFI GOP -> stream precoce differe"),
+    ("CONFIG_DRM_FBDEV_EMULATION","y", WARN, "xe/i915 n'exposent pas /dev/fb0 -> stream coupe au handoff"),
+    ("CONFIG_FB_EFI",             "y", WARN, "pas de framebuffer EFI de secours pour le stream precoce"),
     # CRITIQUE : sans initrd support, le noyau IGNORE l'initramfs et cherche un
     # root reel -> 'VFS unable to mount root' (panic). Decouvert en debug reel.
     ("CONFIG_BLK_DEV_INITRD", "y", CRIT, "initramfs IGNORE par le noyau -> panic VFS"),

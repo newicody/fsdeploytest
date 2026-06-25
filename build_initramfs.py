@@ -747,6 +747,19 @@ def main():
                 "Fournis FFMPEG_STATIC=/chemin/ffmpeg (build statique) pour "
                 "streamer la console de boot des le chargement.")
 
+        # zpool.cache : import INSTANTANE des pools au boot. Avec lui, import_pool
+        # prend le chemin '-c /etc/zfs/zpool.cache' (aucun scan de devices) ; sans
+        # lui, init.py retombe sur un scan '-d by-id/by-partuuid' (nettement plus
+        # lent). On l'embarque s'il existe.
+        cache_src = os.environ.get("ZPOOL_CACHE", "/etc/zfs/zpool.cache")
+        if os.path.isfile(cache_src):
+            os.makedirs(f"{stage}/etc/zfs", exist_ok=True)
+            shutil.copy2(cache_src, f"{stage}/etc/zfs/zpool.cache")
+            msg("zpool.cache embarque (/etc/zfs/zpool.cache -> import instantane)")
+        else:
+            msg("pas de zpool.cache au build -> import par scan (plus lent). "
+                "Genere-le : zpool set cachefile=/etc/zfs/zpool.cache <pools>")
+
         # cle de stream YouTube : deposee dans l'initramfs si fournie au build
         yt = os.environ.get("YT_KEY", "")
         if yt:

@@ -42,6 +42,87 @@ def _safe(label, fn, *args, **kwargs):
         return None
 
 
+def _supervise(argv, env=None, preexec=None):
+    """Lance argv et, EN TANT QUE PID 1, MOISSONNE tous les zombies tant qu'il
+    tourne. Indispensable : tout demon qui se detache par double-fork (le bus D-Bus
+    de session, pipewire, wireplumber, xdg-desktop-portal, leurs helpers) voit son
+    processus intermediaire re-parente sur PID 1 ; sans wait() il devient zombie et
+    le service deraille (bus instable, Firefox qui ne joint pas D-Bus, audio KO).
+    On attend la fin du processus principal en reapant tout le reste au passage.
+    Retourne le code de sortie du processus principal."""
+    try:
+        p = subprocess.Popen(argv, env=env, preexec_fn=preexec)
+    except OSError as e:
+        log(f"[pid1] lancement '{argv[0] if argv else '?'}' echoue : {e}")
+        return 1
+    main_pid, rc = p.pid, 0
+    while True:
+        try:
+            pid, status = os.waitpid(-1, 0)      # bloque jusqu'a la mort d'un enfant
+        except ChildProcessError:
+            break                                 # plus aucun enfant
+        except OSError as e:
+            log(f"[pid1] waitpid : {e}")
+            break
+        if pid == main_pid:
+            rc = os.waitstatus_to_exitcode(status)
+            while True:                           # drainer les zombies restants
+                try:
+                    z, _ = os.waitpid(-1, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    break
+                if z == 0:
+                    break
+            break
+        # sinon : un enfant re-parente (zombie) vient d'etre reape -> on continue
+    return rc
+
+
+def _ensure_initctl():
+    """Cree /run/initctl (FIFO) et le DRAINE. session_launch est PID 1 mais PAS
+    openrc-init : des outils SysV (telinit, openrc-shutdown, certains scripts)
+    ouvrent /run/initctl. Absent -> erreurs ; present sans lecteur -> le writer
+    bloque. On le cree et on le vide (lecture non bloquante) pour eviter les deux ;
+    le contenu recu est journalise (protocole init extensible plus tard)."""
+    import threading
+    path = "/run/initctl"
+    try:
+        if not os.path.exists(path):
+            os.mkfifo(path, 0o600)
+    except OSError as e:
+        log(f"[pid1] /run/initctl non cree : {e}")
+        return
+
+    def _drain():
+        while True:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError:
+                time.sleep(2)
+                continue
+            try:
+                while True:
+                    try:
+                        data = os.read(fd, 4096)
+                    except BlockingIOError:
+                        time.sleep(0.5)
+                        continue
+                    except OSError:
+                        break
+                    if not data:                  # writers fermes -> reouvrir
+                        break
+                    log(f"[pid1] /run/initctl recu {len(data)} octet(s) (ignore)")
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            time.sleep(0.2)
+
+    threading.Thread(target=_drain, daemon=True).start()
+    log("[pid1] /run/initctl cree et draine (PID 1 custom, pas openrc-init)")
+
+
 def sh(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
@@ -757,9 +838,8 @@ def run_session_app(scfg, uid, gid, home):
     log(f"[session] {shell} --login -c '{cmd}' "
         f"(utilisateur {scfg['user']}, uid={uid})")
     try:
-        return subprocess.run([shell, "--login", "-c", cmd], env=env,
-                              preexec_fn=_demote(uid, gid,
-                                                 scfg["user"])).returncode
+        return _supervise([shell, "--login", "-c", cmd], env=env,
+                          preexec=_demote(uid, gid, scfg["user"]))
     except BaseException as ex:                 # jamais d'exception jusqu'a PID 1
         log(f"[session] echec lancement session : {type(ex).__name__}: {ex}")
         return 1
@@ -797,6 +877,7 @@ def main():
     # descriptor', 'sysfs would not start', 'devfs failed' constates au demarrage
     # des services. udev de ce runlevel peuple /dev/dri (perms GPU) avant seatd/compositeur.
     _safe("openrc_bringup", openrc_bringup)
+    _safe("ensure_initctl", _ensure_initctl)
 
     # REMONTER les datasets ZFS du systeme booted : les montages /mnt/* de
     # l'initramfs ont disparu au switch_root (pools toujours importes). Sans ca :
@@ -861,7 +942,7 @@ def main():
         cmd = scfg.get("session_cmd", "dbus-run-session sway")
         shell = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
         try:
-            return subprocess.run([shell, "--login", "-c", cmd]).returncode
+            return _supervise([shell, "--login", "-c", cmd])
         except BaseException as ex:
             log(f"[session] repli root echoue : {type(ex).__name__}: {ex}")
             return 1

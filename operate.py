@@ -382,10 +382,12 @@ def cmd_kernel(rest):
     report_context()
     # option locale --config / -c : installer un .config + olddefconfig avant de
     # deleguer a kernel_build (qui suppose le .config deja en place).
-    cfg, passth, it = None, [], iter(rest)
+    cfg, expect, passth, it = None, None, [], iter(rest)
     for a in it:
         if a in ("--config", "-c"):
             cfg = next(it, None)
+        elif a == "--expect":
+            expect = next(it, None)
         else:
             passth.append(a)
     if cfg:
@@ -399,6 +401,8 @@ def cmd_kernel(rest):
         subprocess.run(["make", "-C", src, "olddefconfig"])
     ensure_efivars()
     mount_esps()
+    if expect:
+        os.environ["KVER_EXPECT"] = expect   # garde-fou cible<->source (run_module propage)
     return run_module("kernel_build.py", passth)
 
 

@@ -30,14 +30,18 @@ def _target_from(artifact):
 
 
 def _trigger_build(target, log):
-    """Delegue a kernel_build (voie Gentoo existante). True si succes. L'invocation
-    exacte (args) se cale sur kernel_build cote machine ; ici on DECLENCHE le module
-    sans reimplementer la moindre etape de build."""
+    """Delegue a kernel_build (voie Gentoo existante). True si succes. On passe la
+    cible en KVER_EXPECT : kernel_build REFUSE si le source ne produit pas cette
+    version -> une validation GitOps "noyau X" ne peut jamais armer un autre noyau.
+    'latest'/vide -> pas de contrainte (build du source courant)."""
     here = os.path.dirname(os.path.abspath(__file__))
     log(f"[kernel] declenchement build -> {target} via kernel_build")
+    env = dict(os.environ)
+    if target and target != "latest":
+        env["KVER_EXPECT"] = target
     try:
         r = subprocess.run([sys.executable, os.path.join(here, "kernel_build.py")],
-                           env=dict(os.environ))
+                           env=env)
         return r.returncode == 0
     except OSError as e:
         log(f"[kernel] echec declenchement kernel_build : {e}")

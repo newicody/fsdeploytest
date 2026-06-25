@@ -285,6 +285,18 @@ def main():
         sys.exit(f".config absent dans {SRC} (lance kernel_watch.py d'abord)")
 
     kver = out(["make", "-C", SRC, "-s", "kernelrelease"]).strip()
+    # Garde-fou de coherence cible<->source : si un build a ete DEMANDE pour une
+    # version precise (KVER_EXPECT, pose par mode_kernel/operate --expect via la
+    # validation GitOps), on REFUSE de compiler un autre source que celui-la. Sinon
+    # une validation "noyau X" armerait en realite le source courant, quel qu'il
+    # soit. Comparaison par sous-chaine ('6.12.3' valide '6.12.3-gentoo'). Echec
+    # AVANT toute compilation : rien n'est bati ni arme.
+    expect = os.environ.get("KVER_EXPECT", "").strip()
+    if expect and expect not in kver:
+        sys.exit(f"ECHEC coherence : build demande pour '{expect}' mais le source "
+                 f"{SRC} produit '{kver}'. Prepare le bon source/.config (repointe "
+                 f"/usr/src/linux vers la cible) avant de relancer. "
+                 "Rien n'a ete compile ni arme.")
     msg(f"build noyau {kver} (-j{JOBS}"
         + (f" {' '.join(make_flags)}" if make_flags else "") + ")")
 

@@ -36,7 +36,9 @@ Sous-commandes :
   deploy        BOOTSTRAP complet (ex-first_boot) : datasets + source + .config +
                 build noyau + rootfs + registre. [--config F] [--rootfs-src D] ...
   kernel        rebuild COMPLET noyau+modules+initramfs+ESP+EFI -> kernel_build.py
-                recree TOUTES les entrees EFI par profil [uki]. [--config X]
+                recree TOUTES les entrees EFI par profil [uki].
+                [--src DIR] [--config FILE] [--jobs N] [--cmdline STR] [--expect VER]
+                (operate TRADUIT ces options en ENV : kernel_build est env-driven)
   rootfs        REBUILD complet d'un rootfs.sfs : sans source -> nettoie la racine
                 vivante (clean_rootfs -> fast_pool/staging) puis fige rootfs-vN.sfs
                 + (re)pointe le lien. [--source D] [--rootfs-src D|--modules KVER
@@ -428,31 +430,79 @@ def cmd_deploy(rest):
 
 
 def cmd_kernel(rest):
+    """Compile le noyau + zfs-kmod + modules.sfs + initramfs + ESP + entrees EFI.
+
+    IMPORTANT : kernel_build.py ne lit PAS d'arguments CLI -- il est pilote par
+    l'ENV (SRC/JOBS/CMDLINE/KVER_EXPECT) + [kernel] d'infra.conf. operate TRADUIT
+    donc les options en ENV (run_module propage os.environ) :
+      --src   DIR    arbre source a compiler (defaut [kernel] src ; -> SRC)
+      --config FILE  installe FILE comme .config DANS la source effective + olddefconfig
+      --jobs  N (-jN) parallelisme make (-> JOBS)
+      --cmdline STR  cmdline EFI (-> CMDLINE ; defaut [kernel] cmdline)
+      --expect VER   garde-fou : refuse si la source ne produit pas VER (-> KVER_EXPECT)
+
+    Ex : operate kernel --src /fast_pool/usr-src/linux-7.0.14 --config K.config -j8"""
     report_context()
-    # option locale --config / -c : installer un .config + olddefconfig avant de
-    # deleguer a kernel_build (qui suppose le .config deja en place).
-    cfg, expect, passth, it = None, None, [], iter(rest)
+    src_override = cfg = expect = jobs = cmdline = None
+    it = iter(rest)
     for a in it:
-        if a in ("--config", "-c"):
+        if a in ("--src", "--source"):
+            src_override = next(it, None)
+        elif a.startswith("--src="):
+            src_override = a.split("=", 1)[1]
+        elif a.startswith("--source="):
+            src_override = a.split("=", 1)[1]
+        elif a in ("--config", "-c"):
             cfg = next(it, None)
+        elif a.startswith("--config="):
+            cfg = a.split("=", 1)[1]
         elif a == "--expect":
             expect = next(it, None)
+        elif a.startswith("--expect="):
+            expect = a.split("=", 1)[1]
+        elif a in ("--jobs", "-j"):
+            jobs = next(it, None)
+        elif a.startswith("--jobs="):
+            jobs = a.split("=", 1)[1]
+        elif a.startswith("-j") and a[2:].isdigit():
+            jobs = a[2:]
+        elif a == "--cmdline":
+            cmdline = next(it, None)
+        elif a.startswith("--cmdline="):
+            cmdline = a.split("=", 1)[1]
         else:
-            passth.append(a)
+            msg(f"option ignoree (kernel_build est pilote par ENV/[kernel], "
+                f"pas par CLI) : {a}")
+
+    # source EFFECTIVE : override CLI > [kernel] src. kernel_build lit SRC en
+    # priorite (et repointe /usr/src/linux dessus pour zfs-kmod).
+    src = src_override or kernel_src()
+    if src_override:
+        if not os.path.isdir(src):
+            sys.exit(f"source noyau introuvable : {src}")
+        os.environ["SRC"] = src
+        msg(f"source noyau : {src} (override --src)")
+
+    # .config -> DANS la source effective (pas [kernel] src en dur)
     if cfg:
         if not os.path.isfile(cfg):
             sys.exit(f".config introuvable : {cfg}")
-        src = kernel_src()
         dst = os.path.join(src, ".config")
         if os.path.abspath(cfg) != os.path.abspath(dst):
             shutil.copy2(cfg, dst)
             msg(f".config installe -> {dst}")
         subprocess.run(["make", "-C", src, "olddefconfig"])
+
+    if jobs:
+        os.environ["JOBS"] = str(jobs)
+    if cmdline:
+        os.environ["CMDLINE"] = cmdline
+    if expect:
+        os.environ["KVER_EXPECT"] = expect   # garde-fou cible<->source
+
     ensure_efivars()
     mount_esps()
-    if expect:
-        os.environ["KVER_EXPECT"] = expect   # garde-fou cible<->source (run_module propage)
-    return run_module("kernel_build.py", passth)
+    return run_module("kernel_build.py", [])
 
 
 def cmd_rootfs(rest):
@@ -619,7 +669,9 @@ USAGE = (
     "\n"
     "Utilisable en chroot / booted / rescue (lit l'infra.conf de la machine).\n"
     "Exemples :\n"
-    "  operate.py kernel --config K.config        # recompile noyau + init + EFI\n"
+    "  operate.py kernel --src /fast_pool/usr-src/linux-7.0.14 --config K.config\n"
+    "                                             # build d'une source precise\n"
+    "  operate.py kernel --config K.config        # recompile ([kernel] src) + EFI\n"
     "  operate.py rootfs                          # rebuild rootfs.sfs (depuis '/')\n"
     "  operate.py restore --sfs /chemin/img.sfs   # remet un rootfs en place\n"
     "  operate.py manager audit                   # etat du registre noyaux\n"

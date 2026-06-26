@@ -1,10 +1,18 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 """
-operate.py -- point d'entree d'exploitation, utilisable dans LES TROIS contextes
-(chroot / systeme booted / mode rescue). Analogue de first_boot.py, mais sans
-hypothese d'environnement : operate.py lit l'infra.conf PHYSIQUEMENT present sur
-la machine (/etc/infra.conf, ou --infra) et s'adapte au contexte detecte.
+operate.py -- point d'entree d'exploitation UNIQUE (le travailleur), utilisable
+dans LES TROIS contextes (chroot / systeme booted / mode rescue). Il lit
+l'infra.conf PHYSIQUEMENT present sur la machine (/etc/infra.conf, ou --infra) et
+s'adapte au contexte detecte.
+
+operate fait TOUT le travail de maintenance : il SUBSUME first_boot (commande
+'deploy') et expose chaque fonctionnalite via la CLI. Les fonctions reutilisables
+de first_boot (verify_infra/preflight/Report) restent importees comme une
+bibliotheque ; first_boot n'est plus une porte d'entree distincte.
+
+L'INFERENCE est AUTONOME (service de fond dispatch_service.py, pilote par
+[dispatch] d'infra.conf) : ce n'est PAS une commande operate.
 
 Contextes et ce qui change :
   - chroot  : depuis un live ; pools peut-etre a importer, ESP/efivars a monter.
@@ -12,45 +20,54 @@ Contextes et ce qui change :
               deja montes par init.py, inference disponible.
   - rescue  : shell de maintenance (overlay non actif / initramfs degrade) ;
               on fait au mieux avec ce qui est monte.
-operate.py NE refuse aucun contexte : il le DETECTE, l'affiche, et previent si un
+operate NE refuse aucun contexte : il le DETECTE, l'affiche, previent si un
 prerequis manque (ex : fast_pool non importe), sans bloquer.
 
 Dispatcher MINCE : aucune logique metier dupliquee. Chaque sous-commande delegue
 au module existant (meme codebase), appele en sous-processus avec INFRA_CONF
-exporte. operate.py n'ajoute QUE la logique d'environnement (detection contexte,
-montage ESP/efivars, restage initramfs multi-ESP).
-
-operate.py vit dans le depot, a cote de ses modules cibles (comme first_boot.py /
-kernel_build.py) : il les appelle par leur chemin frere.
+exporte. operate n'ajoute QUE la logique d'environnement (detection contexte,
+montage ESP/efivars, restage initramfs multi-ESP) et les enchainements (rootfs
+complet, restore) qui evitent de dupliquer le bootstrap.
 
 Sous-commandes :
-  status      etat env + contexte + conformite (reutilise first_boot.verify_infra)
-  check       suite de saintete READ-ONLY (infra + sfs/ESP montage RO test) ;
-              --strict -> rc!=0 si critique ; --diagnose -> + kernel_diagnose
-  kernel      rebuild COMPLET noyau+modules+initramfs+ESP+EFI  -> kernel_build.py
-              recree TOUTES les entrees EFI par profil [uki] (normal/safe/debug/
-              i915only) sur chaque ESP. [--config X : stage X + olddefconfig avant]
-  initramfs   rebuild de l'initramfs SEUL + restage sur TOUTES les ESP (sans
-              recompiler le noyau ; les entrees EFI existantes referencent le
-              meme fichier -> tous les profils en beneficient). [--kver V]
-  config      propose/applique une maj du .config             -> kernel_watch.py
-  diagnose    coherence noyau/modules/sfs                      -> kernel_diagnose.py
-  freeze      fige l'overlay vivant en rootfs-vN.sfs           -> freeze_overlay.py
-  select      list | use <vN> | rollback (lien rootfs.sfs)     -> select_rootfs.py
-  clean       prepare une racine nettoyee pour le sfs          -> clean_rootfs.py
-  rootfs      fige rootfs.sfs / modules-<ver>.sfs              -> sfs_build.py
-  snapshot    gestion des snapshots ZFS                        -> snapshot_manager.py
-  replicate   replication incrementale (defaut --from-config)  -> zfs_replicate.py
-  storage     audit de conformite stockage                     -> storage_manager.py
-  validate    valide SFS + ESP avant de (re)booter             -> validate_boot.py
-  confirm     promeut le noyau frais boote (BootOrder)         -> boot_confirm.py
-  bench       inventaire + bench machine                       -> machine_bench.py
-  brainstorm  flux d'idees local (inference)                   -> brainstorm.py
-  rag         RAG multi-domaines local (inference)             -> rag.py
-  esp         monte les ESP a leur install_mount (boot_layout)
+  status        etat env + contexte + conformite (reutilise verify_infra)
+  check         suite de saintete READ-ONLY (infra + sfs/ESP montage RO test) ;
+                --strict -> rc!=0 si critique ; --diagnose -> + kernel_diagnose
+  deploy        BOOTSTRAP complet (ex-first_boot) : datasets + source + .config +
+                build noyau + rootfs + registre. [--config F] [--rootfs-src D] ...
+  kernel        rebuild COMPLET noyau+modules+initramfs+ESP+EFI -> kernel_build.py
+                recree TOUTES les entrees EFI par profil [uki]. [--config X]
+  rootfs        REBUILD complet d'un rootfs.sfs : sans source -> nettoie la racine
+                vivante (clean_rootfs -> fast_pool/staging) puis fige rootfs-vN.sfs
+                + (re)pointe le lien. [--source D] [--rootfs-src D|--modules KVER
+                -> passthrough sfs_build]
+  initramfs     rebuild de l'initramfs SEUL + restage sur TOUTES les ESP. [--kver V]
+  restore       remet en place un rootfs depuis un .sfs : --sfs FICHIER -> importe
+                comme rootfs-vN.sfs + active le lien (effet au prochain boot).
+  config        propose/applique une maj du .config             -> kernel_watch.py
+  config-history  historique des .config (list|render|show)      -> config_history.py
+  config-delta    compare deux .config                            -> config_delta.py
+  diagnose      coherence noyau/modules/sfs                       -> kernel_diagnose.py
+  source        cycle de vie des sources (list|fetch|select)      -> source_manager.py
+  freeze        fige l'overlay vivant en rootfs-vN.sfs            -> freeze_overlay.py
+  select        list | use <vN> | rollback (lien rootfs.sfs)      -> select_rootfs.py
+  clean         prepare une racine nettoyee pour le sfs           -> clean_rootfs.py
+  snapshot      gestion des snapshots ZFS                         -> snapshot_manager.py
+  replicate     replication incrementale (defaut --from-config)   -> zfs_replicate.py
+  storage       audit de conformite stockage                      -> storage_manager.py
+  validate      valide SFS + ESP avant de (re)booter              -> validate_boot.py
+  confirm       promeut le noyau frais boote (BootOrder)          -> boot_confirm.py
+  manager       registre noyaux : list|audit|history|mark|promote -> kernel_registry.py
+  manager-sync  synchro git de l'audit trail                      -> manager_git.py
+  bench         inventaire + bench machine                        -> machine_bench.py
+  brainstorm    flux d'idees local (inference)                    -> brainstorm.py
+  rag           RAG multi-domaines local (inference)              -> rag.py
+  esp           monte les ESP a leur install_mount (boot_layout)
 
+Options globales (AVANT la sous-commande) : --infra PATH, --comment "texte"
+(--comment est journalise et reserve a un futur post sur le mode projet).
 Tout argument apres la sous-commande est transmis tel quel au module cible.
-L'option globale --infra se place AVANT la sous-commande. stdlib uniquement.
+stdlib uniquement.
 """
 import os
 import shutil
@@ -61,6 +78,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # convention de chemin sur l'ESP, miroir de kernel_build.DEST_DIR
 ESP_DEST_DIR = "EFI/gentoo"
+
+# commentaire optionnel (--comment), journalise et reserve au futur post projet.
+COMMENT = ""
 
 
 def _first_existing(*paths):
@@ -181,7 +201,10 @@ def mount_esps():
 def journal(kind, detail):
     """Ecrit un evenement dans le manager (boot_pool/manager/history.jsonl) via
     kernel_registry. Best-effort : si le manager est indisponible (chroot/rescue,
-    boot_pool non monte), on n'echoue JAMAIS l'operation pour autant."""
+    boot_pool non monte), on n'echoue JAMAIS l'operation pour autant. Le
+    commentaire global (--comment) est joint au detail si present."""
+    if COMMENT:
+        detail = f"{detail} | comment: {COMMENT}"
     try:
         import kernel_registry
         kernel_registry.KernelRegistry().log_event(kind, None, detail)
@@ -261,25 +284,36 @@ def kernel_src():
 
 # sous-commandes en simple passthrough vers leur module (memes args/CLI)
 PASS = {
-    "config":     "kernel_watch.py",
-    "source":     "source_manager.py",
-    "dispatch":   "dispatch.py",
-    "diagnose":   "kernel_diagnose.py",
+    # --- noyau & config ---
+    "config":         "kernel_watch.py",
+    "source":         "source_manager.py",
+    "diagnose":       "kernel_diagnose.py",
+    "config-history": "config_history.py",
+    "config-delta":   "config_delta.py",
+    # --- rootfs / overlay (rootfs = handler natif cmd_rootfs) ---
     "freeze":     "freeze_overlay.py",
     "select":     "select_rootfs.py",
     "clean":      "clean_rootfs.py",
-    "rootfs":     "sfs_build.py",
+    # --- zfs / stockage ---
     "snapshot":   "snapshot_manager.py",
     "storage":    "storage_manager.py",
     "validate":   "validate_boot.py",
+    # --- manager (registre noyaux + audit trail git) ---
+    "manager":      "kernel_registry.py",
+    "manager-sync": "manager_git.py",
+    # --- outils ---
     "bench":      "machine_bench.py",
     "brainstorm": "brainstorm.py",
     "rag":        "rag.py",
 }
+# NB: 'dispatch' n'est PAS une commande : l'inference est AUTONOME
+# (dispatch_service.py, [dispatch] d'infra.conf). Debug a la main hors operate :
+# 'python3 dispatch.py'.
 
 # commandes ne touchant pas au systeme -> root non requis (check : mode degrade
 # sans root, controle complet avec root)
-NO_ROOT = {"status", "rag", "brainstorm", "check"}
+NO_ROOT = {"status", "rag", "brainstorm", "check",
+           "config-history", "config-delta", "manager", "manager-sync"}
 
 
 # --------------------------------------------------------------------------- #
@@ -379,6 +413,20 @@ def cmd_check(rest):
     return 0
 
 
+def cmd_deploy(rest):
+    """BOOTSTRAP complet (ex-first_boot) : operate subsume first_boot. On delegue
+    a first_boot.py (datasets + source + .config + build + rootfs + registre) en
+    injectant --infra (resolu par operate) si l'appelant ne l'a pas precise. Tous
+    les autres arguments (--config, --rootfs-src, --src, --dry-run, --yes...) sont
+    transmis tels quels."""
+    report_context()
+    ensure_efivars()
+    args = list(rest)
+    if "--infra" not in args and not any(a.startswith("--infra=") for a in args):
+        args = ["--infra", INFRA] + args
+    return run_module("first_boot.py", args)
+
+
 def cmd_kernel(rest):
     report_context()
     # option locale --config / -c : installer un .config + olddefconfig avant de
@@ -405,6 +453,41 @@ def cmd_kernel(rest):
     if expect:
         os.environ["KVER_EXPECT"] = expect   # garde-fou cible<->source (run_module propage)
     return run_module("kernel_build.py", passth)
+
+
+def cmd_rootfs(rest):
+    """REBUILD d'un rootfs.sfs. Deux modes :
+      - passthrough : si --rootfs-src ou --modules est fourni, on transmet tel
+        quel a sfs_build.py (build depuis un arbre prepare / modules-<ver>.sfs).
+      - complet (defaut) : sans source, on REBUILD depuis la racine vivante
+        (--source, defaut '/') : clean_rootfs (rsync + nettoyage + marqueur ->
+        fast_pool/staging) PUIS sfs_build versionne+lien. C'est 'recompiler un
+        rootfs.sfs' en une commande (meme chaine que le bootstrap)."""
+    report_context()
+    if any(a in ("--rootfs-src", "--modules") for a in rest) \
+            or any(a.startswith(("--rootfs-src=", "--modules=")) for a in rest):
+        return run_module("sfs_build.py", rest)
+    source, extra, it = "/", [], iter(rest)
+    for a in it:
+        if a == "--source":
+            source = next(it, "/")
+        elif a.startswith("--source="):
+            source = a.split("=", 1)[1]
+        else:
+            extra.append(a)            # ex --force / --force-live -> sfs_build
+    staging = _zfs_mountpoint("fast_pool/staging")
+    if not staging:
+        msg("fast_pool/staging non monte -> rebuild rootfs impossible "
+            "(zfs mount fast_pool/staging).")
+        return 1
+    msg(f"rebuild rootfs : {source} -> nettoyage vers {staging} (clean_rootfs)...")
+    rc = run_module("clean_rootfs.py",
+                    ["--source", source, "--staging", staging, "--yes"])
+    if rc != 0:
+        msg("clean_rootfs a echoue -> rebuild avorte (rien fige).")
+        return rc
+    msg("fige du rootfs nettoye en rootfs-vN.sfs + lien (sfs_build)...")
+    return run_module("sfs_build.py", ["--rootfs-src", staging] + extra)
 
 
 def cmd_initramfs(rest):
@@ -457,6 +540,49 @@ def cmd_initramfs(rest):
     return 1
 
 
+def cmd_restore(rest):
+    """Remet en place un rootfs depuis un .sfs (ex : sauvegarde, image de
+    secours). --sfs FICHIER : si le fichier est deja dans le dataset sfs, on
+    active son lien ; sinon on l'importe comme rootfs-vN.sfs (version suivante)
+    puis on (re)pointe rootfs.sfs dessus. Effet au PROCHAIN boot. Reutilise
+    select_rootfs (versionnage + lien atomique + memo rollback) : aucune logique
+    parallele."""
+    report_context()
+    sfs, it = None, iter(rest)
+    for a in it:
+        if a == "--sfs":
+            sfs = next(it, None)
+        elif a.startswith("--sfs="):
+            sfs = a.split("=", 1)[1]
+    if not sfs:
+        msg("usage : operate restore --sfs <fichier.sfs>")
+        return 2
+    if not os.path.isfile(sfs):
+        msg(f"sfs introuvable : {sfs}")
+        return 1
+    sfs_dir = _sfs_dir()
+    if not sfs_dir:
+        msg("dataset fast_pool/sfs introuvable/non monte.")
+        return 1
+    try:
+        import select_rootfs
+    except Exception as e:
+        msg(f"select_rootfs indisponible : {e}")
+        return 1
+    target = os.path.basename(sfs)
+    if os.path.dirname(os.path.abspath(sfs)) != os.path.abspath(sfs_dir):
+        vers = select_rootfs._versions(sfs_dir)
+        nextn = (vers[-1][0] + 1) if vers else 1
+        target = f"rootfs-v{nextn}.sfs"
+        dst = os.path.join(sfs_dir, target)
+        msg(f"import du sfs -> {dst}")
+        shutil.copy2(sfs, dst)
+    select_rootfs._set_link(sfs_dir, target)
+    msg(f"rootfs.sfs -> {target}. Effet au prochain boot "
+        "('operate validate' puis reboot recommandes).")
+    return 0
+
+
 def cmd_replicate(rest):
     report_context()
     return run_module("zfs_replicate.py", rest or ["--from-config"])
@@ -481,22 +607,32 @@ def cmd_pass(name, rest):
 
 # --------------------------------------------------------------------------- #
 USAGE = (
-    "usage: operate.py [--infra PATH] <commande> [args...]\n"
+    "usage: operate.py [--infra PATH] [--comment TXT] <commande> [args...]\n"
     "\n"
-    "commandes : status check kernel initramfs config diagnose freeze select\n"
-    "            clean rootfs snapshot replicate storage validate confirm bench\n"
-    "            brainstorm rag esp\n"
+    "commandes :\n"
+    "  noyau     : deploy kernel config diagnose source config-history config-delta\n"
+    "  rootfs    : rootfs restore freeze select clean\n"
+    "  boot      : initramfs esp validate confirm\n"
+    "  stockage  : snapshot storage replicate\n"
+    "  manager   : manager manager-sync\n"
+    "  systeme   : status check bench brainstorm rag\n"
     "\n"
     "Utilisable en chroot / booted / rescue (lit l'infra.conf de la machine).\n"
-    "Tout ce qui suit <commande> est transmis au module cible (ex:\n"
-    " 'operate.py kernel --config K.config -j8', 'operate.py select use v2',\n"
-    " 'operate.py snapshot rotate --apply', 'operate.py initramfs --kver 7.0.12').\n"
+    "Exemples :\n"
+    "  operate.py kernel --config K.config        # recompile noyau + init + EFI\n"
+    "  operate.py rootfs                          # rebuild rootfs.sfs (depuis '/')\n"
+    "  operate.py restore --sfs /chemin/img.sfs   # remet un rootfs en place\n"
+    "  operate.py manager audit                   # etat du registre noyaux\n"
+    "  operate.py deploy --config K.config --rootfs-src /  # bootstrap complet\n"
+    "\n"
+    "L'inference est AUTONOME (service de fond, [dispatch] d'infra.conf) : pas de\n"
+    "commande ici. --comment est journalise (futur post sur le mode projet).\n"
     "Detail des roles : voir l'entete de ce fichier."
 )
 
 
 def main():
-    global INFRA
+    global INFRA, COMMENT
     argv = sys.argv[1:]
 
     # options globales EN TETE (decoupage manuel : argparse.REMAINDER ne
@@ -515,6 +651,14 @@ def main():
         elif tok.startswith("--infra="):
             INFRA = tok.split("=", 1)[1]
             i += 1
+        elif tok == "--comment":
+            if i + 1 >= len(argv):
+                sys.exit("--comment attend un texte")
+            COMMENT = argv[i + 1]
+            i += 2
+        elif tok.startswith("--comment="):
+            COMMENT = tok.split("=", 1)[1]
+            i += 1
         else:
             break
 
@@ -527,8 +671,11 @@ def main():
     handlers = {
         "status":    cmd_status,
         "check":     cmd_check,
+        "deploy":    cmd_deploy,
         "kernel":    cmd_kernel,
+        "rootfs":    cmd_rootfs,
         "initramfs": cmd_initramfs,
+        "restore":   cmd_restore,
         "esp":       cmd_esp,
         "replicate": cmd_replicate,
         "confirm":   cmd_confirm,
@@ -541,7 +688,7 @@ def main():
 
     # manager : aligne MANAGER_ROOT sur infra.conf [manager] (env > config) pour
     # que le journal d'operate ET les modules delegues (kernel_build, boot_confirm)
-    # pointent au MEME manager que first_boot. run_module propage os.environ.
+    # pointent au MEME manager. run_module propage os.environ.
     if "MANAGER_ROOT" not in os.environ:
         try:
             from configobj import ConfigObj

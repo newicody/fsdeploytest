@@ -547,19 +547,23 @@ def cmd_initramfs(rest):
     le nouvel initramfs sans recreer d'entree NVRAM."""
     report_context()
     kver = os.uname().release
-    passth, it = [], iter(rest)
+    it = iter(rest)
     for a in it:
         if a == "--kver":
             kver = next(it, kver)
+        elif a.startswith("--kver="):
+            kver = a.split("=", 1)[1]
         else:
-            passth.append(a)
+            # build_initramfs est ENV-driven (KVER/OUT/INIT_SRC/FFMPEG_STATIC/
+            # PYBIN) : il ne lit AUCUN argument CLI -> on n'avale rien en silence.
+            msg(f"option ignoree (build_initramfs est pilote par ENV) : {a}")
     out_path = os.path.join("/var/tmp", f"initramfs-{kver}.zst")
     # build_initramfs ecrit OUT ; KVER selectionne les modules/zfs.ko embarques.
     env = dict(os.environ, INFRA_CONF=INFRA, KVER=kver, OUT=out_path)
     bscript = os.path.join(HERE, "build_initramfs.py")
     if not os.path.isfile(bscript):
         sys.exit(f"module introuvable : {bscript}")
-    rc = subprocess.run([sys.executable, bscript] + passth, env=env).returncode
+    rc = subprocess.run([sys.executable, bscript], env=env).returncode
     if rc != 0:
         msg("build_initramfs a ECHOUE -> ESP NON modifiee (pas de vieux fichier "
             "stage).")
@@ -641,7 +645,11 @@ def cmd_replicate(rest):
 def cmd_confirm(rest):
     report_context()
     ensure_efivars()
-    return run_module("boot_confirm.py", rest)
+    if rest:
+        # boot_confirm est ENV-driven (POOL) et ne prend pas d'arguments CLI.
+        msg(f"options ignorees (boot_confirm ne prend pas d'arguments) : "
+            f"{' '.join(rest)}")
+    return run_module("boot_confirm.py", [])
 
 
 def cmd_esp(rest):
